@@ -6,6 +6,7 @@ enum MessageType: String, Codable {
     case speakerReady = "speaker.ready"
     case audioStart = "audio.start"
     case audioStop = "audio.stop"
+    case transcriptInput = "transcript.input"
     case abort
     case transcriptFinal = "transcript.final"
     case deviceCommand = "device_command"
@@ -51,6 +52,11 @@ struct AbortMessage: Codable {
         case sessionId = "session_id"
         case reason
     }
+}
+
+struct TranscriptInput: Codable {
+    let type: MessageType
+    let text: String
 }
 
 // MARK: - Outbound

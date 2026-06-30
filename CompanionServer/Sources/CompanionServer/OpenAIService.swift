@@ -69,15 +69,18 @@ struct OpenAIRESTService: OpenAIService {
         let url = URL(string: "https://api.openai.com/v1/chat/completions")!
         logger.debug(
             "HTTP POST /v1/chat/completions",
-            metadata: ["model": "gpt-4o-mini", "transcript_chars": "\(transcript.count)"]
+            metadata: ["model": "gpt-54", "transcript_chars": "\(transcript.count)"]
         )
         var request = authorizedRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let body = ChatRequest(
-            model: "gpt-4o-mini",
-            messages: [.init(role: "user", content: transcript)],
+            model: "gpt-5-nano",
+            messages: [
+                .init(role: "system", content: CompanionPrompt.system),
+                .init(role: "user", content: CompanionPrompt.userMessage(for: transcript)),
+            ],
             tools: [.setLEDTool]
         )
         request.httpBody = try JSONEncoder().encode(body)

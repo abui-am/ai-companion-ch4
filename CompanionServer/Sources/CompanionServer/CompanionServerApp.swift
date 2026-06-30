@@ -39,7 +39,12 @@ struct CompanionServerApp {
             return .dontUpgrade
         } onUpgrade: { inbound, outbound, _ in
             serverLogger.info("ws connection upgraded")
-            let session = VoiceSession(outbound: outbound, openAI: openAI, speakers: speakers, logger: serverLogger)
+            let session = VoiceSession(
+                outbound: WebSocketSessionOutboundWriter(base: outbound),
+                openAI: openAI,
+                speakers: speakers,
+                logger: serverLogger
+            )
             try await session.start()
 
             do {
@@ -62,7 +67,7 @@ struct CompanionServerApp {
             return .dontUpgrade
         } onUpgrade: { inbound, outbound, _ in
             let speakerId = UUID()
-            await speakers.register(id: speakerId, outbound: outbound)
+            await speakers.register(id: speakerId, outbound: WebSocketSessionOutboundWriter(base: outbound))
             serverLogger.info("speaker connected", metadata: ["id": .string(speakerId.uuidString)])
 
             let ready = try JSONEncoder().encode(SpeakerReady())
@@ -125,6 +130,9 @@ struct CompanionServerApp {
             await session.handleAudioStart()
         case .audioStop:
             await session.handleAudioStop()
+        case .transcriptInput:
+            let transcript = try JSONDecoder().decode(TranscriptInput.self, from: data)
+            await session.handleTranscriptInput(transcript.text)
         case .abort:
             let abort = try JSONDecoder().decode(AbortMessage.self, from: data)
             await session.handleAbort(reason: abort.reason)

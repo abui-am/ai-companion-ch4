@@ -47,7 +47,7 @@ let package = Package(
         ),
         .testTarget(
             name: "CompanionServerTests",
-            dependencies: ["CompanionServer"]
+            dependencies: ["CompanionServer", "TestClient"]
         ),
     ]
 )
