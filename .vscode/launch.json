@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ai-companion-ch5}/CompanionServer",
+            "name": "Debug CompanionServer (CompanionServer)",
+            "target": "CompanionServer",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug CompanionServer (CompanionServer)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ai-companion-ch5}/CompanionServer",
+            "name": "Release CompanionServer (CompanionServer)",
+            "target": "CompanionServer",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release CompanionServer (CompanionServer)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ai-companion-ch5}/CompanionServer",
+            "name": "Debug TestClient (CompanionServer)",
+            "target": "TestClient",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug TestClient (CompanionServer)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ai-companion-ch5}/CompanionServer",
+            "name": "Release TestClient (CompanionServer)",
+            "target": "TestClient",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release TestClient (CompanionServer)"
+        }
+    ]
+}

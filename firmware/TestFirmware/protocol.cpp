@@ -1,0 +1,29 @@
+#include "protocol.h"
+
+#include <ArduinoJson.h>
+
+void protocolParse(const uint8_t *data, size_t len, ProtoMsg &out) {
+    out = ProtoMsg();
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, data, len);
+    if (err) {
+        return;
+    }
+
+    const char *type = doc["type"] | "";
+
+    if (strcmp(type, "speaker.ready") == 0) {
+        out.type = PROTO_MSG_SPEAKER_READY;
+    } else if (strcmp(type, "tts.start") == 0) {
+        out.type = PROTO_MSG_TTS_START;
+        out.sessionId = String((const char *)(doc["session_id"] | ""));
+    } else if (strcmp(type, "tts.end") == 0) {
+        out.type = PROTO_MSG_TTS_END;
+        out.sessionId = String((const char *)(doc["session_id"] | ""));
+    } else if (strcmp(type, "error") == 0) {
+        out.type = PROTO_MSG_ERROR;
+        out.errorCode = String((const char *)(doc["code"] | ""));
+        out.errorMessage = String((const char *)(doc["message"] | ""));
+    }
+}
