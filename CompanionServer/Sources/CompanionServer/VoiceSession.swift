@@ -21,20 +21,31 @@ actor VoiceSession {
     private let sessionId = UUID().uuidString
     private let outbound: SessionOutboundWriter
     private let openAI: OpenAIService
+    private let cartesia: CartesiaTTSService
+    private let stt: CartesiaSTTServiceProtocol
     private let speakers: SpeakerRegistry
     private let logger: Logger
 
     private var phase: SessionPhase = .connected
-    private var opusBuffer: [Data] = []
-    private let maxBufferedFrames = 500
-    private var droppedFrames = 0
     private var pipelineTask: Task<Void, Never>?
+    private var activeContextId: String?
     private var turnCounter = 0
     private var uplinkFrameCounter = 0
+    private var conversationHistory: [ChatMessage] = []
+    private let maxHistoryMessages = 20
 
-    init(outbound: SessionOutboundWriter, openAI: OpenAIService, speakers: SpeakerRegistry, logger: Logger) {
+    init(
+        outbound: SessionOutboundWriter,
+        openAI: OpenAIService,
+        cartesia: CartesiaTTSService,
+        stt: CartesiaSTTServiceProtocol,
+        speakers: SpeakerRegistry,
+        logger: Logger
+    ) {
         self.outbound = outbound
         self.openAI = openAI
+        self.cartesia = cartesia
+        self.stt = stt
         self.speakers = speakers
         self.logger = logger
     }
@@ -42,19 +53,18 @@ actor VoiceSession {
     func start() async throws {
         phase = .connected
         logger.info("session started", metadata: ["session_id": .string(sessionId)])
+        Task { await stt.connect() }
         let ready = SessionReady(sessionId: sessionId, audio: .downlink)
         try await send(ready)
     }
 
     func handleAudioStart() {
         phase = .capturing
-        opusBuffer.removeAll()
-        droppedFrames = 0
         uplinkFrameCounter = 0
         logger.info("audio.start", metadata: ["session_id": .string(sessionId), "phase": .string("\(phase)")])
     }
 
-    func handleOpusFrame(_ data: Data) {
+    func handleOpusFrame(_ data: Data) async {
         guard phase == .capturing else {
             logger.debug(
                 "ignored uplink frame — not capturing",
@@ -62,25 +72,12 @@ actor VoiceSession {
             )
             return
         }
-        if opusBuffer.count >= maxBufferedFrames {
-            opusBuffer.removeFirst()
-            droppedFrames += 1
-            logger.warning(
-                "opus buffer cap exceeded, dropping oldest frame",
-                metadata: ["session_id": .string(sessionId), "dropped_total": "\(droppedFrames)"]
-            )
-        }
-        opusBuffer.append(data)
         uplinkFrameCounter += 1
         logger.debug(
-            "uplink frame buffered",
-            metadata: [
-                "session_id": .string(sessionId),
-                "frame": "\(uplinkFrameCounter)",
-                "bytes": "\(data.count)",
-                "buffered": "\(opusBuffer.count)",
-            ]
+            "uplink frame forwarded to stt",
+            metadata: ["session_id": .string(sessionId), "frame": "\(uplinkFrameCounter)", "bytes": "\(data.count)"]
         )
+        await stt.sendAudio(data)
     }
 
     func handleAudioStop() {
@@ -94,25 +91,20 @@ actor VoiceSession {
         phase = .processing
         turnCounter += 1
         let turnId = "turn-\(turnCounter)"
-        let frames = opusBuffer
-        let dropped = droppedFrames
-        opusBuffer.removeAll()
-        let totalBytes = frames.reduce(0) { $0 + $1.count }
+        let frameCount = uplinkFrameCounter
         logger.info(
             "audio.stop",
             metadata: [
                 "session_id": .string(sessionId),
                 "turn_id": .string(turnId),
-                "frames": "\(frames.count)",
-                "bytes": "\(totalBytes)",
-                "dropped": "\(dropped)",
+                "frames": "\(frameCount)",
                 "phase": .string("\(phase)"),
             ]
         )
         logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.audio_stop", "turn_id": .string(turnId)])
 
         pipelineTask = Task { [weak self] in
-            await self?.runPipeline(turnId: turnId, frames: frames, droppedFrames: dropped)
+            await self?.runPipeline(turnId: turnId, frameCount: frameCount)
         }
     }
 
@@ -131,14 +123,21 @@ actor VoiceSession {
         }
     }
 
-    func handleAbort(reason: String) {
+    func handleAbort(reason: String) async {
         logger.info(
             "abort",
             metadata: ["session_id": .string(sessionId), "reason": .string(reason), "phase": .string("\(phase)")]
         )
         pipelineTask?.cancel()
         pipelineTask = nil
-        opusBuffer.removeAll()
+        if let contextId = activeContextId {
+            await cartesia.cancelTurn(contextId: contextId)
+            activeContextId = nil
+        }
+        // Closing/reconnecting the STT socket unblocks any pending finalize() wait immediately
+        // instead of leaving the cancelled pipeline task suspended until its watchdog timeout.
+        await stt.close()
+        Task { await stt.connect() }
         phase = .connected
         Task {
             try? await send(TTSEnd(sessionId: sessionId))
@@ -149,35 +148,34 @@ actor VoiceSession {
     func handleDisconnect() {
         pipelineTask?.cancel()
         pipelineTask = nil
-        opusBuffer.removeAll()
+        if let contextId = activeContextId {
+            Task { await cartesia.cancelTurn(contextId: contextId) }
+            activeContextId = nil
+        }
+        Task { await stt.close() }
         logger.info("session disconnected", metadata: ["session_id": .string(sessionId)])
     }
 
-    private func runPipeline(turnId: String, frames: [Data], droppedFrames: Int) async {
+    private func runPipeline(turnId: String, frameCount: Int) async {
         let t0 = Date()
         logger.info(
             "pipeline start",
-            metadata: ["session_id": .string(sessionId), "turn_id": .string(turnId), "frames": "\(frames.count)"]
+            metadata: ["session_id": .string(sessionId), "turn_id": .string(turnId), "frames": "\(frameCount)"]
         )
         do {
-            guard !frames.isEmpty else {
+            guard frameCount > 0 else {
                 logger.warning("pipeline abort — no audio frames", metadata: ["session_id": .string(sessionId)])
                 try await send(ErrorMessage(code: "no_audio", message: "No audio frames received"))
                 phase = .connected
                 return
             }
 
-            logger.debug("decoding uplink to WAV", metadata: ["session_id": .string(sessionId), "frames": "\(frames.count)"])
-            let wav = try OpusCodec.decodeToWAV(frames, sampleRate: AudioParams.uplink.sampleRate)
-            try Task.checkCancellation()
-            logger.debug("WAV ready", metadata: ["session_id": .string(sessionId), "wav_bytes": "\(wav.count)"])
-
-            logger.info("openai.transcribe start", metadata: ["session_id": .string(sessionId)])
-            let transcript = try await openAI.transcribe(wav: wav)
+            logger.info("cartesia.stt finalize start", metadata: ["session_id": .string(sessionId)])
+            let transcript = await stt.finalize()
             try Task.checkCancellation()
             let tAsrDone = Date()
             logger.info(
-                "openai.transcribe done",
+                "cartesia.stt finalize done",
                 metadata: [
                     "session_id": .string(sessionId),
                     "chars": "\(transcript.count)",
@@ -190,121 +188,7 @@ actor VoiceSession {
             guard phase == .processing else { return }
             try await send(TranscriptFinal(sessionId: sessionId, text: transcript))
 
-            guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                logger.warning("empty transcript — skipping chat/tts", metadata: ["session_id": .string(sessionId)])
-                try await send(ErrorMessage(code: "empty_transcript", message: "No speech detected in recording"))
-                phase = .connected
-                return
-            }
-
-            logger.info("openai.chat start", metadata: ["session_id": .string(sessionId)])
-            let chatResult = try await openAI.chat(transcript: transcript)
-            try Task.checkCancellation()
-            let tLlmFirst = Date()
-            logger.info(
-                "openai.chat done",
-                metadata: [
-                    "session_id": .string(sessionId),
-                    "reply_chars": "\(chatResult.reply.count)",
-                    "reply": .string(chatResult.reply),
-                    "has_command": "\(chatResult.command != nil)",
-                    "ms": "\(ms(tAsrDone, tLlmFirst))",
-                ]
-            )
-            logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.chat_ready", "turn_id": .string(turnId)])
-
-            if let rawCommand = chatResult.command {
-                do {
-                    let validated = try CmdRouter.validate(rawCommand)
-                    logger.info(
-                        "device_command validated",
-                        metadata: [
-                            "session_id": .string(sessionId),
-                            "action": .string(validated.action),
-                            "r": "\(validated.params.r)",
-                            "g": "\(validated.params.g)",
-                            "b": "\(validated.params.b)",
-                        ]
-                    )
-                    try await send(validated)
-                } catch {
-                    logger.error(
-                        "invalid device_command rejected",
-                        metadata: ["session_id": .string(sessionId), "error": "\(error)"]
-                    )
-                    try await send(ErrorMessage(code: "invalid_device_command", message: nil))
-                }
-            }
-
-            phase = .streamingTTS
-            try await send(TTSStart(sessionId: sessionId))
-            await mirrorTTSStart()
-            logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.tts_start", "turn_id": .string(turnId)])
-
-            logger.info(
-                "openai.speech start",
-                metadata: ["session_id": .string(sessionId), "input_chars": "\(chatResult.reply.count)"]
-            )
-            let pcm = try await openAI.speech(text: chatResult.reply)
-            try Task.checkCancellation()
-            let tTtsFirstByte = Date()
-            logger.info(
-                "openai.speech done",
-                metadata: [
-                    "session_id": .string(sessionId),
-                    "pcm_bytes": "\(pcm.count)",
-                    "ms": "\(ms(tLlmFirst, tTtsFirstByte))",
-                ]
-            )
-            dumpDebugTTSAudio(pcm, turnId: turnId)
-
-            let opusOut = try OpusCodec.encodeFromPCM(pcm, sampleRate: AudioParams.downlink.sampleRate)
-            logger.debug(
-                "downlink frames encoded",
-                metadata: ["session_id": .string(sessionId), "frames": "\(opusOut.count)", "pcm_bytes": "\(pcm.count)"]
-            )
-            for (index, chunk) in opusOut.enumerated() {
-                try Task.checkCancellation()
-                if index == 0 {
-                    logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.first_downlink_audio", "turn_id": .string(turnId)])
-                }
-                logger.debug(
-                    "ws send binary",
-                    metadata: ["session_id": .string(sessionId), "frame": "\(index + 1)", "bytes": "\(chunk.count)"]
-                )
-                try await outbound.writeBinary(chunk)
-                await speakers.broadcastBinary(chunk)
-            }
-            let tWsSent = Date()
-
-            guard phase == .streamingTTS else { return }
-            try await send(TTSEnd(sessionId: sessionId))
-            await mirrorTTSEnd()
-            phase = .connected
-            logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.tts_end", "turn_id": .string(turnId)])
-
-            let report = LatencyReport(
-                sessionId: sessionId,
-                turnId: turnId,
-                ms: LatencyMs(
-                    audioStopToAsrDone: ms(t0, tAsrDone),
-                    asrDoneToLlmFirstToken: ms(tAsrDone, tLlmFirst),
-                    llmFirstTokenToTtsFirstByte: ms(tLlmFirst, tTtsFirstByte),
-                    ttsFirstByteToWsSent: ms(tTtsFirstByte, tWsSent),
-                    audioStopToFirstDownlink: ms(t0, tTtsFirstByte)
-                ),
-                droppedFrames: droppedFrames
-            )
-            try await send(report)
-            logger.info(
-                "pipeline complete",
-                metadata: [
-                    "session_id": .string(sessionId),
-                    "turn_id": .string(turnId),
-                    "total_ms": "\(ms(t0, tWsSent))",
-                    "downlink_frames": "\(opusOut.count)",
-                ]
-            )
+            await runChatAndSpeak(turnId: turnId, transcript: transcript, t0: t0, tAsrDone: tAsrDone, droppedFrames: 0)
         } catch is CancellationError {
             logger.info("pipeline cancelled", metadata: ["session_id": .string(sessionId)])
         } catch {
@@ -328,28 +212,118 @@ actor VoiceSession {
             guard phase == .processing else { return }
             try await send(TranscriptFinal(sessionId: sessionId, text: cleanedTranscript))
 
-            guard !cleanedTranscript.isEmpty else {
+            await runChatAndSpeak(turnId: turnId, transcript: cleanedTranscript, t0: t0, tAsrDone: tAsrDone, droppedFrames: 0)
+        } catch is CancellationError {
+            logger.info("pipeline cancelled", metadata: ["session_id": .string(sessionId)])
+        } catch {
+            logger.error("pipeline failed", metadata: ["session_id": .string(sessionId), "error": "\(error)"])
+            try? await send(ErrorMessage(code: "pipeline_failed", message: "\(error)"))
+            phase = .connected
+        }
+    }
+
+    /// Streams the LLM reply token-by-token to Cartesia as it arrives and forwards
+    /// Cartesia's streamed PCM audio to the downlink incrementally, so chat
+    /// generation and TTS synthesis overlap instead of running sequentially.
+    private func runChatAndSpeak(turnId: String, transcript: String, t0: Date, tAsrDone: Date, droppedFrames: Int) async {
+        do {
+            guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 logger.warning("empty transcript — skipping chat/tts", metadata: ["session_id": .string(sessionId)])
                 try await send(ErrorMessage(code: "empty_transcript", message: "No speech detected in recording"))
                 phase = .connected
                 return
             }
 
-            logger.info("openai.chat start", metadata: ["session_id": .string(sessionId)])
-            let chatResult = try await openAI.chat(transcript: cleanedTranscript)
+            phase = .streamingTTS
+            try await send(TTSStart(sessionId: sessionId))
+            await mirrorTTSStart()
+            logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.tts_start", "turn_id": .string(turnId)])
+
+            let contextId = "\(sessionId)-\(turnId)"
+            activeContextId = contextId
+            let audioEvents = await cartesia.beginTurn(contextId: contextId)
+
+            var tLlmFirstToken: Date?
+            var tTtsFirstByte: Date?
+            var tWsFirstSent: Date?
+            var downlinkFrameCount = 0
+            var fullPCM = Data()
+
+            let downlinkTask = Task { [outbound, speakers, logger, sessionId] () -> DownlinkResult in
+                var firstByte: Date?
+                var firstWsSent: Date?
+                var frameCount = 0
+                var pcmAccumulator = Data()
+                for await event in audioEvents {
+                    switch event {
+                    case .audio(let pcm):
+                        if firstByte == nil {
+                            firstByte = Date()
+                            logger.info(
+                                "e2e stage",
+                                metadata: ["session_id": .string(sessionId), "stage": "server.first_tts_audio_chunk", "turn_id": .string(turnId)]
+                            )
+                        }
+                        pcmAccumulator.append(pcm)
+                        let opusOut = (try? OpusCodec.encodeFromPCM(pcm, sampleRate: AudioParams.downlink.sampleRate)) ?? []
+                        for chunk in opusOut {
+                            if firstWsSent == nil {
+                                firstWsSent = Date()
+                                logger.info(
+                                    "e2e stage",
+                                    metadata: ["session_id": .string(sessionId), "stage": "server.first_downlink_audio", "turn_id": .string(turnId)]
+                                )
+                            }
+                            frameCount += 1
+                            try? await outbound.writeBinary(chunk)
+                            await speakers.broadcastBinary(chunk)
+                        }
+                    case .done:
+                        break
+                    case .error(let message):
+                        logger.error("cartesia stream error", metadata: ["session_id": .string(sessionId), "error": .string(message)])
+                    }
+                }
+                return DownlinkResult(frameCount: frameCount, firstByte: firstByte, firstWsSent: firstWsSent, pcm: pcmAccumulator)
+            }
+
+            var chatResult = ChatToolResult(reply: "", command: nil)
+            for try await event in openAI.chat(transcript: transcript, history: conversationHistory) {
+                try Task.checkCancellation()
+                switch event {
+                case .token(let text):
+                    if tLlmFirstToken == nil {
+                        tLlmFirstToken = Date()
+                        logger.info(
+                            "e2e stage",
+                            metadata: ["session_id": .string(sessionId), "stage": "server.llm_first_token", "turn_id": .string(turnId)]
+                        )
+                    }
+                    await cartesia.sendTranscriptChunk(text, contextId: contextId, isFinal: false)
+                case .done(let result):
+                    chatResult = result
+                }
+            }
+            await cartesia.sendTranscriptChunk("", contextId: contextId, isFinal: true)
             try Task.checkCancellation()
-            let tLlmFirst = Date()
+            let tLlmDone = Date()
             logger.info(
-                "openai.chat done",
+                "openai.chat done (streamed)",
                 metadata: [
                     "session_id": .string(sessionId),
                     "reply_chars": "\(chatResult.reply.count)",
                     "reply": .string(chatResult.reply),
                     "has_command": "\(chatResult.command != nil)",
-                    "ms": "\(ms(tAsrDone, tLlmFirst))",
+                    "ms": "\(ms(tAsrDone, tLlmDone))",
                 ]
             )
             logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.chat_ready", "turn_id": .string(turnId)])
+
+            conversationHistory.append(ChatMessage(role: "user", content: transcript))
+            conversationHistory.append(ChatMessage(role: "assistant", content: chatResult.reply))
+            if conversationHistory.count > maxHistoryMessages {
+                conversationHistory.removeFirst(conversationHistory.count - maxHistoryMessages)
+            }
 
             if let rawCommand = chatResult.command {
                 do {
@@ -374,46 +348,13 @@ actor VoiceSession {
                 }
             }
 
-            phase = .streamingTTS
-            try await send(TTSStart(sessionId: sessionId))
-            await mirrorTTSStart()
-            logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.tts_start", "turn_id": .string(turnId)])
-
-            logger.info(
-                "openai.speech start",
-                metadata: ["session_id": .string(sessionId), "input_chars": "\(chatResult.reply.count)"]
-            )
-            let pcm = try await openAI.speech(text: chatResult.reply)
-            try Task.checkCancellation()
-            let tTtsFirstByte = Date()
-            logger.info(
-                "openai.speech done",
-                metadata: [
-                    "session_id": .string(sessionId),
-                    "pcm_bytes": "\(pcm.count)",
-                    "ms": "\(ms(tLlmFirst, tTtsFirstByte))",
-                ]
-            )
-            dumpDebugTTSAudio(pcm, turnId: turnId)
-
-            let opusOut = try OpusCodec.encodeFromPCM(pcm, sampleRate: AudioParams.downlink.sampleRate)
-            logger.debug(
-                "downlink frames encoded",
-                metadata: ["session_id": .string(sessionId), "frames": "\(opusOut.count)", "pcm_bytes": "\(pcm.count)"]
-            )
-            for (index, chunk) in opusOut.enumerated() {
-                try Task.checkCancellation()
-                if index == 0 {
-                    logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.first_downlink_audio", "turn_id": .string(turnId)])
-                }
-                logger.debug(
-                    "ws send binary",
-                    metadata: ["session_id": .string(sessionId), "frame": "\(index + 1)", "bytes": "\(chunk.count)"]
-                )
-                try await outbound.writeBinary(chunk)
-                await speakers.broadcastBinary(chunk)
-            }
-            let tWsSent = Date()
+            let downlinkResult = await downlinkTask.value
+            activeContextId = nil
+            tTtsFirstByte = downlinkResult.firstByte
+            tWsFirstSent = downlinkResult.firstWsSent
+            downlinkFrameCount = downlinkResult.frameCount
+            fullPCM = downlinkResult.pcm
+            dumpDebugTTSAudio(fullPCM, turnId: turnId)
 
             guard phase == .streamingTTS else { return }
             try await send(TTSEnd(sessionId: sessionId))
@@ -421,17 +362,19 @@ actor VoiceSession {
             phase = .connected
             logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.tts_end", "turn_id": .string(turnId)])
 
+            let tEnd = Date()
             let report = LatencyReport(
                 sessionId: sessionId,
                 turnId: turnId,
                 ms: LatencyMs(
                     audioStopToAsrDone: ms(t0, tAsrDone),
-                    asrDoneToLlmFirstToken: ms(tAsrDone, tLlmFirst),
-                    llmFirstTokenToTtsFirstByte: ms(tLlmFirst, tTtsFirstByte),
-                    ttsFirstByteToWsSent: ms(tTtsFirstByte, tWsSent),
-                    audioStopToFirstDownlink: ms(t0, tTtsFirstByte)
+                    asrDoneToLlmFirstToken: tLlmFirstToken.map { ms(tAsrDone, $0) } ?? 0,
+                    llmFirstTokenToTtsFirstByte: (tLlmFirstToken != nil && tTtsFirstByte != nil) ? ms(tLlmFirstToken!, tTtsFirstByte!) : 0,
+                    ttsFirstByteToWsSent: (tTtsFirstByte != nil && tWsFirstSent != nil) ? ms(tTtsFirstByte!, tWsFirstSent!) : 0,
+                    audioStopToFirstDownlink: tWsFirstSent.map { ms(t0, $0) } ?? ms(t0, tEnd),
+                    audioStopToFirstTtsAudioChunk: tTtsFirstByte.map { ms(t0, $0) } ?? 0
                 ),
-                droppedFrames: 0
+                droppedFrames: droppedFrames
             )
             try await send(report)
             logger.info(
@@ -439,17 +382,26 @@ actor VoiceSession {
                 metadata: [
                     "session_id": .string(sessionId),
                     "turn_id": .string(turnId),
-                    "total_ms": "\(ms(t0, tWsSent))",
-                    "downlink_frames": "\(opusOut.count)",
+                    "total_ms": "\(ms(t0, tEnd))",
+                    "downlink_frames": "\(downlinkFrameCount)",
                 ]
             )
         } catch is CancellationError {
+            activeContextId = nil
             logger.info("pipeline cancelled", metadata: ["session_id": .string(sessionId)])
         } catch {
+            activeContextId = nil
             logger.error("pipeline failed", metadata: ["session_id": .string(sessionId), "error": "\(error)"])
             try? await send(ErrorMessage(code: "pipeline_failed", message: "\(error)"))
             phase = .connected
         }
+    }
+
+    private struct DownlinkResult {
+        let frameCount: Int
+        let firstByte: Date?
+        let firstWsSent: Date?
+        let pcm: Data
     }
 
     private func ms(_ a: Date, _ b: Date) -> Int {

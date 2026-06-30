@@ -54,7 +54,6 @@ final class CmdRouterTests: XCTestCase {
         let outbound = TestOutboundWriter()
         let speakerWriter = TestOutboundWriter()
         let openAI = StubOpenAIService(
-            transcript: "ignored",
             chatResult: ChatToolResult(reply: "Hello from test", command: nil),
             speechData: Data([0, 1, 2, 3, 4, 5, 6, 7])
         )
@@ -62,7 +61,9 @@ final class CmdRouterTests: XCTestCase {
         let speakers = SpeakerRegistry(logger: logger)
         await speakers.register(id: UUID(), outbound: speakerWriter)
 
-        let session = VoiceSession(outbound: outbound, openAI: openAI, speakers: speakers, logger: logger)
+        let cartesia = FakeCartesiaService(audioChunks: [Data([0, 1, 2, 3, 4, 5, 6, 7])])
+        let stt = FakeCartesiaSTTService()
+        let session = VoiceSession(outbound: outbound, openAI: openAI, cartesia: cartesia, stt: stt, speakers: speakers, logger: logger)
         try await session.start()
         await session.handleTranscriptInput("halo dunia")
 
@@ -137,21 +138,59 @@ private actor TestOutboundWriter: SessionOutboundWriter {
 }
 
 private struct StubOpenAIService: OpenAIService {
-    let transcript: String
     let chatResult: ChatToolResult
     let speechData: Data
 
-    func transcribe(wav: Data) async throws -> String {
-        transcript
-    }
-
-    func chat(transcript: String) async throws -> ChatToolResult {
-        chatResult
+    func chat(transcript: String, history: [ChatMessage]) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            if !chatResult.reply.isEmpty {
+                continuation.yield(.token(chatResult.reply))
+            }
+            continuation.yield(.done(chatResult))
+            continuation.finish()
+        }
     }
 
     func speech(text: String) async throws -> Data {
         speechData
     }
+}
+
+private actor FakeCartesiaService: CartesiaTTSService {
+    private let audioChunks: [Data]
+    private var continuations: [String: AsyncStream<CartesiaEvent>.Continuation] = [:]
+
+    init(audioChunks: [Data]) {
+        self.audioChunks = audioChunks
+    }
+
+    func beginTurn(contextId: String) -> AsyncStream<CartesiaEvent> {
+        AsyncStream { continuation in
+            continuations[contextId] = continuation
+        }
+    }
+
+    func sendTranscriptChunk(_ text: String, contextId: String, isFinal: Bool) async {
+        guard isFinal, let continuation = continuations[contextId] else { return }
+        for chunk in audioChunks {
+            continuation.yield(.audio(chunk))
+        }
+        continuation.yield(.done)
+        continuation.finish()
+        continuations.removeValue(forKey: contextId)
+    }
+
+    func cancelTurn(contextId: String) async {
+        continuations[contextId]?.finish()
+        continuations.removeValue(forKey: contextId)
+    }
+}
+
+private actor FakeCartesiaSTTService: CartesiaSTTServiceProtocol {
+    func connect() async {}
+    func sendAudio(_ data: Data) async {}
+    func finalize() async -> String { "" }
+    func close() async {}
 }
 
 private enum RecordedMessage: Equatable {

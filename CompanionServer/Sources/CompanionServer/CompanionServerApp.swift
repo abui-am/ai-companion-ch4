@@ -27,6 +27,13 @@ struct CompanionServerApp {
         )
 
         let openAI = OpenAIRESTService(apiKey: config.openAIAPIKey, logger: serverLogger)
+        let cartesia = CartesiaService(
+            apiKey: config.cartesiaAPIKey,
+            voiceId: config.cartesiaVoiceId,
+            modelId: config.cartesiaModelId,
+            sampleRate: AudioParams.downlink.sampleRate,
+            logger: serverLogger
+        )
         let speakers = SpeakerRegistry(logger: serverLogger)
 
         let wsRouter = Router(context: BasicWebSocketRequestContext.self)
@@ -39,9 +46,16 @@ struct CompanionServerApp {
             return .dontUpgrade
         } onUpgrade: { inbound, outbound, _ in
             serverLogger.info("ws connection upgraded")
+            let stt = CartesiaSTTService(
+                apiKey: config.cartesiaAPIKey,
+                sampleRate: AudioParams.uplink.sampleRate,
+                logger: serverLogger
+            )
             let session = VoiceSession(
                 outbound: WebSocketSessionOutboundWriter(base: outbound),
                 openAI: openAI,
+                cartesia: cartesia,
+                stt: stt,
                 speakers: speakers,
                 logger: serverLogger
             )

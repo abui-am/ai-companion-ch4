@@ -133,6 +133,7 @@ struct LatencyMs: Codable {
     let llmFirstTokenToTtsFirstByte: Int
     let ttsFirstByteToWsSent: Int
     let audioStopToFirstDownlink: Int
+    let audioStopToFirstTtsAudioChunk: Int
 
     enum CodingKeys: String, CodingKey {
         case audioStopToAsrDone = "audio_stop_to_asr_done"
@@ -140,6 +141,7 @@ struct LatencyMs: Codable {
         case llmFirstTokenToTtsFirstByte = "llm_first_token_to_tts_first_byte"
         case ttsFirstByteToWsSent = "tts_first_byte_to_ws_sent"
         case audioStopToFirstDownlink = "audio_stop_to_first_downlink"
+        case audioStopToFirstTtsAudioChunk = "audio_stop_to_first_tts_audio_chunk"
     }
 }
 

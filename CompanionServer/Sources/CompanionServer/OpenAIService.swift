@@ -1,14 +1,25 @@
 import Foundation
 import Logging
 
-struct ChatToolResult {
+struct ChatToolResult: Sendable {
     let reply: String
     let command: DeviceCommand?
 }
 
+enum ChatStreamEvent: Sendable {
+    case token(String)
+    case done(ChatToolResult)
+}
+
+/// A single turn in a session's conversation history, fed back to the LLM so it
+/// has context from earlier turns in the same connection.
+struct ChatMessage: Sendable {
+    let role: String
+    let content: String
+}
+
 protocol OpenAIService: Sendable {
-    func transcribe(wav: Data) async throws -> String
-    func chat(transcript: String) async throws -> ChatToolResult
+    func chat(transcript: String, history: [ChatMessage]) -> AsyncThrowingStream<ChatStreamEvent, Error>
     func speech(text: String) async throws -> Data
 }
 
@@ -35,78 +46,91 @@ struct OpenAIRESTService: OpenAIService {
         return request
     }
 
-    func transcribe(wav: Data) async throws -> String {
-        let url = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
-        logger.debug("HTTP POST /v1/audio/transcriptions", metadata: ["wav_bytes": "\(wav.count)", "model": "whisper-1"])
-        var request = authorizedRequest(url: url)
-        request.httpMethod = "POST"
-        let boundary = UUID().uuidString
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+    func chat(transcript: String, history: [ChatMessage]) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let url = URL(string: "https://api.openai.com/v1/chat/completions")!
+                    logger.debug(
+                        "HTTP POST /v1/chat/completions (stream)",
+                        metadata: ["model": "gpt-5-nano", "transcript_chars": "\(transcript.count)", "history_messages": "\(history.count)"]
+                    )
+                    var request = authorizedRequest(url: url)
+                    request.httpMethod = "POST"
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
-        var body = Data()
-        func appendField(_ name: String, _ value: String) {
-            body.append("--\(boundary)\r\n".data(using: .utf8)!)
-            body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8)!)
-            body.append("\(value)\r\n".data(using: .utf8)!)
+                    let body = ChatRequest(
+                        model: "gpt-5-nano",
+                        messages: [.init(role: "system", content: CompanionPrompt.system)]
+                            + history.map { .init(role: $0.role, content: $0.content) }
+                            + [.init(role: "user", content: CompanionPrompt.userMessage(for: transcript))],
+                        tools: [.setLEDTool],
+                        stream: true
+                    )
+                    request.httpBody = try JSONEncoder().encode(body)
+
+                    let (bytes, response) = try await session.bytes(for: request)
+                    let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                    guard (200...299).contains(status) else {
+                        var errorData = Data()
+                        for try await byte in bytes { errorData.append(byte) }
+                        logger.error(
+                            "OpenAI HTTP error",
+                            metadata: ["status": "\(status)", "body": .string(String(data: errorData, encoding: .utf8) ?? "")]
+                        )
+                        throw OpenAIError.badResponse(status, String(data: errorData, encoding: .utf8) ?? "")
+                    }
+
+                    var contentBuffer = ""
+                    var toolCalls: [Int: (name: String, arguments: String)] = [:]
+
+                    for try await line in bytes.lines {
+                        try Task.checkCancellation()
+                        guard line.hasPrefix("data: ") else { continue }
+                        let payload = String(line.dropFirst(6))
+                        if payload == "[DONE]" { break }
+                        guard let data = payload.data(using: .utf8) else { continue }
+                        let chunk = try JSONDecoder().decode(ChatStreamChunk.self, from: data)
+                        guard let choice = chunk.choices.first else { continue }
+
+                        if let content = choice.delta.content, !content.isEmpty {
+                            contentBuffer += content
+                            continuation.yield(.token(content))
+                        }
+                        if let calls = choice.delta.toolCalls {
+                            for call in calls {
+                                var entry = toolCalls[call.index] ?? (name: "", arguments: "")
+                                if let name = call.function?.name { entry.name = name }
+                                if let args = call.function?.arguments { entry.arguments += args }
+                                toolCalls[call.index] = entry
+                            }
+                        }
+                    }
+
+                    var command: DeviceCommand?
+                    if let setLED = toolCalls.values.first(where: { $0.name == "set_led" }),
+                       let argsData = setLED.arguments.data(using: .utf8),
+                       let params = try? JSONDecoder().decode(LEDParams.self, from: argsData) {
+                        command = DeviceCommand(action: "set_led", params: params)
+                        logger.debug(
+                            "chat tool call",
+                            metadata: ["name": "set_led", "arguments": .string(setLED.arguments)]
+                        )
+                    }
+
+                    logger.debug(
+                        "HTTP response /v1/chat/completions (stream) complete",
+                        metadata: ["reply_chars": "\(contentBuffer.count)"]
+                    )
+                    continuation.yield(.done(ChatToolResult(reply: contentBuffer, command: command)))
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
-        appendField("model", "whisper-1")
-        body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n".data(using: .utf8)!)
-        body.append("Content-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
-        body.append(wav)
-        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
-        request.httpBody = body
-
-        let (data, response) = try await session.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-        logger.debug("HTTP response /v1/audio/transcriptions", metadata: ["status": "\(status)", "bytes": "\(data.count)"])
-        try Self.checkStatus(response, data, logger: logger)
-        let decoded = try JSONDecoder().decode(TranscriptionResponse.self, from: data)
-        return decoded.text
-    }
-
-    func chat(transcript: String) async throws -> ChatToolResult {
-        let url = URL(string: "https://api.openai.com/v1/chat/completions")!
-        logger.debug(
-            "HTTP POST /v1/chat/completions",
-            metadata: ["model": "gpt-54", "transcript_chars": "\(transcript.count)"]
-        )
-        var request = authorizedRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-        let body = ChatRequest(
-            model: "gpt-5-nano",
-            messages: [
-                .init(role: "system", content: CompanionPrompt.system),
-                .init(role: "user", content: CompanionPrompt.userMessage(for: transcript)),
-            ],
-            tools: [.setLEDTool]
-        )
-        request.httpBody = try JSONEncoder().encode(body)
-
-        let (data, response) = try await session.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-        logger.debug("HTTP response /v1/chat/completions", metadata: ["status": "\(status)", "bytes": "\(data.count)"])
-        try Self.checkStatus(response, data, logger: logger)
-        let decoded = try JSONDecoder().decode(ChatResponse.self, from: data)
-        guard let choice = decoded.choices.first else {
-            logger.warning("chat completion returned no choices")
-            return ChatToolResult(reply: "", command: nil)
-        }
-
-        var command: DeviceCommand?
-        if let toolCall = choice.message.toolCalls?.first,
-           let argsData = toolCall.function.arguments.data(using: .utf8),
-           let params = try? JSONDecoder().decode(LEDParams.self, from: argsData) {
-            command = DeviceCommand(action: "set_led", params: params)
-            logger.debug(
-                "chat tool call",
-                metadata: ["name": .string(toolCall.function.name), "arguments": .string(toolCall.function.arguments)]
-            )
-        }
-
-        return ChatToolResult(reply: choice.message.content ?? "", command: command)
     }
 
     func speech(text: String) async throws -> Data {
@@ -141,14 +165,11 @@ struct OpenAIRESTService: OpenAIService {
 
 // MARK: - REST payload types
 
-private struct TranscriptionResponse: Decodable {
-    let text: String
-}
-
 private struct ChatRequest: Encodable {
     let model: String
     let messages: [ChatMessageIn]
     let tools: [ChatTool]
+    let stream: Bool
 
     struct ChatMessageIn: Encodable {
         let role: String
@@ -188,16 +209,16 @@ private struct ChatTool: Encodable {
     )
 }
 
-private struct ChatResponse: Decodable {
+private struct ChatStreamChunk: Decodable {
     let choices: [Choice]
 
     struct Choice: Decodable {
-        let message: Message
+        let delta: Delta
     }
 
-    struct Message: Decodable {
+    struct Delta: Decodable {
         let content: String?
-        let toolCalls: [ToolCall]?
+        let toolCalls: [ToolCallDelta]?
 
         enum CodingKeys: String, CodingKey {
             case content
@@ -205,13 +226,14 @@ private struct ChatResponse: Decodable {
         }
     }
 
-    struct ToolCall: Decodable {
-        let function: FunctionCall
+    struct ToolCallDelta: Decodable {
+        let index: Int
+        let function: FunctionDelta?
     }
 
-    struct FunctionCall: Decodable {
-        let name: String
-        let arguments: String
+    struct FunctionDelta: Decodable {
+        let name: String?
+        let arguments: String?
     }
 }
 
