@@ -27,9 +27,9 @@ struct PlaybackChunk {
 
 // Jitter buffer sized for ~720 ms at 60 ms/frame; server paces sends so this
 // rarely fills. Storage is static inside the queue (no per-frame malloc).
-static constexpr UBaseType_t kPlaybackQueueDepth = 32;
-static constexpr UBaseType_t kInitialPrefillFrames = 8;
-static constexpr UBaseType_t kMaxPrefillFrames = 16;
+static constexpr UBaseType_t kPlaybackQueueDepth = 6;
+static constexpr UBaseType_t kInitialPrefillFrames = 3;
+static constexpr UBaseType_t kMaxPrefillFrames = 6;
 static constexpr int kQueueWaitMs = 120;
 static constexpr int kStarvationFramesBeforeRebuffer = 8;
 static constexpr int kDownlinkFrameMs = COMPANION_FRAME_MS;
@@ -195,6 +195,7 @@ static void onButtonEvent(ButtonEvent event, void *ctx) {
 
     switch (s) {
     case SESSION_IDLE:
+        audioIoSpeakerBeep();
         sendText(protocolBuildAudioStart());
         setState(SESSION_CAPTURING);
         xSemaphoreGive(s_captureStartSem);

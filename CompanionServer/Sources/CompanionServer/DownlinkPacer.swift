@@ -48,15 +48,22 @@ actor DownlinkPacer {
 
     func enqueue(pcm: Data) async throws -> Int {
         guard turnActive else { return 0 }
-        let chunks = try OpusCodec.encodeFromPCM(pcm, sampleRate: sampleRate)
-        for chunk in chunks {
+        // Send raw 16-bit mono PCM in 60 ms frames so the firmware can memcpy
+        // directly into its I2S output buffer without an Opus decoder.
+        let frameBytes = sampleRate * 2 * 60 / 1000
+        var offset = 0
+        var count = 0
+        while offset < pcm.count {
             try Task.checkCancellation()
             while frameQueue.count >= maxQueuedFrames {
                 try await waitForQueueSpace()
             }
-            frameQueue.append(chunk)
+            let end = min(offset + frameBytes, pcm.count)
+            frameQueue.append(pcm.subdata(in: offset..<end))
+            count += 1
+            offset = end
         }
-        return chunks.count
+        return count
     }
 
     /// Waits until all enqueued frames have been sent at real-time pace.

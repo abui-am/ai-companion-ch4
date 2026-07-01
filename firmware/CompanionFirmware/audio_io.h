@@ -15,3 +15,6 @@ size_t audioIoReadUplinkFrame(uint8_t *out, size_t outCapacity);
 // duplicated to both I2S slots so mono audio plays correctly regardless of
 // which channel the amp's hardware select pin is wired to.
 void audioIoWriteDownlink(const int16_t *monoSamples, size_t sampleCount);
+
+// Short confirmation beep on the speaker. Call after audioIoInit().
+void audioIoSpeakerBeep();

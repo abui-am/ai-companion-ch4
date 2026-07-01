@@ -7,9 +7,9 @@
 #include "config.h"
 #include "protocol.h"
 
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <esp_heap_caps.h>
 
 #if MIC_LOOPBACK_TEST_MODE
 #include "button.h"
@@ -50,7 +50,8 @@ static bool loopbackInitRecordBuffer() {
 
   const size_t frameBytes = COMPANION_UPLINK_FRAME_BYTES;
   const size_t minBytes = loopbackRecordBytesForSec(1);
-  const size_t idealBytes = loopbackRecordBytesForSec(MIC_LOOPBACK_MAX_RECORD_SEC);
+  const size_t idealBytes =
+      loopbackRecordBytesForSec(MIC_LOOPBACK_MAX_RECORD_SEC);
 
   size_t psramBlock =
       heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -63,12 +64,12 @@ static bool loopbackInitRecordBuffer() {
   internalBlock = (internalBlock / frameBytes) * frameBytes;
   psramBlock = (psramBlock / frameBytes) * frameBytes;
 
-  Serial.printf("[MIC LOOPBACK] alloc: want=%u psram_block=%u internal_block=%u "
-                "free_heap=%u\n",
-                static_cast<unsigned>(idealBytes),
-                static_cast<unsigned>(psramBlock),
-                static_cast<unsigned>(internalBlock),
-                static_cast<unsigned>(ESP.getFreeHeap()));
+  Serial.printf(
+      "[MIC LOOPBACK] alloc: want=%u psram_block=%u internal_block=%u "
+      "free_heap=%u\n",
+      static_cast<unsigned>(idealBytes), static_cast<unsigned>(psramBlock),
+      static_cast<unsigned>(internalBlock),
+      static_cast<unsigned>(ESP.getFreeHeap()));
 
   for (size_t tryBytes = idealBytes; tryBytes >= minBytes;
        tryBytes -= frameBytes) {
@@ -77,9 +78,8 @@ static bool loopbackInitRecordBuffer() {
       continue;
     }
     s_recordBufCap = tryBytes;
-    const float maxSec =
-        static_cast<float>(s_recordBufCap) /
-        static_cast<float>(COMPANION_UPLINK_SAMPLE_RATE * 2);
+    const float maxSec = static_cast<float>(s_recordBufCap) /
+                         static_cast<float>(COMPANION_UPLINK_SAMPLE_RATE * 2);
     const bool inPsram = esp_ptr_external_ram(s_recordBuf);
     Serial.printf("[MIC LOOPBACK] record buffer %u bytes (~%.1f sec, %s)\n",
                   static_cast<unsigned>(s_recordBufCap), maxSec,
@@ -102,7 +102,8 @@ static bool loopbackInitRecordBuffer() {
 }
 #endif
 
-// INMP441: 24-bit audio left-justified in a 32-bit I2S word (MIC_DATA_SHIFT in config.h).
+// INMP441: 24-bit audio left-justified in a 32-bit I2S word (MIC_DATA_SHIFT in
+// config.h).
 
 static const i2s_port_t MIC_PORT = I2S_NUM_0;
 #if HAS_MIC
@@ -133,6 +134,7 @@ void audioIoInit() {
     Serial.printf("audio: mic i2s_driver_install failed err=%d\n", micErr);
   } else {
     i2s_pin_config_t micPins = {
+        .mck_io_num = I2S_PIN_NO_CHANGE,
         .bck_io_num = PIN_MIC_BCLK,
         .ws_io_num = PIN_MIC_WS,
         .data_out_num = I2S_PIN_NO_CHANGE,
@@ -173,6 +175,7 @@ void audioIoInit() {
     Serial.printf("audio: speaker i2s_driver_install failed err=%d\n", spkErr);
   } else {
     i2s_pin_config_t spkPins = {
+        .mck_io_num = I2S_PIN_NO_CHANGE,
         .bck_io_num = PIN_SPK_BCLK,
         .ws_io_num = PIN_SPK_WS,
         .data_out_num = PIN_SPK_DOUT,
@@ -182,9 +185,10 @@ void audioIoInit() {
     if (spkErr != ESP_OK) {
       Serial.printf("audio: speaker i2s_set_pin failed err=%d\n", spkErr);
     } else {
-      Serial.printf("audio: I2S speaker ready (bclk=%d ws=%d dout=%d @ %d Hz)\n",
-                    PIN_SPK_BCLK, PIN_SPK_WS, PIN_SPK_DOUT,
-                    COMPANION_DOWNLINK_SAMPLE_RATE);
+      Serial.printf(
+          "audio: I2S speaker ready (bclk=%d ws=%d dout=%d @ %d Hz)\n",
+          PIN_SPK_BCLK, PIN_SPK_WS, PIN_SPK_DOUT,
+          COMPANION_DOWNLINK_SAMPLE_RATE);
     }
   }
   Serial.flush();
@@ -222,8 +226,8 @@ size_t audioIoReadUplinkFrame(uint8_t *out, size_t outCapacity) {
 #if HAS_MIC
   static int32_t rawBuf[COMPANION_UPLINK_FRAME_BYTES / sizeof(int16_t)];
   size_t bytesRead = 0;
-  esp_err_t err =
-      i2s_read(MIC_PORT, rawBuf, sizeof(rawBuf), &bytesRead, pdMS_TO_TICKS(200));
+  esp_err_t err = i2s_read(MIC_PORT, rawBuf, sizeof(rawBuf), &bytesRead,
+                           pdMS_TO_TICKS(200));
   if (err != ESP_OK) {
     Serial.printf("audio: mic read failed err=%d\n", err);
     return 0;
@@ -388,8 +392,8 @@ static PcmStats analyzePcm(const int16_t *samples, size_t count) {
     prev = static_cast<int16_t>(v);
   }
   stats.dc = static_cast<int32_t>(sum / static_cast<int64_t>(count));
-  stats.rms = static_cast<int32_t>(sqrt(static_cast<double>(sumSq) /
-                                        static_cast<double>(count)));
+  stats.rms = static_cast<int32_t>(
+      sqrt(static_cast<double>(sumSq) / static_cast<double>(count)));
   return stats;
 }
 
@@ -436,7 +440,8 @@ struct LoopbackCounters {
   uint32_t idleLoops = 0;
 };
 
-static void applyMonitorGain(const int16_t *in, int16_t *out, size_t sampleCount) {
+static void applyMonitorGain(const int16_t *in, int16_t *out,
+                             size_t sampleCount) {
   for (size_t i = 0; i < sampleCount; i++) {
     int32_t v = static_cast<int32_t>(in[i]) * MIC_LOOPBACK_MONITOR_GAIN;
     if (v > 32767) {
@@ -464,13 +469,14 @@ static size_t resample16kTo24k(const int16_t *in, size_t inCount, int16_t *out,
     }
     size_t idx2 = (idx + 1 < inCount) ? idx + 1 : idx;
     float sample = static_cast<float>(in[idx]) * (1.0f - frac) +
-                     static_cast<float>(in[idx2]) * frac;
+                   static_cast<float>(in[idx2]) * frac;
     out[i] = static_cast<int16_t>(sample);
   }
   return outCount;
 }
 
-static bool loopbackPlayMicFrame(const int16_t *monoSamples, size_t sampleCount) {
+static bool loopbackPlayMicFrame(const int16_t *monoSamples,
+                                 size_t sampleCount) {
   static int16_t gainBuf[COMPANION_UPLINK_FRAME_BYTES / sizeof(int16_t)];
   static int16_t resampledBuf[COMPANION_DOWNLINK_FRAME_BYTES / sizeof(int16_t)];
   applyMonitorGain(monoSamples, gainBuf, sampleCount);
@@ -485,24 +491,21 @@ static bool loopbackPlayMicFrame(const int16_t *monoSamples, size_t sampleCount)
 static void loopbackConfirmBeep() { audioIoSpeakerBeep(); }
 #endif
 
-static size_t loopbackWriteDownlink(const int16_t *monoSamples, size_t sampleCount,
-                                    bool *writeOk) {
+static size_t loopbackWriteDownlink(const int16_t *monoSamples,
+                                    size_t sampleCount, bool *writeOk) {
   *writeOk = loopbackPlayMicFrame(monoSamples, sampleCount);
   size_t outCount = (sampleCount * 3) / 2;
   return outCount * 2 * sizeof(int16_t);
 }
 
-static void logLoopbackSummary(const LoopbackCounters &counters,
-                               uint32_t windowFrames,
-                               const IntervalStats &interval,
-                               const IntervalStats &readUs,
-                               const IntervalStats &writeUs,
-                               int32_t rmsMin, int32_t rmsMax, int32_t rmsSum,
-                               int32_t peakMax, uint32_t clipSum) {
-  float rmsAvg = windowFrames > 0
-                     ? static_cast<float>(rmsSum) /
-                           static_cast<float>(windowFrames)
-                     : 0.0f;
+static void
+logLoopbackSummary(const LoopbackCounters &counters, uint32_t windowFrames,
+                   const IntervalStats &interval, const IntervalStats &readUs,
+                   const IntervalStats &writeUs, int32_t rmsMin, int32_t rmsMax,
+                   int32_t rmsSum, int32_t peakMax, uint32_t clipSum) {
+  float rmsAvg = windowFrames > 0 ? static_cast<float>(rmsSum) /
+                                        static_cast<float>(windowFrames)
+                                  : 0.0f;
   Serial.println("[LOOPBACK SUMMARY] --------------------------------");
   Serial.printf("  session_frames=%lu window_frames=%lu short_reads=%lu "
                 "write_err=%lu clip_sum=%lu heap=%u\n",
@@ -516,18 +519,21 @@ static void logLoopbackSummary(const LoopbackCounters &counters,
                 "(expected=%d)\n",
                 interval.minMs, interval.maxMs, interval.meanMs,
                 interval.stdDev(), COMPANION_FRAME_MS);
-  Serial.printf("  read_us   min=%.0f max=%.0f avg=%.0f (hw wait ~%dms — normal)\n",
-                readUs.minMs, readUs.maxMs, readUs.meanMs, COMPANION_FRAME_MS);
+  Serial.printf(
+      "  read_us   min=%.0f max=%.0f avg=%.0f (hw wait ~%dms — normal)\n",
+      readUs.minMs, readUs.maxMs, readUs.meanMs, COMPANION_FRAME_MS);
   if (writeUs.count > 0) {
     Serial.printf("  write_us  min=%.0f max=%.0f avg=%.0f std=%.0f\n",
-                  writeUs.minMs, writeUs.maxMs, writeUs.meanMs, writeUs.stdDev());
+                  writeUs.minMs, writeUs.maxMs, writeUs.meanMs,
+                  writeUs.stdDev());
   }
-  Serial.printf("  rms_avg=%.0f rms_min=%ld rms_max=%ld peak_max=%ld\n",
-                rmsAvg, static_cast<long>(rmsMin), static_cast<long>(rmsMax),
+  Serial.printf("  rms_avg=%.0f rms_min=%ld rms_max=%ld peak_max=%ld\n", rmsAvg,
+                static_cast<long>(rmsMin), static_cast<long>(rmsMax),
                 static_cast<long>(peakMax));
   if (clipSum > 0) {
-    Serial.printf("  WARNING: clipping detected — try MIC_DATA_SHIFT=%d in config.h\n",
-                  MIC_DATA_SHIFT + 1);
+    Serial.printf(
+        "  WARNING: clipping detected — try MIC_DATA_SHIFT=%d in config.h\n",
+        MIC_DATA_SHIFT + 1);
   }
   Serial.println("[LOOPBACK SUMMARY] --------------------------------");
 }
@@ -550,9 +556,8 @@ static int32_t pcmPeak(const int16_t *samples, size_t count) {
 static int audioIoPlayPcmMono(const int16_t *samples, size_t sampleCount,
                               int sampleRateHz) {
   i2s_zero_dma_buffer(SPK_PORT);
-  esp_err_t clkErr =
-      i2s_set_clk(SPK_PORT, static_cast<uint32_t>(sampleRateHz),
-                  I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+  esp_err_t clkErr = i2s_set_clk(SPK_PORT, static_cast<uint32_t>(sampleRateHz),
+                                 I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
   if (clkErr != ESP_OK) {
     Serial.printf("audio: i2s_set_clk %d Hz failed err=%d\n", sampleRateHz,
                   clkErr);
@@ -568,8 +573,8 @@ static int audioIoPlayPcmMono(const int16_t *samples, size_t sampleCount,
       chunk = sizeof(monoBuf) / sizeof(monoBuf[0]);
     }
     for (size_t i = 0; i < chunk; i++) {
-      int32_t v = static_cast<int32_t>(samples[offset + i]) *
-                  MIC_LOOPBACK_MONITOR_GAIN;
+      int32_t v =
+          static_cast<int32_t>(samples[offset + i]) * MIC_LOOPBACK_MONITOR_GAIN;
       if (v > 32767) {
         v = 32767;
       } else if (v < -32768) {
@@ -583,9 +588,8 @@ static int audioIoPlayPcmMono(const int16_t *samples, size_t sampleCount,
       stereoBuf[2 * i + 1] = monoBuf[i];
     }
     size_t bytesWritten = 0;
-    esp_err_t err =
-        i2s_write(SPK_PORT, stereoBuf, chunk * 2 * sizeof(int16_t),
-                  &bytesWritten, portMAX_DELAY);
+    esp_err_t err = i2s_write(SPK_PORT, stereoBuf, chunk * 2 * sizeof(int16_t),
+                              &bytesWritten, portMAX_DELAY);
     if (err != ESP_OK || bytesWritten == 0) {
       Serial.printf("audio: pcm i2s_write failed err=%d written=%u\n", err,
                     static_cast<unsigned>(bytesWritten));
@@ -615,13 +619,14 @@ static void playbackRecording(size_t bytes) {
   const int16_t *samples = reinterpret_cast<const int16_t *>(s_recordBuf);
   const size_t sampleCount = bytes / sizeof(int16_t);
   const int32_t peak = pcmPeak(samples, sampleCount);
-  const unsigned durationMs = static_cast<unsigned>(
-      sampleCount * 1000 / COMPANION_UPLINK_SAMPLE_RATE);
+  const unsigned durationMs =
+      static_cast<unsigned>(sampleCount * 1000 / COMPANION_UPLINK_SAMPLE_RATE);
   Serial.printf("[MIC] (6) playback (~%u ms, %u samples, peak=%ld)...\n",
                 durationMs, static_cast<unsigned>(sampleCount),
                 static_cast<long>(peak));
   if (peak < 200) {
-    Serial.println("[MIC] WARNING: recording very quiet — check mic wiring/shift");
+    Serial.println(
+        "[MIC] WARNING: recording very quiet — check mic wiring/shift");
   }
 
   if (audioIoPlayPcmMono(samples, sampleCount, COMPANION_UPLINK_SAMPLE_RATE) !=
@@ -658,18 +663,20 @@ static void finishRecordingSession(LoopbackCounters &counters,
   const int16_t *samples = reinterpret_cast<const int16_t *>(s_recordBuf);
   const size_t sampleCount = bytes / sizeof(int16_t);
   const int32_t peak = pcmPeak(samples, sampleCount);
-  const unsigned durationMs = static_cast<unsigned>(
-      sampleCount * 1000 / COMPANION_UPLINK_SAMPLE_RATE);
+  const unsigned durationMs =
+      static_cast<unsigned>(sampleCount * 1000 / COMPANION_UPLINK_SAMPLE_RATE);
   Serial.printf("[MIC] captured %u samples (~%u ms) peak=%ld\n",
                 static_cast<unsigned>(sampleCount), durationMs,
                 static_cast<long>(peak));
   if (peak < 200) {
-    Serial.println("[MIC] WARNING: recording very quiet — check mic wiring/shift");
+    Serial.println(
+        "[MIC] WARNING: recording very quiet — check mic wiring/shift");
   }
 
 #if MIC_UPLOAD_TO_SERVER
   Serial.println("[MIC] (6) uploading to CompanionServer...");
-  if (!micServerUploadSend(reinterpret_cast<const uint8_t *>(s_recordBuf), bytes)) {
+  if (!micServerUploadSend(reinterpret_cast<const uint8_t *>(s_recordBuf),
+                           bytes)) {
     Serial.println("[MIC] upload FAILED");
   }
 #else
@@ -679,8 +686,9 @@ static void finishRecordingSession(LoopbackCounters &counters,
   s_phase = LoopbackPhase::Idle;
 
   if (haveSessionStats) {
-    logLoopbackSummary(counters, intervalStats.count, intervalStats, readUsStats,
-                       writeUsStats, rmsMin, rmsMax, rmsSum, peakMax, clipSum);
+    logLoopbackSummary(counters, intervalStats.count, intervalStats,
+                       readUsStats, writeUsStats, rmsMin, rmsMax, rmsSum,
+                       peakMax, clipSum);
   }
 }
 
@@ -717,8 +725,8 @@ static void micLoopbackTask(void *arg) {
   const size_t expectedBytes = COMPANION_UPLINK_FRAME_BYTES;
   bool haveSessionStats = false;
 
-  const unsigned maxSec =
-      static_cast<unsigned>(s_recordBufCap / (COMPANION_UPLINK_SAMPLE_RATE * 2));
+  const unsigned maxSec = static_cast<unsigned>(
+      s_recordBufCap / (COMPANION_UPLINK_SAMPLE_RATE * 2));
   Serial.println("=== Mic record/playback ===");
   Serial.println("  1. tap");
   Serial.println("  2. mic listening");
@@ -742,36 +750,35 @@ static void micLoopbackTask(void *arg) {
         } else
 #endif
         {
-        s_touchTap = false;
-        s_recordLen = 0;
-        s_recordBufferFull = false;
-        counters = {};
-        intervalStats.reset();
-        readUsStats.reset();
-        writeUsStats.reset();
-        rmsMin = INT32_MAX;
-        rmsMax = 0;
-        rmsSum = 0;
-        peakMax = 0;
-        clipSum = 0;
-        haveSessionStats = false;
-        lastFrameUs = micros();
-        s_phase = LoopbackPhase::Recording;
-        audioIoPrimeMic();
-        loopbackConfirmBeep();
-        Serial.println("[MIC] (1) tap");
-        Serial.println("[MIC] (2) listening — speak now");
+          s_touchTap = false;
+          s_recordLen = 0;
+          s_recordBufferFull = false;
+          counters = {};
+          intervalStats.reset();
+          readUsStats.reset();
+          writeUsStats.reset();
+          rmsMin = INT32_MAX;
+          rmsMax = 0;
+          rmsSum = 0;
+          peakMax = 0;
+          clipSum = 0;
+          haveSessionStats = false;
+          lastFrameUs = micros();
+          s_phase = LoopbackPhase::Recording;
+          audioIoPrimeMic();
+          loopbackConfirmBeep();
+          Serial.println("[MIC] (1) tap");
+          Serial.println("[MIC] (2) listening — speak now");
         }
       } else if (s_phase == LoopbackPhase::Recording) {
         s_touchTap = false;
-        const float sec =
-            static_cast<float>(s_recordLen) /
-            static_cast<float>(COMPANION_UPLINK_SAMPLE_RATE * 2);
+        const float sec = static_cast<float>(s_recordLen) /
+                          static_cast<float>(COMPANION_UPLINK_SAMPLE_RATE * 2);
         Serial.println("[MIC] (4) tap");
         Serial.printf("[MIC] (5) mic stopped — %.1f sec captured\n", sec);
-        finishRecordingSession(counters, intervalStats, readUsStats, writeUsStats,
-                               rmsMin, rmsMax, rmsSum, peakMax, clipSum,
-                               haveSessionStats);
+        finishRecordingSession(counters, intervalStats, readUsStats,
+                               writeUsStats, rmsMin, rmsMax, rmsSum, peakMax,
+                               clipSum, haveSessionStats);
         counters = {};
         intervalStats.reset();
         readUsStats.reset();
@@ -813,17 +820,16 @@ static void micLoopbackTask(void *arg) {
       s_recordLen += nbytes;
     } else if (!s_recordBufferFull) {
       s_recordBufferFull = true;
-      const float sec =
-          static_cast<float>(s_recordLen) /
-          static_cast<float>(COMPANION_UPLINK_SAMPLE_RATE * 2);
-      Serial.printf("[MIC LOOPBACK] buffer full at ~%.1f sec — tap to stop & play\n",
-                    sec);
+      const float sec = static_cast<float>(s_recordLen) /
+                        static_cast<float>(COMPANION_UPLINK_SAMPLE_RATE * 2);
+      Serial.printf(
+          "[MIC LOOPBACK] buffer full at ~%.1f sec — tap to stop & play\n",
+          sec);
     }
 
     if ((counters.frames % 17) == 0 && counters.frames > 0) {
-      const float sec =
-          static_cast<float>(s_recordLen) /
-          static_cast<float>(COMPANION_UPLINK_SAMPLE_RATE * 2);
+      const float sec = static_cast<float>(s_recordLen) /
+                        static_cast<float>(COMPANION_UPLINK_SAMPLE_RATE * 2);
       Serial.printf("[MIC] (3) recording... %.1f sec peak=%ld rms=%ld\n", sec,
                     static_cast<long>(pcm.peak), static_cast<long>(pcm.rms));
     }
@@ -890,7 +896,8 @@ void audioIoLogLoopbackConfig() {
                 PIN_SPK_DOUT);
   Serial.printf("  monitor_gain=%d log_every_frame=%d\n",
                 MIC_LOOPBACK_MONITOR_GAIN, MIC_LOOPBACK_LOG_EVERY_FRAME);
-  Serial.printf("  button_gpio=%d touch_mode=%d\n", PIN_BUTTON, USE_TOUCH_BUTTON);
+  Serial.printf("  button_gpio=%d touch_mode=%d\n", PIN_BUTTON,
+                USE_TOUCH_BUTTON);
   Serial.printf("  free_heap=%u bytes\n",
                 static_cast<unsigned>(ESP.getFreeHeap()));
 #endif
@@ -908,7 +915,8 @@ void audioIoMicLoopbackBegin() {
 #if HAS_MIC && HAS_SPEAKER
 #if MIC_LOOPBACK_TEST_MODE
   if (s_recordBuf == nullptr) {
-    Serial.println("[MIC LOOPBACK] ERROR: call audioIoLoopbackAllocBuffer() first");
+    Serial.println(
+        "[MIC LOOPBACK] ERROR: call audioIoLoopbackAllocBuffer() first");
     return;
   }
   buttonInit(onLoopbackButton, NULL);

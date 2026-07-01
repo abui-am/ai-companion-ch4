@@ -28,7 +28,7 @@ struct AudioParams: Codable {
     }
 
     static let uplink = AudioParams(format: "opus", sampleRate: 16_000, frameMs: 60)
-    static let downlink = AudioParams(format: "opus", sampleRate: 24_000, frameMs: 60)
+    static let downlink = AudioParams(format: "pcm", sampleRate: 24_000, frameMs: 60)
 }
 
 // MARK: - Inbound
