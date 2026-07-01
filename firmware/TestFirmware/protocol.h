@@ -12,6 +12,7 @@
 
 enum ProtoMsgType {
     PROTO_MSG_UNKNOWN = 0,
+    PROTO_MSG_SESSION_READY,
     PROTO_MSG_SPEAKER_READY,
     PROTO_MSG_TTS_START,
     PROTO_MSG_TTS_END,
@@ -28,3 +29,7 @@ struct ProtoMsg {
 };
 
 void protocolParse(const uint8_t *data, size_t len, ProtoMsg &out);
+String protocolBuildSessionStart();
+String protocolBuildSessionStartDumpOnly();
+String protocolBuildAudioStart();
+String protocolBuildAudioStop();

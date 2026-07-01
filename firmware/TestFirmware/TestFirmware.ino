@@ -1,6 +1,8 @@
 #include <WiFi.h>
 
+#include "audio_io.h"
 #include "config.h"
+#include "mic_server_upload.h"
 #include "ws_session.h"
 
 static void connectWiFi() {
@@ -17,14 +19,42 @@ static void connectWiFi() {
 }
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(MIC_LOOPBACK_SERIAL_BAUD);
     delay(500);
     Serial.println();
     Serial.println("=== TestFirmware ===");
+
+#if MIC_LOOPBACK_TEST_MODE
+    audioIoInit();
+#if SPEAKER_SELF_TEST_ON_BOOT
+    audioIoSpeakerSelfTest();
+#else
+    audioIoSpeakerBeep();
+#endif
+    audioIoPrimeMic();
+    audioIoLogLoopbackConfig();
+    if (!audioIoLoopbackAllocBuffer()) {
+        Serial.println("[MIC LOOPBACK] FATAL: no record buffer — halting");
+        while (true) {
+            delay(1000);
+        }
+    }
+    audioIoMicLoopbackBegin();
+    connectWiFi();
+    micServerUploadBegin();
+#else
     connectWiFi();
     wsSessionBegin();
+#endif
 }
 
 void loop() {
+#if MIC_LOOPBACK_TEST_MODE
+#if MIC_UPLOAD_TO_SERVER
+    micServerUploadLoop();
+#endif
+    delay(10);
+#else
     wsSessionLoop();
+#endif
 }

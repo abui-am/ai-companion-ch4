@@ -13,7 +13,10 @@ void protocolParse(const uint8_t *data, size_t len, ProtoMsg &out) {
 
     const char *type = doc["type"] | "";
 
-    if (strcmp(type, "speaker.ready") == 0) {
+    if (strcmp(type, "session.ready") == 0) {
+        out.type = PROTO_MSG_SESSION_READY;
+        out.sessionId = String((const char *)(doc["session_id"] | ""));
+    } else if (strcmp(type, "speaker.ready") == 0) {
         out.type = PROTO_MSG_SPEAKER_READY;
     } else if (strcmp(type, "tts.start") == 0) {
         out.type = PROTO_MSG_TTS_START;
@@ -27,3 +30,32 @@ void protocolParse(const uint8_t *data, size_t len, ProtoMsg &out) {
         out.errorMessage = String((const char *)(doc["message"] | ""));
     }
 }
+
+String protocolBuildSessionStart() {
+    JsonDocument doc;
+    doc["type"] = "session.start";
+    JsonObject audio = doc["audio"].to<JsonObject>();
+    audio["format"] = "opus";
+    audio["sample_rate"] = COMPANION_UPLINK_SAMPLE_RATE;
+    audio["frame_ms"] = COMPANION_FRAME_MS;
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+String protocolBuildSessionStartDumpOnly() {
+    JsonDocument doc;
+    doc["type"] = "session.start";
+    doc["mode"] = "dump_only";
+    JsonObject audio = doc["audio"].to<JsonObject>();
+    audio["format"] = "opus";
+    audio["sample_rate"] = COMPANION_UPLINK_SAMPLE_RATE;
+    audio["frame_ms"] = COMPANION_FRAME_MS;
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+String protocolBuildAudioStart() { return "{\"type\":\"audio.start\"}"; }
+
+String protocolBuildAudioStop() { return "{\"type\":\"audio.stop\"}"; }

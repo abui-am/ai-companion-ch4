@@ -100,6 +100,11 @@ enum SpeakerBenchmark {
 
         try await drainUntilTTSEnd(socket, logger: logger, captureFinishedAt: captureFinishedAt)
         print("Benchmark turn complete.")
+        if let root = PackagePaths.packageRoot() {
+            print("Server WAV dumps → \(root)/debug-audio/")
+            print("  *-uplink.wav   mic/audio sent to server")
+            print("  *-downlink.wav AI TTS response")
+        }
     }
 
     // MARK: - WebSocket helpers

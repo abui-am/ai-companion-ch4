@@ -1,3 +1,4 @@
+import CompanionEnv
 import Foundation
 import Logging
 
@@ -36,6 +37,7 @@ actor VoiceSession {
     private var uplinkPCMDump = Data()
     private var downlinkPCMDump = Data()
     private var downlinkTurnId: String?
+    private var dumpOnlyMode = false
     private var conversationHistory: [ChatMessage] = []
     private let maxHistoryMessages = 20
 
@@ -75,6 +77,17 @@ actor VoiceSession {
         try await send(ready)
     }
 
+    func handleSessionStart(_ start: SessionStart) {
+        dumpOnlyMode = start.mode == "dump_only"
+        if dumpOnlyMode {
+            logger.info(
+                "dump-only session — uplink WAV dump only, no STT/LLM/TTS",
+                metadata: ["session_id": .string(sessionId)]
+            )
+            print("[session] dump-only mode — AI pipeline disabled")
+        }
+    }
+
     func handleAudioStart() {
         phase = .capturing
         uplinkFrameCounter = 0
@@ -96,6 +109,9 @@ actor VoiceSession {
             "uplink frame",
             metadata: ["session_id": .string(sessionId), "frame": "\(uplinkFrameCounter)", "bytes": "\(data.count)"]
         )
+        if dumpOnlyMode {
+            return
+        }
         if let realtime {
             await realtime.appendAudioFrame(data)
         } else {
@@ -111,7 +127,6 @@ actor VoiceSession {
             )
             return
         }
-        phase = .processing
         turnCounter += 1
         let turnId = "turn-\(turnCounter)"
         let frameCount = uplinkFrameCounter
@@ -127,6 +142,18 @@ actor VoiceSession {
         logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.audio_stop", "turn_id": .string(turnId)])
         dumpDebugUplinkAudio(uplinkPCMDump, turnId: turnId)
 
+        if dumpOnlyMode {
+            phase = .connected
+            uplinkFrameCounter = 0
+            uplinkPCMDump.removeAll(keepingCapacity: true)
+            logger.info(
+                "dump-only turn complete",
+                metadata: ["session_id": .string(sessionId), "turn_id": .string(turnId)]
+            )
+            return
+        }
+
+        phase = .processing
         if realtime != nil {
             pipelineTask = Task { [weak self] in
                 await self?.runRealtimeTurn(turnId: turnId)
@@ -559,6 +586,7 @@ actor VoiceSession {
             let filename = "\(timestamp)-\(sessionId)-\(turnId)-uplink.wav"
             let fileURL = directory.appendingPathComponent(filename)
             try Self.wrapWAV(pcm: pcm, sampleRate: AudioParams.uplink.sampleRate).write(to: fileURL)
+            print("[debug-audio] uplink → \(fileURL.path) (\(pcm.count) bytes PCM)")
             logger.info(
                 "uplink debug audio saved",
                 metadata: [
@@ -584,6 +612,7 @@ actor VoiceSession {
             let filename = "\(timestamp)-\(sessionId)-\(turnId)-downlink.wav"
             let fileURL = directory.appendingPathComponent(filename)
             try Self.wrapWAV(pcm: pcm, sampleRate: AudioParams.downlink.sampleRate).write(to: fileURL)
+            print("[debug-audio] downlink → \(fileURL.path) (\(pcm.count) bytes PCM)")
             logger.info(
                 "downlink debug audio saved",
                 metadata: [
@@ -603,17 +632,11 @@ actor VoiceSession {
 
     private static func debugAudioDirectory() throws -> URL {
         let fm = FileManager.default
-        var dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-        for _ in 0..<10 {
-            let packageFile = dir.appendingPathComponent("Package.swift")
-            if fm.fileExists(atPath: packageFile.path) {
-                let debugDir = dir.appendingPathComponent("debug-audio", isDirectory: true)
-                try fm.createDirectory(at: debugDir, withIntermediateDirectories: true)
-                return debugDir
-            }
-            let parent = dir.deletingLastPathComponent()
-            if parent.path == dir.path { break }
-            dir = parent
+        if let root = PackagePaths.packageRoot() {
+            let debugDir = URL(fileURLWithPath: root, isDirectory: true)
+                .appendingPathComponent("debug-audio", isDirectory: true)
+            try fm.createDirectory(at: debugDir, withIntermediateDirectories: true)
+            return debugDir
         }
 
         let fallback = URL(fileURLWithPath: fm.currentDirectoryPath, isDirectory: true)

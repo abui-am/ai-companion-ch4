@@ -25,6 +25,13 @@ struct CompanionServerApp {
                 "log_level": .string("\(LogConfig.level())"),
             ]
         )
+        if let root = PackagePaths.packageRoot() {
+            let debugDir = URL(fileURLWithPath: root, isDirectory: true)
+                .appendingPathComponent("debug-audio", isDirectory: true)
+            try? FileManager.default.createDirectory(at: debugDir, withIntermediateDirectories: true)
+            logger.info("debug audio dumps enabled", metadata: ["dir": .string(debugDir.path)])
+            print("Debug audio WAV dumps → \(debugDir.path)/")
+        }
 
         let openAI = OpenAIRESTService(apiKey: config.openAIAPIKey, logger: serverLogger)
 
@@ -179,7 +186,8 @@ struct CompanionServerApp {
         logger.info("ws recv event", metadata: ["type": .string(envelope.type.rawValue)])
         switch envelope.type {
         case .sessionStart:
-            logger.debug("session.start ignored — session begins on upgrade")
+            let start = try JSONDecoder().decode(SessionStart.self, from: data)
+            await session.handleSessionStart(start)
         case .audioStart:
             await session.handleAudioStart()
         case .audioStop:

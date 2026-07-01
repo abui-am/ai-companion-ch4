@@ -40,6 +40,13 @@ struct InboundEnvelope: Codable {
 struct SessionStart: Codable {
     let type: MessageType
     let audio: AudioParams
+    let mode: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case audio
+        case mode
+    }
 }
 
 struct AbortMessage: Codable {

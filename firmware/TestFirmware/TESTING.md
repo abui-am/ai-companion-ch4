@@ -33,6 +33,62 @@ To repeat the beep without reflashing: power-cycle the board (test runs every bo
 
 Set `SPEAKER_SELF_TEST_ON_BOOT 0` when you're done debugging hardware.
 
+## Mic loopback test (mic + speaker, no server)
+
+Hear yourself on the speaker to verify **INMP441 mic wiring** and I2S paths together. No WiFi, no CompanionServer.
+
+1. In [`config.h`](config.h) set:
+   - `MIC_LOOPBACK_TEST_MODE 1`
+   - Confirm mic pins: `PIN_MIC_BCLK 14`, `PIN_MIC_WS 12`, `PIN_MIC_DIN 35`
+   - Speaker pins same as above (33 / 25 / 32)
+2. Flash **TestFirmware**, Serial Monitor @ **921600**.
+1. **Tap** → beep
+2. **Mic listening** — bicara (max 10 detik; progress di serial)
+3. **Tap lagi** → mic stop
+4. **Playback** rekaman di speaker
+
+TTP223 mode **momentary**: tap singkat, lepas, ngomong, tap lagi.
+
+**Serial Monitor must be set to `921600` baud** when `MIC_LOOPBACK_LOG_EVERY_FRAME=1`.
+
+### Diagnostic log fields (every frame)
+
+| Field | Meaning |
+|-------|---------|
+| `f` | Frame number |
+| `samp` | Samples in frame (expect 960 @ 60 ms / 16 kHz) |
+| `got` / `exp_bytes` | Bytes read (expect 1920) |
+| `int_ms` | Time since last frame (expect ~60) |
+| `jit_ms` | `int_ms - 60` — jitter |
+| `read_us` / `write_us` | I2S driver latency |
+| `rms` / `peak` | Level (noise floor vs speech) |
+| `dc` | DC offset (expect near 0) |
+| `clip` | Samples near full scale |
+| `zc` | Zero crossings (hiss = high at low rms) |
+
+Every 30 frames, `[LOOPBACK SUMMARY]` prints min/max/avg/std for interval and noise.
+
+**Noise test:** stay silent 5 s — note `rms_avg` in summary (noise floor).  
+**Jitter test:** speak steadily — `interval_ms std` should stay &lt; 3 ms.
+
+Expected serial:
+
+```
+=== TestFirmware ===
+mode: mic loopback (no WiFi — hear yourself on speaker)
+audio: I2S mic ready
+audio: I2S speaker ready
+[MIC LOOPBACK] running — speak into the mic
+```
+
+| Symptom | Check |
+|---------|--------|
+| Silence | Mic L/R pin to GND, 3V3/GND, BCLK/WS/DIN GPIOs |
+| Loud hiss only | `MIC_DATA_SHIFT` in `audio_io.cpp` (try 10–14) |
+| Feedback squeal | Lower amp volume; mic too close to speaker |
+
+When done, set `MIC_LOOPBACK_TEST_MODE 0` to return to `/speaker` TTS testing.
+
 ## Arduino IDE setup
 
 Same as [CompanionFirmware](../TESTING.md): ESP32 board package, **ArduinoJson**, **WebSockets** (Links2004), USB CDC On Boot enabled.
