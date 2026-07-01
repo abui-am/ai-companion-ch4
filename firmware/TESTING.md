@@ -1,6 +1,8 @@
 # Testing CompanionFirmware (v2)
 
-Production firmware: ESP32 mic + speaker on one `/ws` session. For bench testing without ESP mic hardware, use **[TestFirmware](TestFirmware/TESTING.md)** (v1: Mac **TestClient** mic → server → ESP speaker on `/speaker`).
+Production firmware: ESP32 mic + speaker on one `/ws` session. Stack spec: **[docs/STABLE_V1.md](../docs/STABLE_V1.md)**.
+
+For bench testing without ESP mic hardware, use **[TestFirmware](TestFirmware/TESTING.md)** (v1: Mac **TestClient** mic → server → ESP speaker on `/speaker`).
 
 ## 1. Arduino IDE setup
 
@@ -37,10 +39,10 @@ Edit `CompanionFirmware/config.h`:
 
 ```bash
 cd CompanionServer
-export DEVICE_TOKEN=<same value as config.h>
-export OPENAI_API_KEY=<your key>
 swift run CompanionServer
 ```
+
+Requires `DEVICE_TOKEN` and `OPENAI_API_KEY` in `CompanionServer/.env` (see `.env.example`).
 
 Confirm it's reachable from the same LAN the ESP32 will join:
 

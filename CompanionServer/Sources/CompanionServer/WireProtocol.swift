@@ -1,5 +1,6 @@
 import Foundation
 
+/// Wire protocol v1 — see `docs/STABLE_V1.md` and `CompanionStack.protocolVersion`.
 enum MessageType: String, Codable {
     case sessionStart = "session.start"
     case sessionReady = "session.ready"

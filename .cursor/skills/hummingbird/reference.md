@@ -1,5 +1,7 @@
 # Hummingbird CompanionServer Reference
 
+Stable v1 wire protocol and pipeline: [docs/STABLE_V1.md](../../../docs/STABLE_V1.md)
+
 ## Codable wire events
 
 ```swift
@@ -111,7 +113,7 @@ Use `AsyncStream` to pipe TTS bytes into Opus encoder without buffering full MP3
 
 - Connect: `ws://<mac-lan-ip>:8080/ws`
 - Header: `Authorization: Bearer <token>`
-- Binary frames: raw Opus (protocol v1)
+- Binary frames: raw PCM16 mono LE (wire protocol v1) — 16 kHz uplink, 24 kHz downlink, 60 ms frames, no header
 - Push-to-talk: send `audio.stop` on button release
 
 ## Hummingbird vs other Swift networking

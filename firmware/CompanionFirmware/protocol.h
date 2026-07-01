@@ -2,6 +2,9 @@
 
 #include <Arduino.h>
 
+// Stable wire protocol version — see docs/STABLE_V1.md.
+#define COMPANION_PROTOCOL_VERSION "v1"
+
 // Mirrors CompanionServer/Sources/CompanionServer/WireProtocol.swift.
 // Audio is sent as raw 16-bit PCM, mono, little-endian — labeled "opus" in
 // session.start for forward compatibility, but matching the server's current

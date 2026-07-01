@@ -2,6 +2,9 @@
 
 #include <Arduino.h>
 
+// Stable wire protocol version — see docs/STABLE_V1.md.
+#define COMPANION_PROTOCOL_VERSION "v1"
+
 #define COMPANION_UPLINK_SAMPLE_RATE 16000
 #define COMPANION_DOWNLINK_SAMPLE_RATE 24000
 #define COMPANION_FRAME_MS 60

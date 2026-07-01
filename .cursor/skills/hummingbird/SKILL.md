@@ -161,7 +161,9 @@ Stages: `audio.stop` → `asr.done` → `llm.first_token` → `tts.first_byte`.
 
 **Outbound JSON:** `session.ready`, `transcript.final`, `device_command`, `tts.start`, `tts.end`, `error`
 
-**Binary:** Opus 16kHz uplink / 24kHz downlink, raw frames (no header v1)
+**Binary:** PCM16 mono LE — 16 kHz uplink / 24 kHz downlink, 60 ms frames, **no per-frame header** (wire protocol v1). Label in JSON is `"opus"` for forward compatibility; payload is raw PCM until libopus is linked.
+
+Stable stack reference: [docs/STABLE_V1.md](../../../docs/STABLE_V1.md)
 
 Full event shapes and lifecycle policies: [reference.md](reference.md)
 

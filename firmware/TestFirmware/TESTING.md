@@ -1,6 +1,6 @@
-# TestFirmware (speaker-only)
+# TestFirmware (speaker-only) — topology v1
 
-ESP32 sketch that connects to CompanionServer **`/speaker`** and plays TTS audio. Mic input comes from **TestClient** on your Mac (`/ws`).
+ESP32 sketch that connects to CompanionServer **`/speaker`** and plays TTS audio. Mic input comes from **TestClient** on your Mac (`/ws`). Full stack spec: **[docs/STABLE_V1.md](../../docs/STABLE_V1.md)**.
 
 ## Architecture
 
@@ -133,33 +133,9 @@ swift run TestClient
 4. Press Enter to talk, speak, press Enter to stop.
 5. Watch TestClient logs for `transcript.final`; ESP plays TTS on the speaker.
 
-## Automated benchmark (no mic)
+## Archived benchmark tools
 
-Uses `benchmark_input.m4a` — the same clip as `RealtimePipeline` / `TTSBenchmark`.
-
-**Terminal 1** — server:
-
-```bash
-cd CompanionServer
-swift run CompanionServer
-```
-
-**Terminal 2** — flash TestFirmware, confirm `speaker ready` on serial.
-
-**Terminal 3** — send prerecorded uplink:
-
-```bash
-cd CompanionServer
-swift run SpeakerBenchmark
-# or: swift run SpeakerBenchmark /path/to/other.m4a
-```
-
-Expected:
-- Mac prints transcript + downlink frame count
-- ESP serial: `tts.start` → `prefill complete` → `downlink frame N` → `tts complete`
-- Speaker plays AI response (if `HAS_SPEAKER=1`)
-
-`SpeakerBenchmark` connects to `/ws` (uplink only). TestFirmware on `/speaker` receives the mirrored TTS audio.
+`SpeakerBenchmark`, `TTSBenchmark`, and `RealtimePipeline` were removed from CompanionServer. To restore prerecorded-uplink testing, see [docs/ARCHIVED_LEGACY_PIPELINE.md](../../docs/ARCHIVED_LEGACY_PIPELINE.md).
 
 ## Expected ESP boot
 

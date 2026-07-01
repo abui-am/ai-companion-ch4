@@ -23,6 +23,11 @@ struct CompanionServerApp {
             metadata: [
                 "companion_host": .string(config.companionHost),
                 "log_level": .string("\(LogConfig.level())"),
+                "stack_version": .string(
+                    "protocol=\(CompanionStack.protocolVersion) pipeline=\(CompanionStack.pipelineProfile)"
+                ),
+                "realtime_model": .string(config.openAIRealtimeModel),
+                "realtime_voice": .string(config.openAIRealtimeVoice),
             ]
         )
         if let root = PackagePaths.packageRoot() {
@@ -33,45 +38,6 @@ struct CompanionServerApp {
             print("Debug audio WAV dumps → \(debugDir.path)/")
         }
 
-        let openAI = OpenAIRESTService(apiKey: config.openAIAPIKey, logger: serverLogger)
-
-        let realtimeService: OpenAIRealtimeService? = config.openAIRealtimeEnabled
-            ? OpenAIRealtimeService(
-                apiKey: config.openAIAPIKey,
-                model: config.openAIRealtimeModel,
-                voice: config.openAIRealtimeVoice,
-                logger: serverLogger
-              )
-            : nil
-        if config.openAIRealtimeEnabled {
-            logger.info(
-                "realtime pipeline enabled",
-                metadata: ["model": .string(config.openAIRealtimeModel), "voice": .string(config.openAIRealtimeVoice)]
-            )
-        }
-
-        let tts: TTSStreamingService
-        switch config.ttsProvider {
-        case "kokoro":
-            tts = KokoroTTSService(
-                weightsDir: URL(fileURLWithPath: config.kokoroWeightsDir, isDirectory: true),
-                voice: config.kokoroVoice,
-                logger: serverLogger
-            )
-            logger.info(
-                "tts provider: kokoro (local MLX)",
-                metadata: ["weights_dir": .string(config.kokoroWeightsDir), "voice": .string(config.kokoroVoice)]
-            )
-        default:
-            tts = CartesiaService(
-                apiKey: config.cartesiaAPIKey,
-                voiceId: config.cartesiaVoiceId,
-                modelId: config.cartesiaModelId,
-                sampleRate: AudioParams.downlink.sampleRate,
-                logger: serverLogger
-            )
-            logger.info("tts provider: cartesia", metadata: ["voice_id": .string(config.cartesiaVoiceId)])
-        }
         let speakers = SpeakerRegistry(logger: serverLogger)
 
         let wsRouter = Router(context: BasicWebSocketRequestContext.self)
@@ -84,26 +50,16 @@ struct CompanionServerApp {
             return .dontUpgrade
         } onUpgrade: { inbound, outbound, _ in
             serverLogger.info("ws connection upgraded")
-            let stt = CartesiaSTTService(
-                apiKey: config.cartesiaAPIKey,
-                sampleRate: AudioParams.uplink.sampleRate,
+            let realtime = OpenAIRealtimeService(
+                apiKey: config.openAIAPIKey,
+                model: config.openAIRealtimeModel,
+                voice: config.openAIRealtimeVoice,
                 logger: serverLogger
             )
-            let realtime: OpenAIRealtimeService? = config.openAIRealtimeEnabled
-                ? OpenAIRealtimeService(
-                    apiKey: config.openAIAPIKey,
-                    model: config.openAIRealtimeModel,
-                    voice: config.openAIRealtimeVoice,
-                    logger: serverLogger
-                  )
-                : nil
             let session = VoiceSession(
                 outbound: WebSocketSessionOutboundWriter(base: outbound),
-                openAI: openAI,
-                tts: tts,
-                stt: stt,
-                speakers: speakers,
                 realtime: realtime,
+                speakers: speakers,
                 logger: serverLogger
             )
             try await session.start()
@@ -192,12 +148,12 @@ struct CompanionServerApp {
             await session.handleAudioStart()
         case .audioStop:
             await session.handleAudioStop()
-        case .transcriptInput:
-            let transcript = try JSONDecoder().decode(TranscriptInput.self, from: data)
-            await session.handleTranscriptInput(transcript.text)
         case .abort:
             let abort = try JSONDecoder().decode(AbortMessage.self, from: data)
             await session.handleAbort(reason: abort.reason)
+        case .transcriptInput:
+            logger.warning("transcript.input is not supported — use audio uplink (see docs/ARCHIVED_LEGACY_PIPELINE.md)")
+            try await session.sendUnsupportedTranscriptInput()
         default:
             logger.warning("unhandled inbound event", metadata: ["type": .string(envelope.type.rawValue)])
         }
