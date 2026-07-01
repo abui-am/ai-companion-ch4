@@ -1,14 +1,14 @@
 import Foundation
 import Logging
 
-enum CartesiaEvent: Sendable {
+enum TTSStreamEvent: Sendable {
     case audio(Data)
     case done
     case error(String)
 }
 
-protocol CartesiaTTSService: Sendable {
-    func beginTurn(contextId: String) async -> AsyncStream<CartesiaEvent>
+protocol TTSStreamingService: Sendable {
+    func beginTurn(contextId: String) async -> AsyncStream<TTSStreamEvent>
     func sendTranscriptChunk(_ text: String, contextId: String, isFinal: Bool) async
     func cancelTurn(contextId: String) async
 }
@@ -17,7 +17,7 @@ protocol CartesiaTTSService: Sendable {
 /// so turns don't pay the ~200ms WS handshake cost on every request. Text chunks for
 /// a turn are sent as they become available (tagged with a shared `context_id`) and
 /// raw PCM audio is streamed back incrementally rather than buffered.
-actor CartesiaService: CartesiaTTSService {
+actor CartesiaService: TTSStreamingService {
     private let apiKey: String
     private let voiceId: String
     private let modelId: String
@@ -27,7 +27,7 @@ actor CartesiaService: CartesiaTTSService {
 
     private var socket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
-    private var continuations: [String: AsyncStream<CartesiaEvent>.Continuation] = [:]
+    private var continuations: [String: AsyncStream<TTSStreamEvent>.Continuation] = [:]
 
     init(
         apiKey: String,
@@ -47,7 +47,7 @@ actor CartesiaService: CartesiaTTSService {
 
     /// Registers a turn and returns a stream of audio events for it. Call this
     /// before sending any transcript chunks for `contextId`.
-    func beginTurn(contextId: String) -> AsyncStream<CartesiaEvent> {
+    func beginTurn(contextId: String) -> AsyncStream<TTSStreamEvent> {
         AsyncStream { continuation in
             continuations[contextId] = continuation
         }
@@ -148,7 +148,7 @@ actor CartesiaService: CartesiaTTSService {
         }
     }
 
-    private func finishTurn(contextId: String, event: CartesiaEvent?) {
+    private func finishTurn(contextId: String, event: TTSStreamEvent?) {
         guard let continuation = continuations[contextId] else { return }
         if let event {
             continuation.yield(event)

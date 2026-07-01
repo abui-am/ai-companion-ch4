@@ -63,7 +63,7 @@ final class CmdRouterTests: XCTestCase {
 
         let cartesia = FakeCartesiaService(audioChunks: [Data([0, 1, 2, 3, 4, 5, 6, 7])])
         let stt = FakeCartesiaSTTService()
-        let session = VoiceSession(outbound: outbound, openAI: openAI, cartesia: cartesia, stt: stt, speakers: speakers, logger: logger)
+        let session = VoiceSession(outbound: outbound, openAI: openAI, tts: cartesia, stt: stt, speakers: speakers, logger: logger)
         try await session.start()
         await session.handleTranscriptInput("halo dunia")
 
@@ -156,15 +156,15 @@ private struct StubOpenAIService: OpenAIService {
     }
 }
 
-private actor FakeCartesiaService: CartesiaTTSService {
+private actor FakeCartesiaService: TTSStreamingService {
     private let audioChunks: [Data]
-    private var continuations: [String: AsyncStream<CartesiaEvent>.Continuation] = [:]
+    private var continuations: [String: AsyncStream<TTSStreamEvent>.Continuation] = [:]
 
     init(audioChunks: [Data]) {
         self.audioChunks = audioChunks
     }
 
-    func beginTurn(contextId: String) -> AsyncStream<CartesiaEvent> {
+    func beginTurn(contextId: String) -> AsyncStream<TTSStreamEvent> {
         AsyncStream { continuation in
             continuations[contextId] = continuation
         }

@@ -11,6 +11,28 @@ TestClient (/ws)  ──mic──► CompanionServer ──► OpenAI
                                └── TTS binary ──► ESP TestFirmware (/speaker) ──► I2S speaker
 ```
 
+## Speaker hardware test (do this first)
+
+Isolates **I2S + amp wiring** from WiFi / server / AI. No Mac, no CompanionServer needed.
+
+1. In [`config.h`](config.h) confirm:
+   - `HAS_SPEAKER 1`
+   - `SPEAKER_SELF_TEST_ON_BOOT 1` (default in TestFirmware)
+   - `PIN_SPK_BCLK`, `PIN_SPK_WS`, `PIN_SPK_DOUT` match your MAX98357A wiring
+2. Flash **TestFirmware**, open Serial Monitor @ **115200**.
+3. **Right after boot** (before WiFi finishes) you should **hear a 1-second 440 Hz beep**.
+
+| What you hear | What it means |
+|---------------|---------------|
+| Clear beep + serial `[SPEAKER TEST] OK` | Speaker path works — safe to test server pipeline |
+| Silence + serial `[SPEAKER TEST] OK` | I2S writes succeed but amp/speaker/wiring wrong — check 3V3/GND, DIN/BCLK/LRC, amp SD pin |
+| `[SPEAKER TEST] FAIL` | I2S driver error — check GPIO pins, double-init, or board config |
+| `[SPEAKER TEST] skipped` | `HAS_SPEAKER=0` in config |
+
+To repeat the beep without reflashing: power-cycle the board (test runs every boot).
+
+Set `SPEAKER_SELF_TEST_ON_BOOT 0` when you're done debugging hardware.
+
 ## Arduino IDE setup
 
 Same as [CompanionFirmware](../TESTING.md): ESP32 board package, **ArduinoJson**, **WebSockets** (Links2004), USB CDC On Boot enabled.
@@ -54,6 +76,34 @@ swift run TestClient
 
 4. Press Enter to talk, speak, press Enter to stop.
 5. Watch TestClient logs for `transcript.final`; ESP plays TTS on the speaker.
+
+## Automated benchmark (no mic)
+
+Uses `benchmark_input.m4a` — the same clip as `RealtimePipeline` / `TTSBenchmark`.
+
+**Terminal 1** — server:
+
+```bash
+cd CompanionServer
+swift run CompanionServer
+```
+
+**Terminal 2** — flash TestFirmware, confirm `speaker ready` on serial.
+
+**Terminal 3** — send prerecorded uplink:
+
+```bash
+cd CompanionServer
+swift run SpeakerBenchmark
+# or: swift run SpeakerBenchmark /path/to/other.m4a
+```
+
+Expected:
+- Mac prints transcript + downlink frame count
+- ESP serial: `tts.start` → `prefill complete` → `downlink frame N` → `tts complete`
+- Speaker plays AI response (if `HAS_SPEAKER=1`)
+
+`SpeakerBenchmark` connects to `/ws` (uplink only). TestFirmware on `/speaker` receives the mirrored TTS audio.
 
 ## Expected ESP boot
 

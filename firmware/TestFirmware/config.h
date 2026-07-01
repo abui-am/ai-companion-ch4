@@ -1,11 +1,10 @@
 #pragma once
 
 // Copy values from CompanionServer/.env and your LAN before flashing.
+#define WIFI_SSID "Wifi iuran"
+#define WIFI_PASSWORD "sekgangguan"
 
-#define WIFI_SSID "ESPServer"
-#define WIFI_PASSWORD "mayunskuy123"
-
-#define COMPANION_SERVER_HOST "10.75.190.219"
+#define COMPANION_SERVER_HOST "192.168.1.3"
 #define COMPANION_SERVER_PORT 8080
 #define COMPANION_SERVER_PATH "/speaker"
 #define COMPANION_USE_TLS false
@@ -17,9 +16,14 @@
 #define HAS_MIC 0
 #define HAS_SPEAKER 1
 
+// Play a 440 Hz beep on boot to verify I2S + amp wiring before testing the server pipeline.
+#define SPEAKER_SELF_TEST_ON_BOOT 1
+
 // Kept for shared button module compilation; GPIO0 is the common BOOT button on ESP32-S3 dev boards.
 #define PIN_BUTTON 0
 
-#define PIN_SPK_BCLK 5
-#define PIN_SPK_WS 6
-#define PIN_SPK_DOUT 7
+// MAX98357A — must match your wiring (same as CompanionFirmware).
+// Do NOT use GPIO 6–11 on ESP32: they are wired to SPI flash and will WDT-reset.
+#define PIN_SPK_BCLK 33 // BCK
+#define PIN_SPK_WS 25   // LRC
+#define PIN_SPK_DOUT 32 // DIN

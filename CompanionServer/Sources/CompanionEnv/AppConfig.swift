@@ -26,6 +26,16 @@ public struct AppConfig: Sendable {
   public let cartesiaVoiceId: String
   public let cartesiaModelId: String
   public let companionHost: String
+  /// "cartesia" (default, cloud streaming) or "kokoro" (local on-device MLX TTS,
+  /// requires running via xcodebuild — see KokoroTTSService.swift).
+  public let ttsProvider: String
+  public let kokoroWeightsDir: String
+  public let kokoroVoice: String
+  /// When true, VoiceSession bypasses the STT→LLM→TTS pipeline and uses the
+  /// OpenAI Realtime API for a single-roundtrip speech-in/speech-out flow.
+  public let openAIRealtimeEnabled: Bool
+  public let openAIRealtimeModel: String
+  public let openAIRealtimeVoice: String
 
   public static func load() async throws -> AppConfig {
     let secrets: SecretsSpecifier<String, String> = .specific(["DEVICE_TOKEN", "OPENAI_API_KEY", "CARTESIA_API_KEY"])
@@ -55,6 +65,14 @@ public struct AppConfig: Sendable {
     let cartesiaVoiceId = reader.string(forKey: "cartesia.voice.id", default: "156fb8d2-335b-4950-9cb3-a2d33befec77")
     let cartesiaModelId = reader.string(forKey: "cartesia.model.id", default: "sonic-2")
     let companionHost = reader.string(forKey: "companion.host", default: "ws://127.0.0.1:8080/ws")
+    let ttsProvider = reader.string(forKey: "tts.provider", default: "cartesia")
+    let kokoroWeightsDir = PackagePaths.resolveRelativeToPackageRoot(
+      reader.string(forKey: "kokoro.weights.dir", default: ".kokoro-models/MLX_GPU")
+    )
+    let kokoroVoice = reader.string(forKey: "kokoro.voice", default: "af_heart")
+    let openAIRealtimeEnabled = reader.string(forKey: "openai.use.realtime", default: "false").lowercased() == "true"
+    let openAIRealtimeModel = reader.string(forKey: "openai.realtime.model", default: "gpt-4o-mini-realtime-preview")
+    let openAIRealtimeVoice = reader.string(forKey: "openai.realtime.voice", default: "verse")
 
     return AppConfig(
       deviceToken: deviceToken,
@@ -62,7 +80,13 @@ public struct AppConfig: Sendable {
       cartesiaAPIKey: cartesiaAPIKey,
       cartesiaVoiceId: cartesiaVoiceId,
       cartesiaModelId: cartesiaModelId,
-      companionHost: companionHost
+      companionHost: companionHost,
+      ttsProvider: ttsProvider,
+      kokoroWeightsDir: kokoroWeightsDir,
+      kokoroVoice: kokoroVoice,
+      openAIRealtimeEnabled: openAIRealtimeEnabled,
+      openAIRealtimeModel: openAIRealtimeModel,
+      openAIRealtimeVoice: openAIRealtimeVoice
     )
   }
 }

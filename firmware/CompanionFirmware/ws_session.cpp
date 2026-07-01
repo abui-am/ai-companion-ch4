@@ -21,14 +21,27 @@ enum SessionState {
 };
 
 struct PlaybackChunk {
-    uint8_t *data;
     size_t len;
+    uint8_t data[COMPANION_DOWNLINK_FRAME_BYTES];
 };
+
+// Jitter buffer sized for ~720 ms at 60 ms/frame; server paces sends so this
+// rarely fills. Storage is static inside the queue (no per-frame malloc).
+static constexpr UBaseType_t kPlaybackQueueDepth = 32;
+static constexpr UBaseType_t kInitialPrefillFrames = 8;
+static constexpr UBaseType_t kMaxPrefillFrames = 16;
+static constexpr int kQueueWaitMs = 120;
+static constexpr int kStarvationFramesBeforeRebuffer = 8;
+static constexpr int kDownlinkFrameMs = COMPANION_FRAME_MS;
+
+static UBaseType_t s_prefillTarget = kInitialPrefillFrames;
 
 static WebSocketsClient s_webSocket;
 static SemaphoreHandle_t s_stateMutex;
 static SessionState s_state = SESSION_IDLE;
 static String s_sessionId;
+static volatile bool s_sessionReady = false;
+static volatile bool s_playbackNeedPrefill = true;
 
 // WebSocketsClient isn't documented as safe to call concurrently from
 // multiple tasks; sendTXT/sendBIN happen from both the capture task and the
@@ -55,14 +68,16 @@ static void setState(SessionState s) {
 static void drainPlaybackQueue() {
     PlaybackChunk chunk;
     while (xQueueReceive(s_playbackQueue, &chunk, 0) == pdTRUE) {
-        free(chunk.data);
+        // chunk storage lives in the queue — nothing to free
     }
+    s_playbackNeedPrefill = true;
 }
 
 static void sendText(const String &text) {
     xSemaphoreTake(s_wsSendMutex, portMAX_DELAY);
     if (s_webSocket.isConnected()) {
-        s_webSocket.sendTXT(text);
+        String copy = text;
+        s_webSocket.sendTXT(copy);
     }
     xSemaphoreGive(s_wsSendMutex);
 }
@@ -79,59 +94,122 @@ static void sendBinary(uint8_t *data, size_t len) {
 
 static void captureTask(void *arg) {
     static uint8_t frame[COMPANION_UPLINK_FRAME_BYTES];
+    int frameCount = 0;
     while (true) {
         xSemaphoreTake(s_captureStartSem, portMAX_DELAY);
+        frameCount = 0;
+        Serial.println("[MIC] capture session started");
         while (getState() == SESSION_CAPTURING) {
             size_t n = audioIoReadUplinkFrame(frame, sizeof(frame));
             if (n > 0) {
+                frameCount++;
                 sendBinary(frame, n);
             }
         }
+        Serial.printf("[MIC] capture stopped, sent %d frames\n", frameCount);
     }
 }
 
 // MARK: - Playback (downlink)
 
 static void playbackTask(void *arg) {
+    (void)arg;
     PlaybackChunk chunk;
     static int16_t samples[COMPANION_DOWNLINK_FRAME_BYTES / sizeof(int16_t)];
+    static int16_t silence[COMPANION_DOWNLINK_FRAME_BYTES / sizeof(int16_t)] = {};
+    TickType_t nextWake = 0;
+    int starvationFrames = 0;
+
     while (true) {
-        if (xQueueReceive(s_playbackQueue, &chunk, portMAX_DELAY) == pdTRUE) {
-            size_t sampleCount = pcmCodecDecodeDownlinkFrame(
-                chunk.data, chunk.len, samples, sizeof(samples) / sizeof(samples[0]));
-            audioIoWriteDownlink(samples, sampleCount);
-            free(chunk.data);
+        if (s_playbackNeedPrefill) {
+            if (uxQueueMessagesWaiting(s_playbackQueue) < s_prefillTarget) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            s_playbackNeedPrefill = false;
+            starvationFrames = 0;
+            nextWake = xTaskGetTickCount();
+            Serial.printf("[AUDIO] prefill complete — playback starting (target=%u)\n",
+                          static_cast<unsigned>(s_prefillTarget));
+        }
+
+        TickType_t now = xTaskGetTickCount();
+        if (now < nextWake) {
+            vTaskDelay(nextWake - now);
+        }
+
+        bool gotFrame = xQueueReceive(s_playbackQueue, &chunk, pdMS_TO_TICKS(kQueueWaitMs)) == pdTRUE;
+        if (!gotFrame) {
+            if (getState() != SESSION_SPEAKING) {
+                continue;
+            }
+            audioIoWriteDownlink(silence, sizeof(silence) / sizeof(silence[0]));
+            starvationFrames++;
+            nextWake += pdMS_TO_TICKS(kDownlinkFrameMs);
+            now = xTaskGetTickCount();
+            if (nextWake < now) {
+                nextWake = now;
+            }
+            if (starvationFrames >= kStarvationFramesBeforeRebuffer) {
+                s_playbackNeedPrefill = true;
+                if (s_prefillTarget < kMaxPrefillFrames) {
+                    s_prefillTarget += 2;
+                }
+                Serial.printf("[AUDIO] underrun — re-buffering (next target=%u)\n",
+                              static_cast<unsigned>(s_prefillTarget));
+                starvationFrames = 0;
+            }
+            continue;
+        }
+
+        starvationFrames = 0;
+        size_t sampleCount = pcmCodecDecodeDownlinkFrame(
+            chunk.data, chunk.len, samples, sizeof(samples) / sizeof(samples[0]));
+        audioIoWriteDownlink(samples, sampleCount);
+
+        int frameMs = static_cast<int>(sampleCount * 1000 / COMPANION_DOWNLINK_SAMPLE_RATE);
+        if (frameMs < 1) {
+            frameMs = kDownlinkFrameMs;
+        }
+        nextWake += pdMS_TO_TICKS(frameMs);
+        now = xTaskGetTickCount();
+        if (nextWake < now) {
+            nextWake = now;
         }
     }
 }
 
 // MARK: - Button -> session transitions
 
+// Toggle logic: tap once = mic ON, tap again = mic OFF.
+// Half-duplex: taps are ignored while the AI is speaking to prevent the mic
+// from picking up speaker output.
 static void onButtonEvent(ButtonEvent event, void *ctx) {
-    if (event == BUTTON_EVENT_PRESSED) {
-        SessionState s = getState();
-        if (s == SESSION_IDLE) {
-#if HAS_MIC
-            sendText(protocolBuildAudioStart());
-            setState(SESSION_CAPTURING);
-            xSemaphoreGive(s_captureStartSem);
-#else
-            Serial.println("HAS_MIC=0, ignoring button press (no mic to capture from yet)");
-#endif
-        } else if (s == SESSION_SPEAKING) {
-            // Barge-in: abort the current TTS turn. User can press again to
-            // start a new capture once the server confirms with tts.end (or
-            // we recover to idle via the error/disconnect paths).
-            sendText(protocolBuildAbort(s_sessionId, "user"));
-            drainPlaybackQueue();
-            setState(SESSION_IDLE);
-        }
-        // CAPTURING / PROCESSING: mid-turn already, ignore extra presses.
-    } else { // BUTTON_EVENT_RELEASED
-        if (getState() == SESSION_CAPTURING) {
-            sendText(protocolBuildAudioStop());
-            setState(SESSION_PROCESSING);
-        }
+    SessionState s = getState();
+    if (!s_sessionReady) {
+        Serial.println("[BUTTON] ignored — session not ready yet");
+        return;
+    }
+
+    if (event != BUTTON_EVENT_PRESSED) return;
+
+    switch (s) {
+    case SESSION_IDLE:
+        sendText(protocolBuildAudioStart());
+        setState(SESSION_CAPTURING);
+        xSemaphoreGive(s_captureStartSem);
+        Serial.println("[BUTTON] tap: IDLE → CAPTURING (mic ON)");
+        break;
+    case SESSION_CAPTURING:
+        sendText(protocolBuildAudioStop());
+        setState(SESSION_PROCESSING);
+        Serial.println("[BUTTON] tap: CAPTURING → PROCESSING (mic OFF)");
+        break;
+    case SESSION_SPEAKING:
+        Serial.println("[BUTTON] tap: IGNORED — AI speaking (half-duplex)");
+        break;
+    case SESSION_PROCESSING:
+        break;
     }
 }
 
@@ -146,7 +224,9 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
         s_sessionId = msg.sessionId;
         drainPlaybackQueue();
         setState(SESSION_IDLE);
+        s_sessionReady = true;
         Serial.printf("session ready: %s\n", s_sessionId.c_str());
+        Serial.println(">>> READY — hold touch sensor to speak <<<");
         break;
     case PROTO_MSG_TRANSCRIPT_FINAL:
         Serial.printf("transcript: %s\n", msg.text.c_str());
@@ -158,10 +238,15 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
         Serial.printf("device_command ignored (no actuator wired): action=%s\n", msg.action.c_str());
         break;
     case PROTO_MSG_TTS_START:
+        drainPlaybackQueue();
+        s_prefillTarget = kInitialPrefillFrames;
+        s_playbackNeedPrefill = true;
         setState(SESSION_SPEAKING);
+        Serial.println("[TTS] START — AI speaking");
         break;
     case PROTO_MSG_TTS_END:
         setState(SESSION_IDLE);
+        Serial.println("[TTS] END — back to idle");
         break;
     case PROTO_MSG_ERROR:
         Serial.printf("server error: code=%s message=%s\n", msg.errorCode.c_str(), msg.errorMessage.c_str());
@@ -179,18 +264,20 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
 
 static void handleBinaryFrame(uint8_t *payload, size_t len) {
     if (getState() != SESSION_SPEAKING) {
+        Serial.printf("[AUDIO] ignored %u bytes — not in SESSION_SPEAKING\n", len);
         return; // ignore stray binary frames outside an active TTS turn
     }
-    uint8_t *copy = (uint8_t *)malloc(len);
-    if (copy == nullptr) {
-        Serial.println("oom copying downlink frame, dropping");
-        return;
+    if (len > COMPANION_DOWNLINK_FRAME_BYTES) {
+        Serial.printf("[AUDIO] truncating oversized frame %u -> %u bytes\n",
+                      static_cast<unsigned>(len),
+                      static_cast<unsigned>(COMPANION_DOWNLINK_FRAME_BYTES));
+        len = COMPANION_DOWNLINK_FRAME_BYTES;
     }
-    memcpy(copy, payload, len);
-    PlaybackChunk chunk = { copy, len };
+    PlaybackChunk chunk = {};
+    chunk.len = len;
+    memcpy(chunk.data, payload, len);
     if (xQueueSend(s_playbackQueue, &chunk, 0) != pdTRUE) {
-        Serial.println("playback queue full, dropping frame");
-        free(copy);
+        Serial.printf("[AUDIO] queue full, dropping %u bytes\n", static_cast<unsigned>(len));
     }
 }
 
@@ -201,11 +288,8 @@ static void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
         sendText(protocolBuildSessionStart());
         break;
     case WStype_DISCONNECTED:
-        // Kill-on-disconnect, mirrored client-side: drop whatever turn was
-        // in flight. The library auto-reconnects; the server always issues
-        // a fresh session_id on the new connection, so there is nothing to
-        // resume here.
-        Serial.println("ws disconnected, resetting local session state");
+        Serial.printf("[WS] DISCONNECTED (was in state %d) — resetting\n", (int)getState());
+        s_sessionReady = false;
         drainPlaybackQueue();
         setState(SESSION_IDLE);
         break;
@@ -227,17 +311,22 @@ void wsSessionBegin() {
     s_stateMutex = xSemaphoreCreateMutex();
     s_wsSendMutex = xSemaphoreCreateMutex();
     s_captureStartSem = xSemaphoreCreateBinary();
-    s_playbackQueue = xQueueCreate(16, sizeof(PlaybackChunk));
+    s_playbackQueue = xQueueCreate(kPlaybackQueueDepth, sizeof(PlaybackChunk));
+    if (s_playbackQueue == nullptr) {
+        Serial.printf("[AUDIO] FATAL: playback queue alloc failed (need %u bytes)\n",
+                      static_cast<unsigned>(kPlaybackQueueDepth * sizeof(PlaybackChunk)));
+    }
 
     audioIoInit();
 
-    xTaskCreate(captureTask, "audio_capture", 4096, NULL, 12, NULL);
-    xTaskCreate(playbackTask, "audio_playback", 4096, NULL, 12, NULL);
+    xTaskCreate(captureTask, "audio_capture", 8192, NULL, 12, NULL);
+    // Playback above capture + loop so I2S drains the queue before it backs up.
+    xTaskCreate(playbackTask, "audio_playback", 8192, NULL, 14, NULL);
 
     static String authHeader = String("Authorization: Bearer ") + COMPANION_DEVICE_TOKEN;
     s_webSocket.setExtraHeaders(authHeader.c_str());
     s_webSocket.onEvent(webSocketEvent);
-    s_webSocket.setReconnectInterval(2000);
+    s_webSocket.setReconnectInterval(0);  // no auto-reconnect
 
 #if COMPANION_USE_TLS
     s_webSocket.beginSSL(COMPANION_SERVER_HOST, COMPANION_SERVER_PORT, COMPANION_SERVER_PATH);
@@ -246,8 +335,7 @@ void wsSessionBegin() {
 #endif
 
     buttonInit(onButtonEvent, NULL);
-
-    Serial.println("ready, hold button to talk");
+    Serial.println("connecting to server, please wait...");
 }
 
 void wsSessionLoop() {

@@ -2,12 +2,16 @@
 import CompanionEnv
 import Foundation
 import Logging
-import Speech
 
 // Matches CompanionServer's AudioParams.uplink (WireProtocol.swift).
 let uplinkSampleRate = 16_000
 let uplinkFrameMs = 60
 let uplinkFrameBytes = uplinkSampleRate / 1000 * uplinkFrameMs * 2
+
+// Matches CompanionServer's AudioParams.downlink (WireProtocol.swift).
+let downlinkSampleRate = 24_000
+let downlinkFrameMs = 60
+let downlinkFrameBytes = downlinkSampleRate / 1000 * downlinkFrameMs * 2
 
 @main
 struct TestClient {
@@ -26,8 +30,7 @@ struct TestClient {
 
         let host = config.companionHost
         logger.info("config loaded", metadata: ["companion_host": .string(host)])
-
-        logger.info("Mic-only mode — captures MacBook mic; TTS plays on ESP32 TestFirmware (/speaker).")
+        logger.info("Firmware sim — Enter to toggle mic on/off; AI response plays on Mac speakers.")
 
         guard await Permission.ensureGranted(logger: logger) else {
             exit(1)
@@ -37,17 +40,31 @@ struct TestClient {
             exit(1)
         }
 
+        // One persistent connection for the whole interactive run — VoiceSession's
+        // conversation history is scoped per WS connection, so reconnecting every
+        // turn silently resets it each time.
+        let socket = makeSocket(host: host, token: config.deviceToken, logger: logger)
+        defer {
+            socket.cancel(with: .normalClosure, reason: nil)
+            logger.debug("websocket closed")
+        }
+        try await send(
+            socket,
+            json: ["type": "session.start", "audio": ["format": "opus", "sample_rate": uplinkSampleRate, "frame_ms": uplinkFrameMs]],
+            logger: logger
+        )
+        try await expect(socket, type: "session.ready", logger: logger)
+        logger.info("e2e stage", metadata: ["stage": "client.session_ready"])
+
         while true {
-            print("\nPress Enter to start talking (or type 'q' + Enter to quit)... ", terminator: "")
+            print("\n[idle] Press Enter to start listening (or 'q' + Enter to quit)... ", terminator: "")
             guard let line = readLine(), line.lowercased() != "q" else { break }
             do {
-                try await runInteractiveTurn(host: host, token: config.deviceToken, logger: logger)
+                try await runTurn(socket: socket, logger: logger)
             } catch let error as TestClientError {
                 logger.error("\(error.description)")
             } catch let urlError as URLError where urlError.code == .cannotConnectToHost {
-                logger.error(
-                    "Cannot connect to CompanionServer at \(host). Is it running? Start CompanionServer first, then try again."
-                )
+                logger.error("Cannot connect to CompanionServer at \(host). Is it running? Start CompanionServer first, then try again.")
             } catch {
                 logger.error("turn failed", metadata: ["error": "\(error)"])
             }
@@ -81,111 +98,47 @@ struct TestClient {
         return socket
     }
 
-    static func runInteractiveTurn(host: String, token: String, logger: Logger) async throws {
-        logger.info("turn start", metadata: ["host": .string(host)])
-        let socket = makeSocket(host: host, token: token, logger: logger)
-        defer {
-            socket.cancel(with: .normalClosure, reason: nil)
-            logger.debug("websocket closed")
-        }
-
-        try await send(socket, json: ["type": "session.start", "audio": ["format": "opus", "sample_rate": uplinkSampleRate, "frame_ms": uplinkFrameMs]], logger: logger)
-        try await expect(socket, type: "session.ready", logger: logger)
-        logger.info("e2e stage", metadata: ["stage": "client.session_ready"])
-
+    /// Simulates one button-toggle cycle: tap ON → stream mic frames → tap OFF → play TTS.
+    /// Half-duplex is natural: mic is stopped before drainTurn enters, so TTS audio
+    /// can never be picked up by the mic.
+    static func runTurn(socket: URLSessionWebSocketTask, logger: Logger) async throws {
+        logger.info("turn start — mic ON")
         let captureStartedAt = Date()
         let mic = try MicCapture(logger: logger)
+
+        try await send(socket, json: ["type": "audio.start"], logger: logger)
+        logger.info("e2e stage", metadata: ["stage": "client.audio_start"])
+
+        // Stream each 60 ms protocol frame to the server immediately as it's captured,
+        // mirroring the ESP32's continuous I2S → WS uplink.
+        mic.onFrame = { frame in
+            Task { try? await socket.send(.data(frame)) }
+        }
         try mic.start()
         logger.info("e2e stage", metadata: ["stage": "client.capture_started"])
-        print("Recording... speak now, then press Enter to stop")
+        print("[listening] Speak now, then press Enter to stop...")
         _ = readLine()
-        let pcm = mic.stop()
+
+        let framesSent = mic.stop()
         let captureFinishedAt = Date()
-        let bytesSent = pcm.count
-        let framesSent = bytesSent / uplinkFrameBytes
-        logger.info(
-            "recording stopped",
-            metadata: ["frames_sent": "\(framesSent)", "bytes_sent": "\(bytesSent)"]
-        )
+        logger.info("recording stopped", metadata: ["frames_sent": "\(framesSent)"])
+
         guard framesSent > 0 else {
+            try await send(socket, json: ["type": "audio.stop"], logger: logger)
             throw TestClientError.noAudioCaptured
         }
-        logger.info("e2e stage", metadata: ["stage": "client.capture_finished", "pcm_bytes": "\(pcm.count)"])
 
-        let transcriptResult: Result<String, Error>
-        do {
-            transcriptResult = .success(try await AppleSpeechTranscriber(logger: logger).transcribe(pcm: pcm))
-        } catch {
-            transcriptResult = .failure(error)
-        }
-        let payload = await makeSubmissionPayload(pcm: pcm, transcriptResult: transcriptResult, logger: logger)
-        try await submit(payload: payload, socket: socket, logger: logger)
-        logger.info("e2e stage", metadata: ["stage": "client.payload_submitted"])
+        try await send(socket, json: ["type": "audio.stop"], logger: logger)
+        logger.info("e2e stage", metadata: ["stage": "client.audio_stop"])
 
+        print("[processing] Waiting for AI response...")
         try await drainTurn(
             socket,
             logger: logger,
             captureStartedAt: captureStartedAt,
             captureFinishedAt: captureFinishedAt
         )
-        logger.info("turn complete — check ESP32 speaker for playback")
-    }
-
-    static func makeSubmissionPayload(
-        pcm: Data,
-        transcriptResult: Result<String, Error>
-    ) -> SubmissionPayload {
-        switch transcriptResult {
-        case .success(let transcript):
-            return .transcript(transcript)
-        case .failure:
-            return .audioFrames(chunkPCMForUplink(pcm))
-        }
-    }
-
-    static func makeSubmissionPayload(
-        pcm: Data,
-        transcriptResult: Result<String, Error>,
-        logger: Logger
-    ) async -> SubmissionPayload {
-        switch transcriptResult {
-        case .success(let transcript):
-            logger.info("local transcript ready", metadata: ["text": .string(transcript)])
-            logger.info("e2e stage", metadata: ["stage": "client.local_transcript_ready", "mode": "transcript"])
-            return .transcript(transcript)
-        case .failure(let error):
-            logger.warning("apple speech failed, falling back to raw audio uplink", metadata: ["error": "\(error)"])
-            logger.info("e2e stage", metadata: ["stage": "client.local_transcript_failed", "mode": "audio_fallback"])
-            return .audioFrames(chunkPCMForUplink(pcm))
-        }
-    }
-
-    static func submit(payload: SubmissionPayload, socket: URLSessionWebSocketTask, logger: Logger) async throws {
-        switch payload {
-        case .transcript(let transcript):
-            logger.info("e2e stage", metadata: ["stage": "client.submit_transcript", "chars": "\(transcript.count)"])
-            try await send(socket, json: ["type": "transcript.input", "text": transcript], logger: logger)
-        case .audioFrames(let frames):
-            logger.info("e2e stage", metadata: ["stage": "client.submit_audio_fallback", "frames": "\(frames.count)"])
-            try await send(socket, json: ["type": "audio.start"], logger: logger)
-            for frame in frames {
-                logger.debug("send binary fallback", metadata: ["bytes": "\(frame.count)"])
-                try await socket.send(.data(frame))
-            }
-            try await send(socket, json: ["type": "audio.stop"], logger: logger)
-        }
-    }
-
-    static func chunkPCMForUplink(_ pcm: Data) -> [Data] {
-        guard !pcm.isEmpty else { return [] }
-        var frames: [Data] = []
-        var offset = 0
-        while offset < pcm.count {
-            let end = min(offset + uplinkFrameBytes, pcm.count)
-            frames.append(pcm.subdata(in: offset..<end))
-            offset = end
-        }
-        return frames
+        logger.info("turn complete")
     }
 
     static func makeTalkToSpeechMetrics(
@@ -206,7 +159,12 @@ struct TestClient {
         captureStartedAt: Date,
         captureFinishedAt: Date
     ) async throws {
+        let player = try SpeakerPlayer(logger: logger)
+        defer { player.stop() }
+
         var downlinkFrames = 0
+        var playbackStartedAt: Date?
+
         while true {
             let message = try await socket.receive()
             switch message {
@@ -214,14 +172,19 @@ struct TestClient {
                 logger.info("recv", metadata: ["json": .string(text)])
                 if text.contains("\"tts.end\"") {
                     logger.info("e2e stage", metadata: ["stage": "client.tts_end", "downlink_frames": "\(downlinkFrames)"])
-                    logger.info(
-                        "tts mirrored to ESP speakers",
-                        metadata: ["downlink_frames_on_ws": "\(downlinkFrames)"]
-                    )
+                    // Wait for all scheduled PCM frames to finish playing before returning.
+                    if let startedAt = playbackStartedAt, downlinkFrames > 0 {
+                        let totalMs = downlinkFrames * downlinkFrameMs
+                        let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+                        let remainingMs = max(0, totalMs - elapsedMs) + 150
+                        logger.info("draining speaker", metadata: ["remaining_ms": "\(remainingMs)"])
+                        try await Task.sleep(nanoseconds: UInt64(remainingMs) * 1_000_000)
+                    }
                     return
                 }
                 if text.contains("\"tts.start\"") {
                     logger.info("e2e stage", metadata: ["stage": "client.tts_start"])
+                    print("[speaking] AI is responding...")
                 }
                 if text.contains("\"transcript.final\"") {
                     logger.info("e2e stage", metadata: ["stage": "client.transcript_final"])
@@ -230,10 +193,11 @@ struct TestClient {
                     logger.warning("server error", metadata: ["json": .string(text)])
                     return
                 }
-            case .data:
+            case .data(let data):
                 downlinkFrames += 1
                 if downlinkFrames == 1 {
                     let now = Date()
+                    playbackStartedAt = now
                     let metrics = makeTalkToSpeechMetrics(
                         captureStartedAt: captureStartedAt,
                         captureFinishedAt: captureFinishedAt,
@@ -248,6 +212,10 @@ struct TestClient {
                             "talk_to_speech_ms": "\(metrics.talkToSpeechMs)",
                         ]
                     )
+                    player.scheduleFrame(data)
+                    player.startPlaying()
+                } else {
+                    player.scheduleFrame(data)
                 }
             @unknown default:
                 continue
@@ -260,16 +228,13 @@ struct TestClient {
             logger.critical("Invalid COMPANION_HOST: \(host)")
             return false
         }
-
         do {
             var request = URLRequest(url: pingURL)
             request.timeoutInterval = 3
             logger.debug("ping request", metadata: ["url": .string(pingURL.absoluteString)])
             let (body, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                logger.critical(
-                    "CompanionServer at \(pingURL.host ?? "?"):\(pingURL.port ?? 8080) did not respond OK. Start CompanionServer first."
-                )
+                logger.critical("CompanionServer at \(pingURL.host ?? "?"):\(pingURL.port ?? 8080) did not respond OK. Start CompanionServer first.")
                 return false
             }
             logger.info(
@@ -282,9 +247,7 @@ struct TestClient {
             )
             return true
         } catch {
-            logger.critical(
-                "Cannot reach CompanionServer at \(pingURL.host ?? "?"):\(pingURL.port ?? 8080). Start CompanionServer in Xcode or another terminal, then re-run TestClient."
-            )
+            logger.critical("Cannot reach CompanionServer at \(pingURL.host ?? "?"):\(pingURL.port ?? 8080). Start CompanionServer in Xcode or another terminal, then re-run TestClient.")
             return false
         }
     }
@@ -299,11 +262,6 @@ struct TestClient {
     }
 }
 
-enum SubmissionPayload: Equatable {
-    case transcript(String)
-    case audioFrames([Data])
-}
-
 struct TalkToSpeechMetrics: Equatable {
     let talkDurationMs: Int
     let stopToSpeechMs: Int
@@ -313,8 +271,6 @@ struct TalkToSpeechMetrics: Equatable {
 enum TestClientError: Error, CustomStringConvertible {
     case unexpectedMessage(String)
     case noAudioCaptured
-    case speechRecognitionUnavailable
-    case speechRecognitionFailed(String)
 
     var description: String {
         switch self {
@@ -322,90 +278,109 @@ enum TestClientError: Error, CustomStringConvertible {
             message
         case .noAudioCaptured:
             "No microphone audio captured. Check System Settings → Sound → Input and speak while recording."
-        case .speechRecognitionUnavailable:
-            "Apple Speech recognition is unavailable for the selected locale on this Mac."
-        case .speechRecognitionFailed(let message):
-            "Apple Speech recognition failed: \(message)"
         }
     }
 }
 
 enum Permission {
     static func ensureGranted(logger: Logger) async -> Bool {
-        let micGranted: Bool
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             logger.info("Microphone access granted.")
-            micGranted = true
+            return true
         case .notDetermined:
             logger.info("Requesting microphone access — approve the macOS prompt to continue.")
             let granted = await AVCaptureDevice.requestAccess(for: .audio)
             if granted {
                 logger.info("Microphone access granted.")
-                micGranted = true
-                break
+                return true
             }
-            logger.critical(
-                "Microphone access denied. Enable TestClient in System Settings → Privacy & Security → Microphone, then re-run."
-            )
+            logger.critical("Microphone access denied. Enable TestClient in System Settings → Privacy & Security → Microphone, then re-run.")
             return false
         case .denied, .restricted:
-            logger.critical(
-                "Microphone access denied. Enable TestClient in System Settings → Privacy & Security → Microphone, then re-run."
-            )
+            logger.critical("Microphone access denied. Enable TestClient in System Settings → Privacy & Security → Microphone, then re-run.")
             return false
         @unknown default:
             logger.critical("Unknown microphone authorization status.")
             return false
         }
-
-        guard micGranted else { return false }
-
-        switch await requestSpeechAuthorization() {
-        case .authorized:
-            logger.info("Speech recognition access granted.")
-            return true
-        case .denied, .restricted:
-            logger.critical(
-                "Speech recognition denied. Enable TestClient in System Settings → Privacy & Security → Speech Recognition, then re-run."
-            )
-            return false
-        case .notDetermined:
-            logger.critical("Speech recognition authorization not determined after request.")
-            return false
-        @unknown default:
-            logger.critical("Unknown speech recognition authorization status.")
-            return false
-        }
-    }
-
-    private static func requestSpeechAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
-        await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
-                continuation.resume(returning: status)
-            }
-        }
     }
 }
 
-/// Captures the Mac's default input device and converts it to 16kHz mono
-/// 16-bit PCM frames matching CompanionServer's uplink format, chunked to
-/// the protocol's 60ms frame size. Temporary stand-in for the ESP32's I2S
-/// mic until that hardware is wired up — same wire format either way, so
-/// nothing downstream needs to change when the real mic arrives.
+/// Plays the server's downlink PCM stream (24 kHz, 16-bit mono) on the Mac's
+/// default output device. Frames are scheduled into AVAudioPlayerNode as they
+/// arrive over the WebSocket, mirroring what the ESP32 would feed to its DAC.
+final class SpeakerPlayer {
+    private let engine = AVAudioEngine()
+    private let playerNode = AVAudioPlayerNode()
+    private let format: AVAudioFormat
+    private let logger: Logger
+
+    init(logger: Logger) throws {
+        self.logger = logger
+        guard let fmt = AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: Double(downlinkSampleRate),
+            channels: 1,
+            interleaved: true
+        ) else {
+            throw TestClientError.unexpectedMessage("failed to construct downlink audio format")
+        }
+        format = fmt
+        engine.attach(playerNode)
+        engine.connect(playerNode, to: engine.mainMixerNode, format: format)
+        engine.prepare()
+        try engine.start()
+    }
+
+    func scheduleFrame(_ data: Data) {
+        let sampleCount = data.count / MemoryLayout<Int16>.size
+        guard sampleCount > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(sampleCount))
+        else { return }
+        buffer.frameLength = AVAudioFrameCount(sampleCount)
+        data.withUnsafeBytes { raw in
+            guard let src = raw.baseAddress?.assumingMemoryBound(to: Int16.self) else { return }
+            buffer.int16ChannelData![0].update(from: src, count: sampleCount)
+        }
+        playerNode.scheduleBuffer(buffer)
+    }
+
+    func startPlaying() {
+        playerNode.play()
+        logger.info("speaker playback started")
+    }
+
+    func stop() {
+        playerNode.stop()
+        engine.stop()
+        logger.info("speaker playback stopped")
+    }
+}
+
+/// Captures the Mac's default input device and converts it to 16 kHz mono
+/// 16-bit PCM frames matching CompanionServer's uplink format. Each complete
+/// 60 ms frame is delivered via onFrame so it can be streamed to the server
+/// immediately, mirroring the ESP32's continuous I2S → WS uplink.
 final class MicCapture {
+    var onFrame: (@Sendable (Data) -> Void)?
+
     private let engine = AVAudioEngine()
     private let targetFormat: AVAudioFormat
     private let logger: Logger
     private var converter: AVAudioConverter?
     private var frameBuffer = Data()
-    private var capturedPCM = Data()
     private var protocolFramesEmitted = 0
     private var conversionErrors = 0
 
     init(logger: Logger) throws {
         self.logger = logger
-        guard let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Double(uplinkSampleRate), channels: 1, interleaved: true) else {
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: Double(uplinkSampleRate),
+            channels: 1,
+            interleaved: true
+        ) else {
             throw TestClientError.unexpectedMessage("failed to construct target audio format")
         }
         targetFormat = format
@@ -436,21 +411,22 @@ final class MicCapture {
         logger.info("mic capture started")
     }
 
-    func stop() -> Data {
+    /// Stops capture and returns the number of 60 ms protocol frames that were emitted.
+    func stop() -> Int {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         converter = nil
-        let pcm = capturedPCM
-        capturedPCM.removeAll()
         frameBuffer.removeAll()
+        let count = protocolFramesEmitted
+        protocolFramesEmitted = 0
         logger.info(
             "mic capture stopped",
             metadata: [
-                "protocol_frames": "\(protocolFramesEmitted)",
+                "protocol_frames": "\(count)",
                 "conversion_errors": "\(conversionErrors)",
             ]
         )
-        return pcm
+        return count
     }
 
     private func process(_ buffer: AVAudioPCMBuffer) {
@@ -487,95 +463,14 @@ final class MicCapture {
         let frameLength = Int(outBuffer.frameLength)
         guard frameLength > 0 else { return }
 
-        let data = Data(bytes: channelData[0], count: frameLength * MemoryLayout<Int16>.size)
-        capturedPCM.append(data)
-        frameBuffer.append(data)
+        frameBuffer.append(Data(bytes: channelData[0], count: frameLength * MemoryLayout<Int16>.size))
 
         while frameBuffer.count >= uplinkFrameBytes {
-            let chunk = frameBuffer.prefix(uplinkFrameBytes)
+            let chunk = Data(frameBuffer.prefix(uplinkFrameBytes))
             frameBuffer.removeFirst(uplinkFrameBytes)
             protocolFramesEmitted += 1
-            logger.debug(
-                "mic frame ready",
-                metadata: ["frame": "\(protocolFramesEmitted)", "bytes": "\(chunk.count)"]
-            )
+            onFrame?(chunk)
+            logger.debug("mic frame sent", metadata: ["frame": "\(protocolFramesEmitted)", "bytes": "\(chunk.count)"])
         }
-    }
-}
-
-final class AppleSpeechTranscriber {
-    private let recognizer: SFSpeechRecognizer?
-    private let logger: Logger
-
-    init(locale: Locale = Locale(identifier: "en-US"), logger: Logger) {
-        self.recognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer()
-        self.logger = logger
-    }
-
-    func transcribe(pcm: Data) async throws -> String {
-        guard let recognizer, recognizer.isAvailable else {
-            throw TestClientError.speechRecognitionUnavailable
-        }
-
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("testclient-\(UUID().uuidString)")
-            .appendingPathExtension("wav")
-        try makeWAV(pcm: pcm, sampleRate: uplinkSampleRate).write(to: url)
-        defer { try? FileManager.default.removeItem(at: url) }
-
-        logger.info("apple speech start", metadata: ["wav_bytes": "\(pcm.count)"])
-        let request = SFSpeechURLRecognitionRequest(url: url)
-        request.shouldReportPartialResults = false
-        if #available(macOS 13, *) {
-            request.requiresOnDeviceRecognition = false
-        }
-
-        let text: String = try await withCheckedThrowingContinuation { continuation in
-            recognizer.recognitionTask(with: request) { result, error in
-                if let error {
-                    continuation.resume(throwing: TestClientError.speechRecognitionFailed(error.localizedDescription))
-                    return
-                }
-                guard let result, result.isFinal else { return }
-                continuation.resume(returning: result.bestTranscription.formattedString)
-            }
-        }
-        return text
-    }
-
-    private func makeWAV(pcm: Data, sampleRate: Int) -> Data {
-        var header = Data()
-        let byteRate = sampleRate * 2
-        let blockAlign: UInt16 = 2
-        let dataSize = UInt32(pcm.count)
-        let chunkSize = 36 + dataSize
-
-        header.append(contentsOf: "RIFF".utf8)
-        header.append(littleEndian: chunkSize)
-        header.append(contentsOf: "WAVE".utf8)
-        header.append(contentsOf: "fmt ".utf8)
-        header.append(littleEndian: UInt32(16))
-        header.append(littleEndian: UInt16(1))
-        header.append(littleEndian: UInt16(1))
-        header.append(littleEndian: UInt32(sampleRate))
-        header.append(littleEndian: UInt32(byteRate))
-        header.append(littleEndian: blockAlign)
-        header.append(littleEndian: UInt16(16))
-        header.append(contentsOf: "data".utf8)
-        header.append(littleEndian: dataSize)
-        header.append(pcm)
-        return header
-    }
-}
-
-private extension Data {
-    mutating func append(littleEndian value: UInt32) {
-        var v = value.littleEndian
-        Swift.withUnsafeBytes(of: &v) { append(contentsOf: $0) }
-    }
-
-    mutating func append(littleEndian value: UInt16) {
-        var v = value.littleEndian
-        Swift.withUnsafeBytes(of: &v) { append(contentsOf: $0) }
     }
 }

@@ -2,33 +2,32 @@
 
 // Fill these in before flashing. Mirrors the showcase-phase auth model in
 // the plan: shared compile-time token, no rotation, LAN-only.
-#define WIFI_SSID "ESPServer"
-#define WIFI_PASSWORD "mayunskuy123"
+#define WIFI_SSID "Wifi iuran"
+#define WIFI_PASSWORD "sekgangguan"
 
-#define COMPANION_SERVER_HOST "192.168.1.100"
+#define COMPANION_SERVER_HOST "192.168.1.3"
 #define COMPANION_SERVER_PORT 8080
 #define COMPANION_SERVER_PATH "/ws"
 #define COMPANION_USE_TLS false // true => wss:// (beginSSL)
 
 // Must match the DEVICE_TOKEN env var CompanionServer was started with.
-#define COMPANION_DEVICE_TOKEN "your-device-token"
+#define COMPANION_DEVICE_TOKEN                                                 \
+  "O6k4xgaZBLhPHCbzsbZqiyFcPvM7LfsCrw7fdgjy4wWLW8urQ0ERSgWHoXTKDyB1"
 
-// Push-to-talk button: active-low, internal pull-up. Many ESP32-S3 dev
-// boards expose GPIO0 as the BOOT button, usable for bring-up.
-#define PIN_BUTTON 0
+// Capacitive touch toggle button. GPIO4 = Touch0 on ESP32 dev module.
+// Tap once to start listening, tap again to stop.
+#define PIN_BUTTON 4
+#define TOUCH_THRESHOLD 40 // below this value = touched; tune per enclosure
 
-// Mic hardware not on the board yet — set to 1 and fill in real pins once
-// it's wired up. Until then, audio capture is a no-op and turns are
-// validated via CompanionServer/TestClient (real MacBook mic) instead.
-#define HAS_MIC 0
+#define HAS_MIC 1
 
-// Mic (I2S RX) — e.g. INMP441. Unused while HAS_MIC is 0.
-#define PIN_MIC_BCLK 4
-#define PIN_MIC_WS 5
-#define PIN_MIC_DIN 6
-#define MIC_CHANNEL_LEFT true // false if your mic's L/R pin selects right
+// Mic (I2S RX) — INMP441. L/R pin tied to GND → left channel.
+#define PIN_MIC_BCLK 14 // SCK
+#define PIN_MIC_WS 12   // WS
+#define PIN_MIC_DIN 35  // SD
+#define MIC_CHANNEL_LEFT true
 
-// Speaker amp (I2S TX) — e.g. MAX98357A.
-#define PIN_SPK_BCLK 5
-#define PIN_SPK_WS 6
-#define PIN_SPK_DOUT 7
+// Speaker amp (I2S TX) — MAX98357A.
+#define PIN_SPK_BCLK 33 // BCK
+#define PIN_SPK_WS 25   // LRC
+#define PIN_SPK_DOUT 32 // DIN

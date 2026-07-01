@@ -21,9 +21,11 @@ actor VoiceSession {
     private let sessionId = UUID().uuidString
     private let outbound: SessionOutboundWriter
     private let openAI: OpenAIService
-    private let cartesia: CartesiaTTSService
+    private let tts: TTSStreamingService
     private let stt: CartesiaSTTServiceProtocol
     private let speakers: SpeakerRegistry
+    private let realtime: OpenAIRealtimeService?
+    private let downlinkPacer: DownlinkPacer
     private let logger: Logger
 
     private var phase: SessionPhase = .connected
@@ -31,29 +33,44 @@ actor VoiceSession {
     private var activeContextId: String?
     private var turnCounter = 0
     private var uplinkFrameCounter = 0
+    private var uplinkPCMDump = Data()
+    private var downlinkPCMDump = Data()
+    private var downlinkTurnId: String?
     private var conversationHistory: [ChatMessage] = []
     private let maxHistoryMessages = 20
 
     init(
         outbound: SessionOutboundWriter,
         openAI: OpenAIService,
-        cartesia: CartesiaTTSService,
+        tts: TTSStreamingService,
         stt: CartesiaSTTServiceProtocol,
         speakers: SpeakerRegistry,
+        realtime: OpenAIRealtimeService? = nil,
         logger: Logger
     ) {
         self.outbound = outbound
         self.openAI = openAI
-        self.cartesia = cartesia
+        self.tts = tts
         self.stt = stt
         self.speakers = speakers
+        self.realtime = realtime
+        self.downlinkPacer = DownlinkPacer(
+            outbound: outbound,
+            speakers: speakers,
+            sampleRate: AudioParams.downlink.sampleRate,
+            logger: logger
+        )
         self.logger = logger
     }
 
     func start() async throws {
         phase = .connected
         logger.info("session started", metadata: ["session_id": .string(sessionId)])
-        Task { await stt.connect() }
+        if let realtime {
+            Task { await realtime.connect() }
+        } else {
+            Task { await stt.connect() }
+        }
         let ready = SessionReady(sessionId: sessionId, audio: .downlink)
         try await send(ready)
     }
@@ -61,6 +78,7 @@ actor VoiceSession {
     func handleAudioStart() {
         phase = .capturing
         uplinkFrameCounter = 0
+        uplinkPCMDump.removeAll(keepingCapacity: true)
         logger.info("audio.start", metadata: ["session_id": .string(sessionId), "phase": .string("\(phase)")])
     }
 
@@ -73,11 +91,16 @@ actor VoiceSession {
             return
         }
         uplinkFrameCounter += 1
+        uplinkPCMDump.append(data)
         logger.debug(
-            "uplink frame forwarded to stt",
+            "uplink frame",
             metadata: ["session_id": .string(sessionId), "frame": "\(uplinkFrameCounter)", "bytes": "\(data.count)"]
         )
-        await stt.sendAudio(data)
+        if let realtime {
+            await realtime.appendAudioFrame(data)
+        } else {
+            await stt.sendAudio(data)
+        }
     }
 
     func handleAudioStop() {
@@ -102,9 +125,16 @@ actor VoiceSession {
             ]
         )
         logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.audio_stop", "turn_id": .string(turnId)])
+        dumpDebugUplinkAudio(uplinkPCMDump, turnId: turnId)
 
-        pipelineTask = Task { [weak self] in
-            await self?.runPipeline(turnId: turnId, frameCount: frameCount)
+        if realtime != nil {
+            pipelineTask = Task { [weak self] in
+                await self?.runRealtimeTurn(turnId: turnId)
+            }
+        } else {
+            pipelineTask = Task { [weak self] in
+                await self?.runPipeline(turnId: turnId, frameCount: frameCount)
+            }
         }
     }
 
@@ -130,14 +160,19 @@ actor VoiceSession {
         )
         pipelineTask?.cancel()
         pipelineTask = nil
-        if let contextId = activeContextId {
-            await cartesia.cancelTurn(contextId: contextId)
-            activeContextId = nil
+        if let realtime {
+            await realtime.cancelResponse()
+        } else {
+            if let contextId = activeContextId {
+                await tts.cancelTurn(contextId: contextId)
+                activeContextId = nil
+            }
+            // Closing/reconnecting the STT socket unblocks any pending finalize() wait immediately.
+            await stt.close()
+            Task { await stt.connect() }
         }
-        // Closing/reconnecting the STT socket unblocks any pending finalize() wait immediately
-        // instead of leaving the cancelled pipeline task suspended until its watchdog timeout.
-        await stt.close()
-        Task { await stt.connect() }
+        await downlinkPacer.cancel()
+        dumpDownlinkCaptureIfNeeded()
         phase = .connected
         Task {
             try? await send(TTSEnd(sessionId: sessionId))
@@ -148,11 +183,16 @@ actor VoiceSession {
     func handleDisconnect() {
         pipelineTask?.cancel()
         pipelineTask = nil
-        if let contextId = activeContextId {
-            Task { await cartesia.cancelTurn(contextId: contextId) }
-            activeContextId = nil
+        if let realtime {
+            Task { await realtime.close() }
+        } else {
+            if let contextId = activeContextId {
+                Task { await tts.cancelTurn(contextId: contextId) }
+                activeContextId = nil
+            }
+            Task { await stt.close() }
         }
-        Task { await stt.close() }
+        Task { await downlinkPacer.cancel() }
         logger.info("session disconnected", metadata: ["session_id": .string(sessionId)])
     }
 
@@ -222,6 +262,95 @@ actor VoiceSession {
         }
     }
 
+    /// Single-roundtrip realtime pipeline: committed audio → OpenAI Realtime API
+    /// → streamed PCM audio back to the client. Bypasses STT, LLM, and TTS stages.
+    private func runRealtimeTurn(turnId: String) async {
+        guard let realtime else { return }
+        let t0 = Date()
+        logger.info("realtime turn start", metadata: ["session_id": .string(sessionId), "turn_id": .string(turnId)])
+
+        do {
+            phase = .streamingTTS
+            await beginDownlinkCapture(turnId: turnId)
+            try await send(TTSStart(sessionId: sessionId))
+            await mirrorTTSStart()
+            logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.tts_start", "turn_id": .string(turnId)])
+
+            logger.info("realtime commitAndCreateResponse — waiting for events", metadata: ["session_id": .string(sessionId)])
+            let events = await realtime.commitAndCreateResponse()
+            logger.info("realtime stream open — iterating events", metadata: ["session_id": .string(sessionId)])
+            var inputText = ""
+            var assistantText = ""
+            var downlinkFrames = 0
+            var firstDownlinkAt: Date?
+
+            for await event in events {
+                try Task.checkCancellation()
+                switch event {
+                case .audio(let pcm):
+                    if firstDownlinkAt == nil {
+                        firstDownlinkAt = Date()
+                        logger.info("realtime first audio chunk received", metadata: ["session_id": .string(sessionId), "bytes": "\(pcm.count)"])
+                        logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.first_downlink_audio", "turn_id": .string(turnId)])
+                    }
+                    let chunks = await sendDownlinkPCM(pcm)
+                    downlinkFrames += chunks
+                    logger.debug("realtime audio pcm=\(pcm.count)b encoded_chunks=\(chunks)", metadata: ["session_id": .string(sessionId)])
+                case .inputTranscript(let text):
+                    inputText = text
+                    logger.info("realtime input transcript", metadata: ["session_id": .string(sessionId), "text": .string(text)])
+                    try? await send(TranscriptFinal(sessionId: sessionId, text: text))
+                    logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.transcript_ready", "turn_id": .string(turnId)])
+                case .assistantTranscript(let delta):
+                    assistantText += delta
+                    logger.debug("realtime assistant delta", metadata: ["session_id": .string(sessionId), "delta": .string(delta)])
+                case .done:
+                    logger.info("realtime stream done", metadata: ["session_id": .string(sessionId)])
+                case .error(let msg):
+                    logger.error("realtime event error", metadata: ["session_id": .string(sessionId), "msg": .string(msg)])
+                }
+            }
+            logger.info("realtime event loop finished", metadata: ["session_id": .string(sessionId), "downlink_frames": "\(downlinkFrames)"])
+
+            if !inputText.isEmpty {
+                conversationHistory.append(ChatMessage(role: "user", content: inputText))
+            }
+            if !assistantText.isEmpty {
+                conversationHistory.append(ChatMessage(role: "assistant", content: assistantText))
+                if conversationHistory.count > maxHistoryMessages {
+                    conversationHistory.removeFirst(conversationHistory.count - maxHistoryMessages)
+                }
+            }
+
+            guard phase == .streamingTTS else { return }
+            await downlinkPacer.endTurn()
+            dumpDownlinkCaptureIfNeeded()
+            try await send(TTSEnd(sessionId: sessionId))
+            await mirrorTTSEnd()
+            phase = .connected
+            logger.info(
+                "realtime turn complete",
+                metadata: [
+                    "session_id": .string(sessionId),
+                    "turn_id": .string(turnId),
+                    "total_ms": "\(Int(Date().timeIntervalSince(t0) * 1000))",
+                    "downlink_frames": "\(downlinkFrames)",
+                ]
+            )
+            logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.tts_end", "turn_id": .string(turnId)])
+        } catch is CancellationError {
+            await downlinkPacer.cancel()
+            dumpDownlinkCaptureIfNeeded()
+            logger.info("realtime turn cancelled", metadata: ["session_id": .string(sessionId)])
+        } catch {
+            await downlinkPacer.cancel()
+            dumpDownlinkCaptureIfNeeded()
+            logger.error("realtime turn failed", metadata: ["session_id": .string(sessionId), "error": "\(error)"])
+            try? await send(ErrorMessage(code: "realtime_failed", message: "\(error)"))
+            phase = .connected
+        }
+    }
+
     /// Streams the LLM reply token-by-token to Cartesia as it arrives and forwards
     /// Cartesia's streamed PCM audio to the downlink incrementally, so chat
     /// generation and TTS synthesis overlap instead of running sequentially.
@@ -235,56 +364,50 @@ actor VoiceSession {
             }
 
             phase = .streamingTTS
+            await beginDownlinkCapture(turnId: turnId)
             try await send(TTSStart(sessionId: sessionId))
             await mirrorTTSStart()
             logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.tts_start", "turn_id": .string(turnId)])
 
             let contextId = "\(sessionId)-\(turnId)"
             activeContextId = contextId
-            let audioEvents = await cartesia.beginTurn(contextId: contextId)
+            let audioEvents = await tts.beginTurn(contextId: contextId)
 
             var tLlmFirstToken: Date?
             var tTtsFirstByte: Date?
             var tWsFirstSent: Date?
             var downlinkFrameCount = 0
-            var fullPCM = Data()
 
-            let downlinkTask = Task { [outbound, speakers, logger, sessionId] () -> DownlinkResult in
+            let downlinkTask = Task { [weak self, sessionId] () -> DownlinkResult in
                 var firstByte: Date?
                 var firstWsSent: Date?
                 var frameCount = 0
-                var pcmAccumulator = Data()
                 for await event in audioEvents {
                     switch event {
                     case .audio(let pcm):
                         if firstByte == nil {
                             firstByte = Date()
-                            logger.info(
+                            self?.logger.info(
                                 "e2e stage",
                                 metadata: ["session_id": .string(sessionId), "stage": "server.first_tts_audio_chunk", "turn_id": .string(turnId)]
                             )
                         }
-                        pcmAccumulator.append(pcm)
-                        let opusOut = (try? OpusCodec.encodeFromPCM(pcm, sampleRate: AudioParams.downlink.sampleRate)) ?? []
-                        for chunk in opusOut {
-                            if firstWsSent == nil {
-                                firstWsSent = Date()
-                                logger.info(
-                                    "e2e stage",
-                                    metadata: ["session_id": .string(sessionId), "stage": "server.first_downlink_audio", "turn_id": .string(turnId)]
-                                )
-                            }
-                            frameCount += 1
-                            try? await outbound.writeBinary(chunk)
-                            await speakers.broadcastBinary(chunk)
+                        let chunks = await self?.sendDownlinkPCM(pcm) ?? 0
+                        if chunks > 0, firstWsSent == nil {
+                            firstWsSent = Date()
+                            self?.logger.info(
+                                "e2e stage",
+                                metadata: ["session_id": .string(sessionId), "stage": "server.first_downlink_audio", "turn_id": .string(turnId)]
+                            )
                         }
+                        frameCount += chunks
                     case .done:
                         break
                     case .error(let message):
-                        logger.error("cartesia stream error", metadata: ["session_id": .string(sessionId), "error": .string(message)])
+                        self?.logger.error("tts stream error", metadata: ["session_id": .string(sessionId), "error": .string(message)])
                     }
                 }
-                return DownlinkResult(frameCount: frameCount, firstByte: firstByte, firstWsSent: firstWsSent, pcm: pcmAccumulator)
+                return DownlinkResult(frameCount: frameCount, firstByte: firstByte, firstWsSent: firstWsSent)
             }
 
             var chatResult = ChatToolResult(reply: "", command: nil)
@@ -299,12 +422,12 @@ actor VoiceSession {
                             metadata: ["session_id": .string(sessionId), "stage": "server.llm_first_token", "turn_id": .string(turnId)]
                         )
                     }
-                    await cartesia.sendTranscriptChunk(text, contextId: contextId, isFinal: false)
+                    await tts.sendTranscriptChunk(text, contextId: contextId, isFinal: false)
                 case .done(let result):
                     chatResult = result
                 }
             }
-            await cartesia.sendTranscriptChunk("", contextId: contextId, isFinal: true)
+            await tts.sendTranscriptChunk("", contextId: contextId, isFinal: true)
             try Task.checkCancellation()
             let tLlmDone = Date()
             logger.info(
@@ -353,10 +476,10 @@ actor VoiceSession {
             tTtsFirstByte = downlinkResult.firstByte
             tWsFirstSent = downlinkResult.firstWsSent
             downlinkFrameCount = downlinkResult.frameCount
-            fullPCM = downlinkResult.pcm
-            dumpDebugTTSAudio(fullPCM, turnId: turnId)
 
             guard phase == .streamingTTS else { return }
+            await downlinkPacer.endTurn()
+            dumpDownlinkCaptureIfNeeded()
             try await send(TTSEnd(sessionId: sessionId))
             await mirrorTTSEnd()
             phase = .connected
@@ -388,9 +511,13 @@ actor VoiceSession {
             )
         } catch is CancellationError {
             activeContextId = nil
+            await downlinkPacer.cancel()
+            dumpDownlinkCaptureIfNeeded()
             logger.info("pipeline cancelled", metadata: ["session_id": .string(sessionId)])
         } catch {
             activeContextId = nil
+            await downlinkPacer.cancel()
+            dumpDownlinkCaptureIfNeeded()
             logger.error("pipeline failed", metadata: ["session_id": .string(sessionId), "error": "\(error)"])
             try? await send(ErrorMessage(code: "pipeline_failed", message: "\(error)"))
             phase = .connected
@@ -401,22 +528,39 @@ actor VoiceSession {
         let frameCount: Int
         let firstByte: Date?
         let firstWsSent: Date?
-        let pcm: Data
+    }
+
+    private func beginDownlinkCapture(turnId: String) async {
+        downlinkTurnId = turnId
+        downlinkPCMDump.removeAll(keepingCapacity: true)
+        await downlinkPacer.beginTurn()
+    }
+
+    private func sendDownlinkPCM(_ pcm: Data) async -> Int {
+        downlinkPCMDump.append(pcm)
+        return (try? await downlinkPacer.enqueue(pcm: pcm)) ?? 0
+    }
+
+    private func dumpDownlinkCaptureIfNeeded() {
+        guard let turnId = downlinkTurnId else { return }
+        dumpDebugDownlinkAudio(downlinkPCMDump, turnId: turnId)
+        downlinkTurnId = nil
     }
 
     private func ms(_ a: Date, _ b: Date) -> Int {
         max(0, Int(b.timeIntervalSince(a) * 1000))
     }
 
-    private func dumpDebugTTSAudio(_ pcm: Data, turnId: String) {
+    private func dumpDebugUplinkAudio(_ pcm: Data, turnId: String) {
+        guard !pcm.isEmpty else { return }
         do {
             let directory = try Self.debugAudioDirectory()
             let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
-            let filename = "\(timestamp)-\(sessionId)-\(turnId).wav"
+            let filename = "\(timestamp)-\(sessionId)-\(turnId)-uplink.wav"
             let fileURL = directory.appendingPathComponent(filename)
-            try Self.wrapWAV(pcm: pcm, sampleRate: AudioParams.downlink.sampleRate).write(to: fileURL)
+            try Self.wrapWAV(pcm: pcm, sampleRate: AudioParams.uplink.sampleRate).write(to: fileURL)
             logger.info(
-                "tts debug audio saved",
+                "uplink debug audio saved",
                 metadata: [
                     "session_id": .string(sessionId),
                     "turn_id": .string(turnId),
@@ -426,7 +570,32 @@ actor VoiceSession {
             )
         } catch {
             logger.warning(
-                "failed to save tts debug audio",
+                "failed to save uplink debug audio",
+                metadata: ["session_id": .string(sessionId), "turn_id": .string(turnId), "error": "\(error)"]
+            )
+        }
+    }
+
+    private func dumpDebugDownlinkAudio(_ pcm: Data, turnId: String) {
+        guard !pcm.isEmpty else { return }
+        do {
+            let directory = try Self.debugAudioDirectory()
+            let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+            let filename = "\(timestamp)-\(sessionId)-\(turnId)-downlink.wav"
+            let fileURL = directory.appendingPathComponent(filename)
+            try Self.wrapWAV(pcm: pcm, sampleRate: AudioParams.downlink.sampleRate).write(to: fileURL)
+            logger.info(
+                "downlink debug audio saved",
+                metadata: [
+                    "session_id": .string(sessionId),
+                    "turn_id": .string(turnId),
+                    "path": .string(fileURL.path),
+                    "bytes": "\(pcm.count)",
+                ]
+            )
+        } catch {
+            logger.warning(
+                "failed to save downlink debug audio",
                 metadata: ["session_id": .string(sessionId), "turn_id": .string(turnId), "error": "\(error)"]
             )
         }

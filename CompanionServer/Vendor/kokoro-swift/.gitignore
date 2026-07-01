@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+*.xcodeproj
+DerivedData/
+xcuserdata/
+*.o
+*.d
+__pycache__/
+*.pyc

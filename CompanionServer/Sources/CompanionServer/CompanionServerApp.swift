@@ -27,13 +27,44 @@ struct CompanionServerApp {
         )
 
         let openAI = OpenAIRESTService(apiKey: config.openAIAPIKey, logger: serverLogger)
-        let cartesia = CartesiaService(
-            apiKey: config.cartesiaAPIKey,
-            voiceId: config.cartesiaVoiceId,
-            modelId: config.cartesiaModelId,
-            sampleRate: AudioParams.downlink.sampleRate,
-            logger: serverLogger
-        )
+
+        let realtimeService: OpenAIRealtimeService? = config.openAIRealtimeEnabled
+            ? OpenAIRealtimeService(
+                apiKey: config.openAIAPIKey,
+                model: config.openAIRealtimeModel,
+                voice: config.openAIRealtimeVoice,
+                logger: serverLogger
+              )
+            : nil
+        if config.openAIRealtimeEnabled {
+            logger.info(
+                "realtime pipeline enabled",
+                metadata: ["model": .string(config.openAIRealtimeModel), "voice": .string(config.openAIRealtimeVoice)]
+            )
+        }
+
+        let tts: TTSStreamingService
+        switch config.ttsProvider {
+        case "kokoro":
+            tts = KokoroTTSService(
+                weightsDir: URL(fileURLWithPath: config.kokoroWeightsDir, isDirectory: true),
+                voice: config.kokoroVoice,
+                logger: serverLogger
+            )
+            logger.info(
+                "tts provider: kokoro (local MLX)",
+                metadata: ["weights_dir": .string(config.kokoroWeightsDir), "voice": .string(config.kokoroVoice)]
+            )
+        default:
+            tts = CartesiaService(
+                apiKey: config.cartesiaAPIKey,
+                voiceId: config.cartesiaVoiceId,
+                modelId: config.cartesiaModelId,
+                sampleRate: AudioParams.downlink.sampleRate,
+                logger: serverLogger
+            )
+            logger.info("tts provider: cartesia", metadata: ["voice_id": .string(config.cartesiaVoiceId)])
+        }
         let speakers = SpeakerRegistry(logger: serverLogger)
 
         let wsRouter = Router(context: BasicWebSocketRequestContext.self)
@@ -51,12 +82,21 @@ struct CompanionServerApp {
                 sampleRate: AudioParams.uplink.sampleRate,
                 logger: serverLogger
             )
+            let realtime: OpenAIRealtimeService? = config.openAIRealtimeEnabled
+                ? OpenAIRealtimeService(
+                    apiKey: config.openAIAPIKey,
+                    model: config.openAIRealtimeModel,
+                    voice: config.openAIRealtimeVoice,
+                    logger: serverLogger
+                  )
+                : nil
             let session = VoiceSession(
                 outbound: WebSocketSessionOutboundWriter(base: outbound),
                 openAI: openAI,
-                cartesia: cartesia,
+                tts: tts,
                 stt: stt,
                 speakers: speakers,
+                realtime: realtime,
                 logger: serverLogger
             )
             try await session.start()

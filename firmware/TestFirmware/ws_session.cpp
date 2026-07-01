@@ -18,15 +18,40 @@ enum SpeakerState {
 };
 
 struct PlaybackChunk {
-    uint8_t *data;
     size_t len;
+    uint8_t data[COMPANION_DOWNLINK_FRAME_BYTES];
 };
+
+static constexpr UBaseType_t kPlaybackQueueDepth = 32;
+static constexpr UBaseType_t kInitialPrefillFrames = 8;
+static constexpr UBaseType_t kMaxPrefillFrames = 16;
+static constexpr int kQueueWaitMs = 120;
+static constexpr int kStarvationFramesBeforeRebuffer = 8;
+static constexpr int kDownlinkFrameMs = COMPANION_FRAME_MS;
+
+static UBaseType_t s_prefillTarget = kInitialPrefillFrames;
 
 static WebSocketsClient s_webSocket;
 static SemaphoreHandle_t s_stateMutex;
 static SpeakerState s_state = SPEAKER_IDLE;
 static QueueHandle_t s_playbackQueue;
 static uint32_t s_downlinkFramesReceived = 0;
+static volatile bool s_playbackNeedPrefill = true;
+#if SPEAKER_SELF_TEST_ON_BOOT
+static bool s_selfTestScheduled = false;
+#endif
+
+#if SPEAKER_SELF_TEST_ON_BOOT
+static void speakerSelfTestTask(void *arg) {
+    (void)arg;
+    // Let setup() return and the WebSocket task start before blocking on I2S.
+    vTaskDelay(pdMS_TO_TICKS(300));
+    Serial.println("[SPEAKER TEST] listen for 440 Hz beep (~1 s)...");
+    Serial.flush();
+    audioIoSpeakerSelfTest();
+    vTaskDelete(NULL);
+}
+#endif
 
 static const char *stateName(SpeakerState s) {
     switch (s) {
@@ -55,24 +80,83 @@ static void setState(SpeakerState s) {
 static void drainPlaybackQueue() {
     PlaybackChunk chunk;
     while (xQueueReceive(s_playbackQueue, &chunk, 0) == pdTRUE) {
-        free(chunk.data);
     }
+    s_playbackNeedPrefill = true;
 }
 
 static void playbackTask(void *arg) {
     (void)arg;
     PlaybackChunk chunk;
     static int16_t samples[COMPANION_DOWNLINK_FRAME_BYTES / sizeof(int16_t)];
+    static int16_t silence[COMPANION_DOWNLINK_FRAME_BYTES / sizeof(int16_t)] = {};
+    TickType_t nextWake = 0;
+    uint32_t framesPlayed = 0;
+    int starvationFrames = 0;
+
     while (true) {
-        if (xQueueReceive(s_playbackQueue, &chunk, portMAX_DELAY) == pdTRUE) {
-            size_t sampleCount = pcmCodecDecodeDownlinkFrame(
-                chunk.data, chunk.len, samples, sizeof(samples) / sizeof(samples[0]));
-            Serial.printf("downlink frame %lu (%u bytes, %u samples)\n",
-                          static_cast<unsigned long>(s_downlinkFramesReceived),
-                          static_cast<unsigned>(chunk.len),
-                          static_cast<unsigned>(sampleCount));
-            audioIoWriteDownlink(samples, sampleCount);
-            free(chunk.data);
+        if (s_playbackNeedPrefill) {
+            if (uxQueueMessagesWaiting(s_playbackQueue) < s_prefillTarget) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            s_playbackNeedPrefill = false;
+            framesPlayed = 0;
+            starvationFrames = 0;
+            nextWake = xTaskGetTickCount();
+            Serial.printf("[AUDIO] prefill complete — playback starting (target=%u)\n",
+                          static_cast<unsigned>(s_prefillTarget));
+        }
+
+        TickType_t now = xTaskGetTickCount();
+        if (now < nextWake) {
+            vTaskDelay(nextWake - now);
+        }
+
+        bool gotFrame = xQueueReceive(s_playbackQueue, &chunk, pdMS_TO_TICKS(kQueueWaitMs)) == pdTRUE;
+        if (!gotFrame) {
+            if (getState() != SPEAKER_PLAYING) {
+                continue;
+            }
+            // Pad short gaps with silence instead of stopping immediately.
+            audioIoWriteDownlink(silence, sizeof(silence) / sizeof(silence[0]));
+            starvationFrames++;
+            nextWake += pdMS_TO_TICKS(kDownlinkFrameMs);
+            now = xTaskGetTickCount();
+            if (nextWake < now) {
+                nextWake = now;
+            }
+            if (starvationFrames >= kStarvationFramesBeforeRebuffer) {
+                s_playbackNeedPrefill = true;
+                if (s_prefillTarget < kMaxPrefillFrames) {
+                    s_prefillTarget += 2;
+                }
+                Serial.printf("[AUDIO] underrun — re-buffering (next target=%u)\n",
+                              static_cast<unsigned>(s_prefillTarget));
+                starvationFrames = 0;
+            }
+            continue;
+        }
+
+        starvationFrames = 0;
+        size_t sampleCount = pcmCodecDecodeDownlinkFrame(
+            chunk.data, chunk.len, samples, sizeof(samples) / sizeof(samples[0]));
+        framesPlayed++;
+        audioIoWriteDownlink(samples, sampleCount);
+
+        int frameMs = static_cast<int>(sampleCount * 1000 / COMPANION_DOWNLINK_SAMPLE_RATE);
+        if (frameMs < 1) {
+            frameMs = kDownlinkFrameMs;
+        }
+        nextWake += pdMS_TO_TICKS(frameMs);
+        now = xTaskGetTickCount();
+        if (nextWake < now) {
+            nextWake = now;
+        }
+
+        if ((framesPlayed % 20) == 0) {
+            Serial.printf("[AUDIO] played %lu frames (queue=%u)\n",
+                          static_cast<unsigned long>(framesPlayed),
+                          static_cast<unsigned>(uxQueueMessagesWaiting(s_playbackQueue)));
         }
     }
 }
@@ -89,11 +173,13 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
         drainPlaybackQueue();
         setState(SPEAKER_IDLE);
         s_downlinkFramesReceived = 0;
-        Serial.println("speaker ready — waiting for TTS from TestClient");
+        Serial.println("speaker ready — waiting for TTS from TestClient / SpeakerBenchmark");
         break;
     case PROTO_MSG_TTS_START:
         s_downlinkFramesReceived = 0;
         drainPlaybackQueue();
+        s_prefillTarget = kInitialPrefillFrames;
+        s_playbackNeedPrefill = true;
         setState(SPEAKER_PLAYING);
         break;
     case PROTO_MSG_TTS_END:
@@ -119,16 +205,17 @@ static void handleBinaryFrame(uint8_t *payload, size_t len) {
         return;
     }
     s_downlinkFramesReceived++;
-    uint8_t *copy = (uint8_t *)malloc(len);
-    if (copy == nullptr) {
-        Serial.println("oom copying downlink frame");
-        return;
+    if (len > COMPANION_DOWNLINK_FRAME_BYTES) {
+        Serial.printf("truncating oversized downlink frame %u -> %u bytes\n",
+                      static_cast<unsigned>(len),
+                      static_cast<unsigned>(COMPANION_DOWNLINK_FRAME_BYTES));
+        len = COMPANION_DOWNLINK_FRAME_BYTES;
     }
-    memcpy(copy, payload, len);
-    PlaybackChunk chunk = { copy, len };
+    PlaybackChunk chunk = {};
+    chunk.len = len;
+    memcpy(chunk.data, payload, len);
     if (xQueueSend(s_playbackQueue, &chunk, 0) != pdTRUE) {
         Serial.println("playback queue full, dropping frame");
-        free(copy);
     }
 }
 
@@ -146,7 +233,6 @@ static void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
         handleTextFrame(payload, length);
         break;
     case WStype_BIN:
-        Serial.printf("ws recv binary: %u bytes\n", static_cast<unsigned>(length));
         handleBinaryFrame(payload, length);
         break;
     case WStype_ERROR:
@@ -159,11 +245,22 @@ static void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 
 void wsSessionBegin() {
     s_stateMutex = xSemaphoreCreateMutex();
-    s_playbackQueue = xQueueCreate(16, sizeof(PlaybackChunk));
+    s_playbackQueue = xQueueCreate(kPlaybackQueueDepth, sizeof(PlaybackChunk));
+    if (s_playbackQueue == nullptr) {
+        Serial.printf("[AUDIO] FATAL: playback queue alloc failed (need %u bytes)\n",
+                      static_cast<unsigned>(kPlaybackQueueDepth * sizeof(PlaybackChunk)));
+    }
 
     audioIoInit();
 
-    xTaskCreate(playbackTask, "audio_playback", 4096, NULL, 12, NULL);
+    xTaskCreate(playbackTask, "audio_playback", 8192, NULL, 14, NULL);
+
+#if SPEAKER_SELF_TEST_ON_BOOT
+    if (!s_selfTestScheduled) {
+        s_selfTestScheduled = true;
+        xTaskCreate(speakerSelfTestTask, "spk_selftest", 4096, NULL, 1, NULL);
+    }
+#endif
 
     static String authHeader = String("Authorization: Bearer ") + COMPANION_DEVICE_TOKEN;
     s_webSocket.setExtraHeaders(authHeader.c_str());
@@ -183,7 +280,7 @@ void wsSessionBegin() {
 #else
     Serial.println("  output: log only (HAS_SPEAKER=0)");
 #endif
-    Serial.println("  mic: TestClient on Mac (/ws)");
+    Serial.println("  uplink: TestClient or SpeakerBenchmark on Mac (/ws)");
 }
 
 void wsSessionLoop() {

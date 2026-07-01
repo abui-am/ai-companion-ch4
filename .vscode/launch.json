@@ -39,6 +39,86 @@
             "target": "TestClient",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release TestClient (CompanionServer)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ai-companion-ch5}/CompanionServer",
+            "name": "Debug KokoroSmokeTest (CompanionServer)",
+            "target": "KokoroSmokeTest",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug KokoroSmokeTest (CompanionServer)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ai-companion-ch5}/CompanionServer",
+            "name": "Release KokoroSmokeTest (CompanionServer)",
+            "target": "KokoroSmokeTest",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release KokoroSmokeTest (CompanionServer)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ai-companion-ch5}/CompanionServer",
+            "name": "Debug TTSBenchmark (CompanionServer)",
+            "target": "TTSBenchmark",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug TTSBenchmark (CompanionServer)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ai-companion-ch5}/CompanionServer",
+            "name": "Release TTSBenchmark (CompanionServer)",
+            "target": "TTSBenchmark",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release TTSBenchmark (CompanionServer)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ai-companion-ch5}/CompanionServer",
+            "name": "Debug RealtimePipeline (CompanionServer)",
+            "target": "RealtimePipeline",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug RealtimePipeline (CompanionServer)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ai-companion-ch5}/CompanionServer",
+            "name": "Release RealtimePipeline (CompanionServer)",
+            "target": "RealtimePipeline",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release RealtimePipeline (CompanionServer)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ai-companion-ch5}/CompanionServer",
+            "name": "Debug SpeakerBenchmark (CompanionServer)",
+            "target": "SpeakerBenchmark",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug SpeakerBenchmark (CompanionServer)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ai-companion-ch5}/CompanionServer",
+            "name": "Release SpeakerBenchmark (CompanionServer)",
+            "target": "SpeakerBenchmark",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release SpeakerBenchmark (CompanionServer)"
         }
     ]
 }
