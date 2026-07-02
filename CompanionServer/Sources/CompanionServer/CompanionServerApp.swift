@@ -28,6 +28,9 @@ struct CompanionServerApp {
                 ),
                 "realtime_model": .string(config.openAIRealtimeModel),
                 "realtime_voice": .string(config.openAIRealtimeVoice),
+                "tts_provider": .string(config.ttsProvider.rawValue),
+                "cartesia_model": .string(config.cartesiaModelId),
+                "web_search": .string(config.webSearchEnabled ? "enabled" : "disabled"),
             ]
         )
         if let root = PackagePaths.packageRoot() {
@@ -50,15 +53,46 @@ struct CompanionServerApp {
             return .dontUpgrade
         } onUpgrade: { inbound, outbound, _ in
             serverLogger.info("ws connection upgraded")
+            let webSearch: WebSearchService? = config.webSearchEnabled
+                ? WebSearchService(
+                    apiKey: config.openAIAPIKey,
+                    model: config.openAISearchModel,
+                    logger: serverLogger
+                )
+                : nil
             let realtime = OpenAIRealtimeService(
                 apiKey: config.openAIAPIKey,
                 model: config.openAIRealtimeModel,
                 voice: config.openAIRealtimeVoice,
+                textOnlyOutput: config.usesCartesiaTTS,
+                webSearch: webSearch,
                 logger: serverLogger
             )
+            let cartesiaTTS: (any TTSStreamingService)? = if config.usesCartesiaTTS, let cartesiaKey = config.cartesiaAPIKey {
+                CartesiaService(
+                    apiKey: cartesiaKey,
+                    voiceId: config.cartesiaVoiceId,
+                    modelId: config.cartesiaModelId,
+                    logger: serverLogger
+                )
+            } else {
+                nil
+            }
+            let thinkingTTS: (any TTSStreamingService)? = if let cartesiaKey = config.cartesiaAPIKey, !cartesiaKey.isEmpty {
+                CartesiaService(
+                    apiKey: cartesiaKey,
+                    voiceId: config.cartesiaVoiceId,
+                    modelId: config.cartesiaModelId,
+                    logger: serverLogger
+                )
+            } else {
+                nil
+            }
             let session = VoiceSession(
                 outbound: WebSocketSessionOutboundWriter(base: outbound),
                 realtime: realtime,
+                tts: cartesiaTTS,
+                thinkingTTS: thinkingTTS,
                 speakers: speakers,
                 logger: serverLogger
             )

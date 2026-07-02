@@ -2,10 +2,10 @@
 
 // Fill these in before flashing. Mirrors the showcase-phase auth model in
 // the plan: shared compile-time token, no rotation, LAN-only.
-#define WIFI_SSID "Wifi iuran"
-#define WIFI_PASSWORD "sekgangguan"
+#define WIFI_SSID "sayaMayunn"
+#define WIFI_PASSWORD "123456789"
 
-#define COMPANION_SERVER_HOST "192.168.1.3"
+#define COMPANION_SERVER_HOST "10.75.190.134"
 #define COMPANION_SERVER_PORT 8080
 #define COMPANION_SERVER_PATH "/ws"
 #define COMPANION_USE_TLS false // true => wss:// (beginSSL)
@@ -31,3 +31,7 @@
 #define PIN_SPK_BCLK 33 // BCK
 #define PIN_SPK_WS 25   // LRC
 #define PIN_SPK_DOUT 32 // DIN
+
+// Speaker output boost (max amplitude ~32767). Lower if you hear clipping.
+#define SPEAKER_BEEP_AMPLITUDE 8000
+#define SPEAKER_PLAYBACK_GAIN 2

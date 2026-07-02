@@ -5,6 +5,7 @@ enum RealtimeAudioEvent: Sendable {
     case audio(Data)               // PCM16 @ 24 kHz chunk from response
     case inputTranscript(String)   // completed user-speech transcript
     case assistantTranscript(String) // incremental assistant text delta
+    case webSearchStarted(String)  // query being looked up
     case done
     case error(String)
 }
@@ -26,16 +27,28 @@ actor OpenAIRealtimeService {
     private let apiKey: String
     private let model: String
     private let voice: String
+    private let textOnlyOutput: Bool
+    private let webSearch: WebSearchService?
     private let logger: Logger
 
     private var socket: URLSessionWebSocketTask?
     private var eventLoopTask: Task<Void, Never>?
     private var turnContinuation: AsyncStream<RealtimeAudioEvent>.Continuation?
+    private var toolCallTask: Task<Void, Never>?
 
-    init(apiKey: String, model: String, voice: String, logger: Logger) {
+    init(
+        apiKey: String,
+        model: String,
+        voice: String,
+        textOnlyOutput: Bool = false,
+        webSearch: WebSearchService? = nil,
+        logger: Logger
+    ) {
         self.apiKey = apiKey
         self.model = model
         self.voice = voice
+        self.textOnlyOutput = textOnlyOutput
+        self.webSearch = webSearch
         self.logger = logger
     }
 
@@ -103,11 +116,13 @@ actor OpenAIRealtimeService {
         logger.info("commitAndCreateResponse: socket ok, sending commit+response.create")
         turnContinuation = continuation
         try? await sendJSON(["type": "input_audio_buffer.commit"])
-        try? await sendJSON(["type": "response.create"])
+        try? await sendJSON(responseCreatePayload())
         return stream
     }
 
     func cancelResponse() async {
+        toolCallTask?.cancel()
+        toolCallTask = nil
         try? await sendJSON(["type": "response.cancel"])
         finishTurn(with: nil)
     }
@@ -151,6 +166,7 @@ actor OpenAIRealtimeService {
             }
 
         case "response.audio.delta", "response.output_audio.delta":
+            guard !textOnlyOutput else { break }
             let b64 = (json["audio"] as? String) ?? (json["delta"] as? String)
             if let b64, let chunk = Data(base64Encoded: b64) {
                 turnContinuation?.yield(.audio(chunk))
@@ -161,9 +177,25 @@ actor OpenAIRealtimeService {
                 turnContinuation?.yield(.assistantTranscript(delta))
             }
 
+        case "response.output_text.delta":
+            if let delta = json["delta"] as? String, !delta.isEmpty {
+                turnContinuation?.yield(.assistantTranscript(delta))
+            }
+
         case "response.done":
             logger.info("realtime response.done")
-            finishTurn(with: .done)
+            if let response = json["response"] as? [String: Any],
+               let calls = Self.extractFunctionCalls(from: response),
+               !calls.isEmpty,
+               webSearch != nil
+            {
+                toolCallTask?.cancel()
+                toolCallTask = Task { [weak self] in
+                    await self?.handleFunctionCalls(calls)
+                }
+            } else {
+                finishTurn(with: .done)
+            }
 
         case "error":
             let msg = (json["error"] as? [String: Any])?["message"] as? String ?? text
@@ -184,24 +216,145 @@ actor OpenAIRealtimeService {
     // MARK: - Helpers
 
     private func sessionUpdatePayload() -> [String: Any] {
-        [
-            "type": "session.update",
-            "session": [
-                "type": "realtime",
-                "instructions": CompanionPrompt.system,
-                "audio": [
-                    "input": [
-                        "format": ["type": "audio/pcm", "rate": Self.sampleRate],
-                        "turn_detection": NSNull(),
-                        "transcription": ["model": "whisper-1"],
-                    ] as [String: Any],
-                    "output": [
-                        "format": ["type": "audio/pcm", "rate": Self.sampleRate],
-                        "voice": voice,
-                    ],
-                ],
+        var audio: [String: Any] = [
+            "input": [
+                "format": ["type": "audio/pcm", "rate": Self.sampleRate],
+                "turn_detection": NSNull(),
+                "transcription": ["model": "whisper-1"],
             ] as [String: Any],
         ]
+        if !textOnlyOutput {
+            audio["output"] = [
+                "format": ["type": "audio/pcm", "rate": Self.sampleRate],
+                "voice": voice,
+            ]
+        }
+
+        let session: [String: Any] = {
+            var s: [String: Any] = [
+                "type": "realtime",
+                "instructions": CompanionPrompt.system,
+                "output_modalities": textOnlyOutput ? ["text"] : ["audio"],
+                "audio": audio,
+            ]
+            if webSearch != nil {
+                s["tools"] = [webSearchToolDefinition()]
+                s["tool_choice"] = "auto"
+            }
+            return s
+        }()
+
+        return [
+            "type": "session.update",
+            "session": session,
+        ]
+    }
+
+    private func webSearchToolDefinition() -> [String: Any] {
+        [
+            "type": "function",
+            "name": "web_search",
+            "description": """
+            Search the live web for current information: news, weather, sports, prices, events, \
+            releases, or any fact that may have changed since your training data. Use when the \
+            user asks about recent or time-sensitive topics.
+            """,
+            "parameters": [
+                "type": "object",
+                "properties": [
+                    "query": [
+                        "type": "string",
+                        "description": "Concise search query for what to look up on the web.",
+                    ] as [String: Any],
+                ],
+                "required": ["query"],
+            ] as [String: Any],
+        ]
+    }
+
+    private struct PendingFunctionCall: Sendable {
+        let name: String
+        let callId: String
+        let argumentsJSON: String
+    }
+
+    private static func extractFunctionCalls(from response: [String: Any]) -> [PendingFunctionCall]? {
+        guard let output = response["output"] as? [[String: Any]] else { return nil }
+        let calls = output.compactMap { item -> PendingFunctionCall? in
+            guard item["type"] as? String == "function_call",
+                  let name = item["name"] as? String,
+                  let callId = item["call_id"] as? String,
+                  let args = item["arguments"] as? String
+            else { return nil }
+            return PendingFunctionCall(name: name, callId: callId, argumentsJSON: args)
+        }
+        return calls.isEmpty ? nil : calls
+    }
+
+    private func handleFunctionCalls(_ calls: [PendingFunctionCall]) async {
+        guard turnContinuation != nil else { return }
+        guard let webSearch else {
+            finishTurn(with: .error("web search not configured"))
+            return
+        }
+
+        for call in calls {
+            guard !Task.isCancelled, turnContinuation != nil else { return }
+
+            guard call.name == "web_search" else {
+                logger.warning("unknown function call", metadata: ["name": .string(call.name)])
+                continue
+            }
+
+            let query: String
+            if let data = call.argumentsJSON.data(using: .utf8),
+               let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let q = args["query"] as? String
+            {
+                query = q
+            } else {
+                logger.error("web_search missing query", metadata: ["args": .string(call.argumentsJSON)])
+                continue
+            }
+
+            turnContinuation?.yield(.webSearchStarted(query))
+            logger.info("realtime web_search tool call", metadata: ["query": .string(query)])
+
+            let result: String
+            do {
+                result = try await webSearch.search(query: query)
+            } catch {
+                logger.error("web_search failed", metadata: ["error": "\(error)"])
+                result = "Web search failed: \(error)"
+            }
+
+            guard !Task.isCancelled, turnContinuation != nil else { return }
+
+            let outputPayload = try? JSONSerialization.data(withJSONObject: ["summary": result])
+            let outputString = outputPayload.flatMap { String(data: $0, encoding: .utf8) } ?? result
+
+            try? await sendJSON([
+                "type": "conversation.item.create",
+                "item": [
+                    "type": "function_call_output",
+                    "call_id": call.callId,
+                    "output": outputString,
+                ],
+            ])
+        }
+
+        guard !Task.isCancelled, turnContinuation != nil else { return }
+        try? await sendJSON(responseCreatePayload())
+    }
+
+    private func responseCreatePayload() -> [String: Any] {
+        if textOnlyOutput {
+            return [
+                "type": "response.create",
+                "response": ["output_modalities": ["text"]],
+            ]
+        }
+        return ["type": "response.create"]
     }
 
     private func waitForEvent(_ wanted: String, on task: URLSessionWebSocketTask) async throws {

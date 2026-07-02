@@ -1,5 +1,6 @@
 #include <WiFi.h>
 
+#include "audio_io.h"
 #include "config.h"
 #include "ws_session.h"
 
@@ -18,6 +19,8 @@ static void connectWiFi() {
 
 void setup() {
     Serial.begin(115200);
+    audioIoInit();
+    audioIoSpeakerBeep();
     connectWiFi();
     wsSessionBegin();
 }

@@ -12,7 +12,7 @@ static const i2s_port_t SPK_PORT = I2S_NUM_1;
 // INMP441 outputs 24-bit audio left-justified in a 32-bit I2S word.
 // Read at 32-bit and right-shift to extract the 16-bit value we send upstream.
 // Increase this value if audio is clipped; decrease if it's too quiet.
-#define MIC_DATA_SHIFT 13
+#define MIC_DATA_SHIFT 14
 
 void audioIoInit() {
 #if HAS_MIC
@@ -128,8 +128,11 @@ static void audioIoPlayTone(int frequencyHz, int durationMs, int amplitude) {
     if (chunk > static_cast<int>(sizeof(monoBuf) / sizeof(monoBuf[0])))
       chunk = sizeof(monoBuf) / sizeof(monoBuf[0]);
     for (int i = 0; i < chunk; i++) {
-      float t = static_cast<float>(samplesPlayed + i) / static_cast<float>(sampleRate);
-      monoBuf[i] = static_cast<int16_t>(sinf(2.0f * PI * static_cast<float>(frequencyHz) * t) * static_cast<float>(amplitude));
+      float t = static_cast<float>(samplesPlayed + i) /
+                static_cast<float>(sampleRate);
+      monoBuf[i] = static_cast<int16_t>(
+          sinf(2.0f * PI * static_cast<float>(frequencyHz) * t) *
+          static_cast<float>(amplitude));
     }
     static int16_t stereoBuf[2 * (sizeof(monoBuf) / sizeof(monoBuf[0]))];
     for (int i = 0; i < chunk; i++) {
@@ -137,14 +140,16 @@ static void audioIoPlayTone(int frequencyHz, int durationMs, int amplitude) {
       stereoBuf[2 * i + 1] = monoBuf[i];
     }
     size_t written = 0;
-    i2s_write(SPK_PORT, stereoBuf, static_cast<size_t>(chunk) * 2 * sizeof(int16_t), &written, portMAX_DELAY);
+    i2s_write(SPK_PORT, stereoBuf,
+              static_cast<size_t>(chunk) * 2 * sizeof(int16_t), &written,
+              portMAX_DELAY);
     samplesPlayed += chunk;
   }
   delay(static_cast<unsigned>(durationMs) + 80);
 }
 
 void audioIoSpeakerBeep() {
-  audioIoPlayTone(880, 120, 8000);
+  audioIoPlayTone(880, 120, SPEAKER_BEEP_AMPLITUDE);
 }
 
 void audioIoWriteDownlink(const int16_t *monoSamples, size_t sampleCount) {
@@ -155,8 +160,16 @@ void audioIoWriteDownlink(const int16_t *monoSamples, size_t sampleCount) {
     sampleCount = maxSamples;
   }
   for (size_t i = 0; i < sampleCount; i++) {
-    stereoBuf[2 * i] = monoSamples[i];
-    stereoBuf[2 * i + 1] = monoSamples[i];
+    int32_t boosted =
+        static_cast<int32_t>(monoSamples[i]) * SPEAKER_PLAYBACK_GAIN;
+    if (boosted > 32767) {
+      boosted = 32767;
+    } else if (boosted < -32768) {
+      boosted = -32768;
+    }
+    int16_t sample = static_cast<int16_t>(boosted);
+    stereoBuf[2 * i] = sample;
+    stereoBuf[2 * i + 1] = sample;
   }
 
   const uint8_t *ptr = reinterpret_cast<const uint8_t *>(stereoBuf);
