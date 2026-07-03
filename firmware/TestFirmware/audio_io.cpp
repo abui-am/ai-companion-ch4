@@ -113,7 +113,13 @@ static const i2s_port_t SPK_PORT = I2S_NUM_1;
 static const i2s_port_t SPK_PORT = I2S_NUM_0;
 #endif
 
+static bool s_audioInitialized = false;
+
 void audioIoInit() {
+  if (s_audioInitialized) {
+    return;
+  }
+
 #if HAS_MIC
   i2s_config_t micConfig = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -195,6 +201,7 @@ void audioIoInit() {
 #else
   Serial.println("audio: speaker disabled (downlink logged only)");
 #endif
+  s_audioInitialized = true;
 }
 
 void audioIoPrimeMic() {

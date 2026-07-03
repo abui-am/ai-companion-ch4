@@ -39,8 +39,8 @@ Hear yourself on the speaker to verify **INMP441 mic wiring** and I2S paths toge
 
 1. In [`config.h`](config.h) set:
    - `MIC_LOOPBACK_TEST_MODE 1`
-   - Confirm mic pins: `PIN_MIC_BCLK 14`, `PIN_MIC_WS 12`, `PIN_MIC_DIN 35`
-   - Speaker pins same as above (33 / 25 / 32)
+   - Confirm mic pins: `PIN_MIC_BCLK 1`, `PIN_MIC_WS 3`, `PIN_MIC_DIN 2`
+   - Speaker pins: `PIN_SPK_BCLK 6`, `PIN_SPK_WS 7`, `PIN_SPK_DOUT 4`
 2. Flash **TestFirmware**, Serial Monitor @ **921600**.
 1. **Tap** → beep
 2. **Mic listening** — bicara (max 10 detik; progress di serial)

@@ -29,29 +29,27 @@
 #endif
 
 // Touch sensor (TTP223 etc.): HIGH when touched. Same as CompanionFirmware
-// GPIO4.
+// GPIO11.
 #if MIC_LOOPBACK_TEST_MODE
 #define USE_TOUCH_BUTTON 1
-#define PIN_BUTTON 4
+#define PIN_BUTTON 11
 #else
 #define USE_TOUCH_BUTTON 0
 #define PIN_BUTTON 0
 #endif
 
 // Mic (I2S RX) — INMP441. L/R pin tied to GND → left channel.
-#define PIN_MIC_BCLK 14 // SCK
-#define PIN_MIC_WS 12   // WS
-#define PIN_MIC_DIN 35  // SD
+#define PIN_MIC_BCLK 1 // SCK / BCLK
+#define PIN_MIC_WS 3   // WS
+#define PIN_MIC_DIN 2  // SD / DIN
 #define MIC_CHANNEL_LEFT true
 // INMP441 gain: increase to reduce clipping (try 12–13), decrease if too quiet.
 #define MIC_DATA_SHIFT 13
 
 // MAX98357A — must match your wiring (same as CompanionFirmware).
-// Do NOT use GPIO 6–11 on ESP32: they are wired to SPI flash and will
-// WDT-reset.
-#define PIN_SPK_BCLK 33 // BCK
-#define PIN_SPK_WS 25   // LRC
-#define PIN_SPK_DOUT 32 // DIN
+#define PIN_SPK_BCLK 6 // BCLK
+#define PIN_SPK_WS 7   // LRC
+#define PIN_SPK_DOUT 4 // DIN
 
 // After tap-tap record, upload PCM to CompanionServer /ws
 // (debug-audio/*-uplink.wav).

@@ -19,13 +19,14 @@ static void connectWiFi() {
 
 void setup() {
     Serial.begin(115200);
-    Serial.printf("[MEM] boot: heap=%u psram=%u psramFound=%d\n",
-                  ESP.getFreeHeap(), ESP.getFreePsram(), psramFound());
+    delay(800);
+    Serial.printf("\n[BOOT] CompanionFirmware heap=%u psram=%u psramFound=%d\n",
+                  static_cast<unsigned>(ESP.getFreeHeap()),
+                  static_cast<unsigned>(ESP.getFreePsram()),
+                  psramFound());
     audioIoInit();
     audioIoSpeakerBeep();
     connectWiFi();
-    Serial.printf("[MEM] after wifi connect: heap=%u psram=%u\n",
-                  ESP.getFreeHeap(), ESP.getFreePsram());
     wsSessionBegin();
 }
 

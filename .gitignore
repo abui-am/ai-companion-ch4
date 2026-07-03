@@ -3,5 +3,6 @@
 *.xcodeproj
 .DS_Store
 .env
+CompanionServer/debug-audio/
 CompanionServer/.kokoro-models/
 CompanionServer/kokoro-smoke-test.wav
