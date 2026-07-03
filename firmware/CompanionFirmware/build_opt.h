@@ -1,0 +1,2 @@
+-Os
+-DCORE_DEBUG_LEVEL=0

@@ -2,8 +2,32 @@ import Foundation
 import Logging
 
 /// Runs web lookups via OpenAI Responses API (`tools: [{ type: "web_search" }]`).
-/// Used as the backend for the Realtime `web_search` function tool.
-struct WebSearchService: Sendable {
+/// Sub-agent backend for the Realtime orchestrator's `web_search` function tool.
+struct WebSearchAgent: SubAgent, Sendable {
+    let name = "web_search"
+
+    var toolDefinition: [String: Any] {
+        [
+            "type": "function",
+            "name": name,
+            "description": """
+            Search the live web for current information: news, weather, sports, prices, events, \
+            releases, or any fact that may have changed since your training data. Use when the \
+            user asks about recent or time-sensitive topics.
+            """,
+            "parameters": [
+                "type": "object",
+                "properties": [
+                    "query": [
+                        "type": "string",
+                        "description": "Concise search query for what to look up on the web.",
+                    ] as [String: Any],
+                ],
+                "required": ["query"],
+            ] as [String: Any],
+        ]
+    }
+
     private let apiKey: String
     private let model: String
     private let logger: Logger
@@ -14,6 +38,29 @@ struct WebSearchService: Sendable {
         self.model = model
         self.logger = logger
         self.session = session
+    }
+
+    func execute(argumentsJSON: String) async -> String {
+        let query: String
+        if let data = argumentsJSON.data(using: .utf8),
+           let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let q = args["query"] as? String
+        {
+            query = q
+        } else {
+            logger.error("web_search missing query", metadata: ["args": .string(argumentsJSON)])
+            return Self.encodeOutput(["error": "missing query parameter"])
+        }
+
+        let result: String
+        do {
+            result = try await search(query: query)
+        } catch {
+            logger.error("web_search failed", metadata: ["error": "\(error)"])
+            result = "Web search failed: \(error)"
+        }
+
+        return Self.encodeOutput(["summary": result])
     }
 
     func search(query: String) async throws -> String {
@@ -70,6 +117,15 @@ struct WebSearchService: Sendable {
         }
 
         throw WebSearchError.noResults
+    }
+
+    private static func encodeOutput(_ payload: [String: String]) -> String {
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let string = String(data: data, encoding: .utf8)
+        {
+            return string
+        }
+        return payload["summary"] ?? payload["error"] ?? "{}"
     }
 
     private static func extractOutputText(from json: [String: Any]) -> String? {

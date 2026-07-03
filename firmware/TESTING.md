@@ -10,8 +10,13 @@ For bench testing without ESP mic hardware, use **[TestFirmware](TestFirmware/TE
 2. Library Manager → install:
   - **ArduinoJson** (Benoit Blanchon)
   - **WebSockets** (Markus Sattler / Links2004)
-3. Tools → Board → select an ESP32S3baud board (e.g. "ESP32S3 Dev Module").
-4. Tools → USB CDC On Boot → **Enabled** (so `Serial` shows up over USB without a separate UART adapter).
+3. Tools → Board → **ESP32S3 Dev Module** (works for ESP32-S3 Mini/Super Mini boards too — there's no separate "Mini" board entry).
+4. Tools → **Partition Scheme** → **Huge APP (3MB No OTA/1MB SPIFFS)**.
+   The Edge Impulse wake-word library pushes the sketch past the default 1.2 MB app limit (~1.7 MB compiled). Without this step you get `text section exceeds available space in board`.
+   **Re-check this every time you change the Board selection** — switching boards resets Partition Scheme back to the 1.2 MB default, which silently reproduces this error.
+   Alternative with OTA: **Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)**. Both fit within 4 MB flash (~3.97 MB used total) — confirm Tools → **Flash Size** matches your module (4MB is standard for S3 Mini/Super Mini boards).
+5. Tools → USB CDC On Boot → **Enabled** on ESP32-S3 (so `Serial` shows up over USB without a separate UART adapter).
+6. Library Manager → install **adjiemuliadi-project-1_inferencing** (Edge Impulse wake-word model) if not already present.
 
 
 
@@ -29,16 +34,16 @@ Edit `CompanionFirmware/config.h`:
 ## 3. Wiring checklist
 
 
-| Signal                   | Pin define                | Notes                                                  |
-| ------------------------ | ------------------------- | ------------------------------------------------------ |
-| Mic BCLK                 | `PIN_MIC_BCLK`            |                                                        |
-| Mic WS/LRCLK             | `PIN_MIC_WS`              |                                                        |
-| Mic DIN (mic→ESP32)      | `PIN_MIC_DIN`             |                                                        |
-| Mic L/R select           | n/a (hardware pin on mic) | must match `MIC_CHANNEL_LEFT`                          |
-| Speaker BCLK             | `PIN_SPK_BCLK`            |                                                        |
-| Speaker WS/LRCLK         | `PIN_SPK_WS`              |                                                        |
-| Speaker DOUT (ESP32→amp) | `PIN_SPK_DOUT`            |                                                        |
-| Push-to-talk button      | `PIN_BUTTON`              | other leg to GND, internal pull-up enabled in firmware |
+| Signal                   | Pin define                | GPIO | Notes                                                  |
+| ------------------------ | ------------------------- | ---- | ------------------------------------------------------ |
+| Mic BCLK / SCK           | `PIN_MIC_BCLK`            | 1    |                                                        |
+| Mic WS / LRCLK           | `PIN_MIC_WS`              | 3    |                                                        |
+| Mic DIN / SD (mic→ESP32) | `PIN_MIC_DIN`             | 2    |                                                        |
+| Mic L/R select           | n/a (hardware pin on mic) |      | must match `MIC_CHANNEL_LEFT`                          |
+| Speaker BCLK             | `PIN_SPK_BCLK`            | 6    |                                                        |
+| Speaker WS/LRCLK         | `PIN_SPK_WS`              | 7    |                                                        |
+| Speaker DOUT (ESP32→amp) | `PIN_SPK_DOUT`            | 4    |                                                        |
+| Push-to-talk button      | `PIN_BUTTON`              | 5    | other leg to GND; GPIO4 is speaker DIN on this layout  |
 
 
 

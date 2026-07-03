@@ -53,19 +53,23 @@ struct CompanionServerApp {
             return .dontUpgrade
         } onUpgrade: { inbound, outbound, _ in
             serverLogger.info("ws connection upgraded")
-            let webSearch: WebSearchService? = config.webSearchEnabled
-                ? WebSearchService(
-                    apiKey: config.openAIAPIKey,
-                    model: config.openAISearchModel,
-                    logger: serverLogger
+            var subAgentList: [any SubAgent] = []
+            if config.webSearchEnabled {
+                subAgentList.append(
+                    WebSearchAgent(
+                        apiKey: config.openAIAPIKey,
+                        model: config.openAISearchModel,
+                        logger: serverLogger
+                    )
                 )
-                : nil
+            }
+            let subAgents = SubAgentRegistry(agents: subAgentList)
             let realtime = OpenAIRealtimeService(
                 apiKey: config.openAIAPIKey,
                 model: config.openAIRealtimeModel,
                 voice: config.openAIRealtimeVoice,
                 textOnlyOutput: config.usesCartesiaTTS,
-                webSearch: webSearch,
+                subAgents: subAgents,
                 logger: serverLogger
             )
             let cartesiaTTS: (any TTSStreamingService)? = if config.usesCartesiaTTS, let cartesiaKey = config.cartesiaAPIKey {

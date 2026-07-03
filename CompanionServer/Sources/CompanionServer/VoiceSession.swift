@@ -265,9 +265,13 @@ actor VoiceSession {
                     assistantText += delta
                     logger.debug("realtime text delta → cartesia", metadata: ["session_id": .string(sessionId), "delta": .string(delta)])
                     await tts.sendTranscriptChunk(delta, contextId: contextId, isFinal: false)
-                case .webSearchStarted(let query):
-                    logger.info("web search in progress", metadata: ["session_id": .string(sessionId), "query": .string(query)])
-                    await speakThinkingFiller(.webSearch, searchQuery: query)
+                case .toolCallStarted(let name, let detail):
+                    logger.info(
+                        "tool call in progress",
+                        metadata: ["session_id": .string(sessionId), "name": .string(name), "detail": .string(detail)]
+                    )
+                    let fillerKind: ThinkingFiller.Kind = name == "web_search" ? .webSearch : .processing
+                    await speakThinkingFiller(fillerKind, searchQuery: name == "web_search" ? detail : nil)
                 case .done:
                     logger.info("realtime text stream done", metadata: ["session_id": .string(sessionId)])
                 case .error(let msg):
@@ -372,9 +376,13 @@ actor VoiceSession {
                     markFirstOutputReceived()
                     assistantText += delta
                     logger.debug("realtime assistant delta", metadata: ["session_id": .string(sessionId), "delta": .string(delta)])
-                case .webSearchStarted(let query):
-                    logger.info("web search in progress", metadata: ["session_id": .string(sessionId), "query": .string(query)])
-                    await speakThinkingFiller(.webSearch, searchQuery: query)
+                case .toolCallStarted(let name, let detail):
+                    logger.info(
+                        "tool call in progress",
+                        metadata: ["session_id": .string(sessionId), "name": .string(name), "detail": .string(detail)]
+                    )
+                    let fillerKind: ThinkingFiller.Kind = name == "web_search" ? .webSearch : .processing
+                    await speakThinkingFiller(fillerKind, searchQuery: name == "web_search" ? detail : nil)
                 case .done:
                     logger.info("realtime stream done", metadata: ["session_id": .string(sessionId)])
                 case .error(let msg):

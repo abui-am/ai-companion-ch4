@@ -12,6 +12,7 @@
 #include "config.h"
 #include "pcm_codec.h"
 #include "protocol.h"
+#include "wake_word.h"
 
 enum SessionState {
     SESSION_IDLE,
@@ -49,7 +50,6 @@ static volatile bool s_playbackNeedPrefill = true;
 // this mutex.
 static SemaphoreHandle_t s_wsSendMutex;
 
-static SemaphoreHandle_t s_captureStartSem;
 static QueueHandle_t s_playbackQueue;
 
 static SessionState getState() {
@@ -90,23 +90,56 @@ static void sendBinary(uint8_t *data, size_t len) {
     xSemaphoreGive(s_wsSendMutex);
 }
 
-// MARK: - Capture (uplink)
+// MARK: - IDLE -> CAPTURING transition (shared by button + wake word)
 
+static void startListening(const char *trigger) {
+    audioIoSpeakerBeep();
+    sendText(protocolBuildAudioStart());
+    setState(SESSION_CAPTURING);
+    Serial.printf("%s: IDLE -> CAPTURING (mic ON)\n", trigger);
+}
+
+// MARK: - Capture (uplink) + wake-word listening
+
+// Single task owns every mic read so only one caller ever touches the I2S
+// RX port. While idle it feeds the wake-word classifier; while capturing it
+// streams frames to the server; while processing/speaking it drops frames
+// (the mic would otherwise pick up the device's own TTS output).
 static void captureTask(void *arg) {
     static uint8_t frame[COMPANION_UPLINK_FRAME_BYTES];
     int frameCount = 0;
+    SessionState lastState = SESSION_IDLE;
     while (true) {
-        xSemaphoreTake(s_captureStartSem, portMAX_DELAY);
-        frameCount = 0;
-        Serial.println("[MIC] capture session started");
-        while (getState() == SESSION_CAPTURING) {
-            size_t n = audioIoReadUplinkFrame(frame, sizeof(frame));
-            if (n > 0) {
-                frameCount++;
-                sendBinary(frame, n);
+        size_t n = audioIoReadUplinkFrame(frame, sizeof(frame));
+        if (n == 0) continue;
+
+        SessionState s = getState();
+        if (s != lastState) {
+            if (lastState == SESSION_CAPTURING) {
+                Serial.printf("[MIC] capture stopped, sent %d frames\n", frameCount);
             }
+            if (s == SESSION_CAPTURING) {
+                frameCount = 0;
+                Serial.println("[MIC] capture session started");
+            }
+            lastState = s;
         }
-        Serial.printf("[MIC] capture stopped, sent %d frames\n", frameCount);
+
+        switch (s) {
+        case SESSION_CAPTURING:
+            frameCount++;
+            sendBinary(frame, n);
+            break;
+        case SESSION_IDLE:
+            if (s_sessionReady &&
+                wakeWordFeed(reinterpret_cast<const int16_t *>(frame), n / sizeof(int16_t))) {
+                startListening("[WAKE] \"hey_botchill\" detected");
+            }
+            break;
+        case SESSION_PROCESSING:
+        case SESSION_SPEAKING:
+            break;
+        }
     }
 }
 
@@ -195,11 +228,7 @@ static void onButtonEvent(ButtonEvent event, void *ctx) {
 
     switch (s) {
     case SESSION_IDLE:
-        audioIoSpeakerBeep();
-        sendText(protocolBuildAudioStart());
-        setState(SESSION_CAPTURING);
-        xSemaphoreGive(s_captureStartSem);
-        Serial.println("[BUTTON] tap: IDLE → CAPTURING (mic ON)");
+        startListening("[BUTTON] tap");
         break;
     case SESSION_CAPTURING:
         sendText(protocolBuildAudioStop());
@@ -227,7 +256,7 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
         setState(SESSION_IDLE);
         s_sessionReady = true;
         Serial.printf("session ready: %s\n", s_sessionId.c_str());
-        Serial.println(">>> READY — hold touch sensor to speak <<<");
+        Serial.println(">>> READY — say \"hey botchill\" or tap the touch sensor <<<");
         break;
     case PROTO_MSG_TRANSCRIPT_FINAL:
         Serial.printf("transcript: %s\n", msg.text.c_str());
@@ -311,7 +340,6 @@ static void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 void wsSessionBegin() {
     s_stateMutex = xSemaphoreCreateMutex();
     s_wsSendMutex = xSemaphoreCreateMutex();
-    s_captureStartSem = xSemaphoreCreateBinary();
     s_playbackQueue = xQueueCreate(kPlaybackQueueDepth, sizeof(PlaybackChunk));
     if (s_playbackQueue == nullptr) {
         Serial.printf("[AUDIO] FATAL: playback queue alloc failed (need %u bytes)\n",
@@ -319,8 +347,11 @@ void wsSessionBegin() {
     }
 
     audioIoInit();
+    wakeWordInit();
 
-    xTaskCreate(captureTask, "audio_capture", 8192, NULL, 12, NULL);
+    // Bumped from 8192: this task now also runs the Edge Impulse classifier
+    // (MFCC + TFLite invoke), not just I2S reads.
+    xTaskCreate(captureTask, "audio_capture", 16384, NULL, 12, NULL);
     // Playback above capture + loop so I2S drains the queue before it backs up.
     xTaskCreate(playbackTask, "audio_playback", 8192, NULL, 14, NULL);
 
