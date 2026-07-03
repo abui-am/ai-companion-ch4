@@ -25,6 +25,14 @@ struct PlaybackChunk {
     uint8_t data[COMPANION_DOWNLINK_FRAME_BYTES];
 };
 
+// Uplink capture chunk. len == 0 is a sentinel meaning "capture ended, flush
+// and send audio.stop" — lets uplinkSendTask know when to close out a turn
+// without needing a second cross-task signal.
+struct CaptureChunk {
+    size_t len;
+    uint8_t data[COMPANION_UPLINK_FRAME_BYTES];
+};
+
 static constexpr UBaseType_t kPlaybackQueueDepth = 12;
 static constexpr UBaseType_t kInitialPrefillFrames = 4;
 static constexpr UBaseType_t kMaxPrefillFrames = 12;
@@ -32,6 +40,12 @@ static constexpr int kDownlinkEnqueueMs = 100;
 static constexpr int kQueueWaitMs = 120;
 static constexpr int kStarvationFramesBeforeRebuffer = 8;
 static constexpr int kDownlinkFrameMs = COMPANION_FRAME_MS;
+
+// ~1.2 s of mic audio at 60 ms/frame. Absorbs WebSocket writes that stall
+// (library blocks up to WEBSOCKETS_TCP_TIMEOUT = 5 s on a stuck TCP send) so
+// a brief WiFi hiccup no longer overflows the ~256 ms I2S DMA ring and drops
+// audio — see docs/analysis on "recording sounds cut off".
+static constexpr UBaseType_t kUplinkQueueDepth = 20;
 
 static UBaseType_t s_prefillTarget = kInitialPrefillFrames;
 
@@ -45,6 +59,7 @@ static volatile bool s_playbackNeedPrefill = true;
 static SemaphoreHandle_t s_wsSendMutex = nullptr;
 static SemaphoreHandle_t s_captureStartSem = nullptr;
 static QueueHandle_t s_playbackQueue = nullptr;
+static QueueHandle_t s_uplinkQueue = nullptr;
 
 static SessionState getState() {
     xSemaphoreTake(s_stateMutex, portMAX_DELAY);
@@ -67,6 +82,15 @@ static void drainPlaybackQueue() {
     while (xQueueReceive(s_playbackQueue, &chunk, 0) == pdTRUE) {
     }
     s_playbackNeedPrefill = true;
+}
+
+static void drainUplinkQueue() {
+    if (s_uplinkQueue == nullptr) {
+        return;
+    }
+    CaptureChunk chunk;
+    while (xQueueReceive(s_uplinkQueue, &chunk, 0) == pdTRUE) {
+    }
 }
 
 static void sendText(const String &text) {
@@ -100,6 +124,16 @@ static void flushWebSocketRepeated(int count, int delayMs) {
 }
 
 // MARK: - Capture (uplink)
+//
+// Reading the mic and sending over the network used to happen in the same
+// loop iteration (read → sendBIN → loop()). sendBIN() blocks the calling
+// task for up to WEBSOCKETS_TCP_TIMEOUT (5 s) whenever the TCP write stalls,
+// but the I2S DMA ring only holds ~256 ms of audio — any hiccup longer than
+// that silently overwrites unread mic samples, which is heard as the
+// recording being "cut off". captureTask now only talks to the mic and
+// pushes frames onto a queue; uplinkSendTask (below) drains that queue and
+// owns all the network I/O, so a slow/stalled socket write no longer blocks
+// mic reads.
 
 static void captureTask(void *arg) {
     (void)arg;
@@ -107,6 +141,7 @@ static void captureTask(void *arg) {
     int frameCount = 0;
     while (true) {
         xSemaphoreTake(s_captureStartSem, portMAX_DELAY);
+        drainUplinkQueue();
         frameCount = 0;
 #if HAS_MIC
         audioIoMicStart();
@@ -119,18 +154,66 @@ static void captureTask(void *arg) {
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
-            sendBinary(frame, COMPANION_UPLINK_FRAME_BYTES);
-            flushWebSocket();
+            if (s_uplinkQueue == nullptr) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            CaptureChunk chunk;
+            chunk.len = n;
+            memcpy(chunk.data, frame, n);
+            if (xQueueSend(s_uplinkQueue, &chunk, 0) != pdTRUE) {
+                // Queue is full — the sender is stalled on the network.
+                // Drop the oldest buffered frame rather than blocking here,
+                // so the mic keeps draining the I2S DMA ring on schedule.
+                CaptureChunk discard;
+                xQueueReceive(s_uplinkQueue, &discard, 0);
+                xQueueSend(s_uplinkQueue, &chunk, 0);
+                Serial.println("[MIC] uplink queue full — dropped oldest buffered frame (network stalled)");
+            }
             frameCount++;
         }
 #if HAS_MIC
         audioIoMicStop();
 #endif
-        flushWebSocketRepeated(10, 5);
-        Serial.printf("[MIC] capture stopped, sent %d frames\n", frameCount);
-        if (getState() == SESSION_PROCESSING) {
+        Serial.printf("[MIC] capture stopped, captured %d frames from mic\n", frameCount);
+        // Sentinel: tells uplinkSendTask to flush and send audio.stop once
+        // every real frame captured above has actually been sent.
+        if (s_uplinkQueue != nullptr) {
+            CaptureChunk endMarker = {};
+            endMarker.len = 0;
+            xQueueSend(s_uplinkQueue, &endMarker, portMAX_DELAY);
+        } else if (getState() == SESSION_PROCESSING) {
             sendText(protocolBuildAudioStop());
         }
+    }
+}
+
+// MARK: - Uplink sender (network)
+
+static void uplinkSendTask(void *arg) {
+    (void)arg;
+    CaptureChunk chunk;
+    int sentCount = 0;
+    while (true) {
+        if (s_uplinkQueue == nullptr) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        if (xQueueReceive(s_uplinkQueue, &chunk, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (chunk.len == 0) {
+            flushWebSocketRepeated(10, 5);
+            Serial.printf("[MIC] uplink sender: flushed %d frames to server\n", sentCount);
+            sentCount = 0;
+            if (getState() == SESSION_PROCESSING) {
+                sendText(protocolBuildAudioStop());
+            }
+            continue;
+        }
+        sendBinary(chunk.data, chunk.len);
+        flushWebSocket();
+        sentCount++;
     }
 }
 
@@ -253,6 +336,7 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
     case PROTO_MSG_SESSION_READY:
         s_sessionId = msg.sessionId;
         drainPlaybackQueue();
+        drainUplinkQueue();
         setState(SESSION_IDLE);
         s_sessionReady = true;
         Serial.printf("session ready: %s\n", s_sessionId.c_str());
@@ -281,6 +365,7 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
         Serial.printf("server error: code=%s message=%s\n", msg.errorCode.c_str(),
                       msg.errorMessage.c_str());
         drainPlaybackQueue();
+        drainUplinkQueue();
         setState(SESSION_IDLE);
         break;
     case PROTO_MSG_LATENCY_REPORT:
@@ -327,6 +412,7 @@ static void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
         Serial.printf("[WS] DISCONNECTED (was in state %d) — resetting\n", (int)getState());
         s_sessionReady = false;
         drainPlaybackQueue();
+        drainUplinkQueue();
         setState(SESSION_IDLE);
         break;
     case WStype_TEXT:
@@ -359,8 +445,18 @@ void wsSessionBegin() {
         Serial.printf("[AUDIO] playback queue ok depth=%u\n",
                       static_cast<unsigned>(kPlaybackQueueDepth));
     }
+    s_uplinkQueue = xQueueCreate(kUplinkQueueDepth, sizeof(CaptureChunk));
+    if (s_uplinkQueue == nullptr) {
+        Serial.printf("[AUDIO] WARNING: uplink queue alloc failed (need %u bytes)\n",
+                      static_cast<unsigned>(kUplinkQueueDepth * sizeof(CaptureChunk)));
+    } else {
+        Serial.printf("[AUDIO] uplink queue ok depth=%u (~%u ms buffered)\n",
+                      static_cast<unsigned>(kUplinkQueueDepth),
+                      static_cast<unsigned>(kUplinkQueueDepth * COMPANION_FRAME_MS));
+    }
 
     xTaskCreate(captureTask, "audio_capture", 8192, NULL, 12, NULL);
+    xTaskCreate(uplinkSendTask, "audio_uplink_send", 8192, NULL, 11, NULL);
     xTaskCreate(playbackTask, "audio_playback", 8192, NULL, 14, NULL);
 
     static String authHeader = String("Authorization: Bearer ") + COMPANION_DEVICE_TOKEN;
