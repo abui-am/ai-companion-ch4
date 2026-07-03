@@ -292,6 +292,16 @@ actor OpenAIRealtimeService {
             Search the live web for current information: news, weather, sports, prices, events, \
             releases, or any fact that may have changed since your training data. Use when the \
             user asks about recent or time-sensitive topics.
+
+            Before calling this tool, speak one short preamble in the same turn (friend tone, \
+            reference what they asked). Then call the tool immediately. Vary the wording. \
+            Do not imply whether the lookup will succeed.
+
+            Preamble sample phrases:
+            - "Okay, about {topic} — let me check."
+            - "Right, I'll look up {topic} real quick."
+            - "One sec, I'll see what's out there on {topic}."
+            - "Let me pull up {topic} for you."
             """,
             "parameters": [
                 "type": "object",

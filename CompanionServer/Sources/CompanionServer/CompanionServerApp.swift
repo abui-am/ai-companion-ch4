@@ -78,21 +78,10 @@ struct CompanionServerApp {
             } else {
                 nil
             }
-            let thinkingTTS: (any TTSStreamingService)? = if let cartesiaKey = config.cartesiaAPIKey, !cartesiaKey.isEmpty {
-                CartesiaService(
-                    apiKey: cartesiaKey,
-                    voiceId: config.cartesiaVoiceId,
-                    modelId: config.cartesiaModelId,
-                    logger: serverLogger
-                )
-            } else {
-                nil
-            }
             let session = VoiceSession(
                 outbound: WebSocketSessionOutboundWriter(base: outbound),
                 realtime: realtime,
                 tts: cartesiaTTS,
-                thinkingTTS: thinkingTTS,
                 speakers: speakers,
                 logger: serverLogger
             )

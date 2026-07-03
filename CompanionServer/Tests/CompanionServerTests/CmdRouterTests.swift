@@ -39,13 +39,11 @@ final class CmdRouterTests: XCTestCase {
         XCTAssertEqual(CompanionPrompt.userMessage(for: "tes suara"), "tes suara")
     }
 
-    func testThinkingFillerHeuristicReferencesQuestion() {
-        let phrase = ThinkingFiller.heuristicPhrase(
-            for: .webSearch,
-            userQuestion: "What's the weather in Jakarta tomorrow?",
-            searchQuery: "Jakarta weather forecast tomorrow"
-        )
-        XCTAssertTrue(phrase.lowercased().contains("jakarta") || phrase.lowercased().contains("weather"))
+    func testCompanionPromptIncludesPreambleGuidance() {
+        let prompt = CompanionPrompt.system.lowercased()
+        XCTAssertTrue(prompt.contains("preamble"))
+        XCTAssertTrue(prompt.contains("web_search"))
+        XCTAssertTrue(prompt.contains("vary"))
     }
 
     func testTalkToSpeechMetricsComputesDurations() {

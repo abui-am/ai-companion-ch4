@@ -28,7 +28,6 @@ actor VoiceSession {
     private let outbound: SessionOutboundWriter
     private let realtime: OpenAIRealtimeService
     private let tts: (any TTSStreamingService)?
-    private let thinkingTTS: (any TTSStreamingService)?
     private let speakers: SpeakerRegistry
     private let downlinkPacer: DownlinkPacer
     private let logger: Logger
@@ -45,23 +44,17 @@ actor VoiceSession {
     private var dumpOnlyMode = false
     private var conversationHistory: [ChatMessage] = []
     private let maxHistoryMessages = 20
-    private var turnUserTranscript = ""
-    private var turnReceivedFirstOutput = false
-    private var turnSpokeThinkingFiller = false
-    private var processingFillerTask: Task<Void, Never>?
 
     init(
         outbound: SessionOutboundWriter,
         realtime: OpenAIRealtimeService,
         tts: (any TTSStreamingService)? = nil,
-        thinkingTTS: (any TTSStreamingService)? = nil,
         speakers: SpeakerRegistry,
         logger: Logger
     ) {
         self.outbound = outbound
         self.realtime = realtime
         self.tts = tts
-        self.thinkingTTS = thinkingTTS
         self.speakers = speakers
         self.downlinkPacer = DownlinkPacer(
             outbound: outbound,
@@ -214,8 +207,6 @@ actor VoiceSession {
         )
         pipelineTask?.cancel()
         pipelineTask = nil
-        processingFillerTask?.cancel()
-        processingFillerTask = nil
         await realtime.cancelResponse()
         if let contextId = activeContextId, let tts {
             await tts.cancelTurn(contextId: contextId)
@@ -260,9 +251,6 @@ actor VoiceSession {
             await mirrorTTSStart()
             logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.tts_start", "turn_id": .string(turnId)])
 
-            resetTurnThinkingState()
-            startProcessingFillerWatch()
-
             let contextId = "\(sessionId)-\(turnId)"
             activeContextId = contextId
             let audioEvents = await tts.beginTurn(contextId: contextId)
@@ -301,18 +289,15 @@ actor VoiceSession {
                     logger.warning("unexpected realtime audio in cartesia tts mode", metadata: ["session_id": .string(sessionId)])
                 case .inputTranscript(let text):
                     inputText = text
-                    noteUserTranscript(text)
                     logger.info("realtime input transcript", metadata: ["session_id": .string(sessionId), "text": .string(text)])
                     try? await send(TranscriptFinal(sessionId: sessionId, text: text))
                     logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.transcript_ready", "turn_id": .string(turnId)])
                 case .assistantTranscript(let delta):
-                    markFirstOutputReceived()
                     assistantText += delta
                     logger.debug("realtime text delta → cartesia", metadata: ["session_id": .string(sessionId), "delta": .string(delta)])
                     await tts.sendTranscriptChunk(delta, contextId: contextId, isFinal: false)
                 case .webSearchStarted(let query):
                     logger.info("web search in progress", metadata: ["session_id": .string(sessionId), "query": .string(query)])
-                    await speakThinkingFiller(.webSearch, searchQuery: query)
                 case .done:
                     logger.info("realtime text stream done", metadata: ["session_id": .string(sessionId)])
                 case .error(let msg):
@@ -335,8 +320,6 @@ actor VoiceSession {
             }
 
             guard phase == .streamingTTS else { return }
-            processingFillerTask?.cancel()
-            processingFillerTask = nil
             await downlinkPacer.endTurn()
             dumpDownlinkCaptureIfNeeded()
             try await send(TTSEnd(sessionId: sessionId))
@@ -385,9 +368,6 @@ actor VoiceSession {
             await mirrorTTSStart()
             logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.tts_start", "turn_id": .string(turnId)])
 
-            resetTurnThinkingState()
-            startProcessingFillerWatch()
-
             logger.info("realtime commitAndCreateResponse — waiting for events", metadata: ["session_id": .string(sessionId)])
             let events = await realtime.commitAndCreateResponse()
             logger.info("realtime stream open — iterating events", metadata: ["session_id": .string(sessionId)])
@@ -399,7 +379,6 @@ actor VoiceSession {
                 try Task.checkCancellation()
                 switch event {
                 case .audio(let pcm):
-                    markFirstOutputReceived()
                     if downlinkFrames == 0 {
                         logger.info("realtime first audio chunk received", metadata: ["session_id": .string(sessionId), "bytes": "\(pcm.count)"])
                         logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.first_downlink_audio", "turn_id": .string(turnId)])
@@ -409,17 +388,14 @@ actor VoiceSession {
                     logger.debug("realtime audio pcm=\(pcm.count)b encoded_chunks=\(chunks)", metadata: ["session_id": .string(sessionId)])
                 case .inputTranscript(let text):
                     inputText = text
-                    noteUserTranscript(text)
                     logger.info("realtime input transcript", metadata: ["session_id": .string(sessionId), "text": .string(text)])
                     try? await send(TranscriptFinal(sessionId: sessionId, text: text))
                     logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.transcript_ready", "turn_id": .string(turnId)])
                 case .assistantTranscript(let delta):
-                    markFirstOutputReceived()
                     assistantText += delta
                     logger.debug("realtime assistant delta", metadata: ["session_id": .string(sessionId), "delta": .string(delta)])
                 case .webSearchStarted(let query):
                     logger.info("web search in progress", metadata: ["session_id": .string(sessionId), "query": .string(query)])
-                    await speakThinkingFiller(.webSearch, searchQuery: query)
                 case .done:
                     logger.info("realtime stream done", metadata: ["session_id": .string(sessionId)])
                 case .error(let msg):
@@ -439,8 +415,6 @@ actor VoiceSession {
             }
 
             guard phase == .streamingTTS else { return }
-            processingFillerTask?.cancel()
-            processingFillerTask = nil
             await downlinkPacer.endTurn()
             dumpDownlinkCaptureIfNeeded()
             try await send(TTSEnd(sessionId: sessionId))
@@ -473,87 +447,6 @@ actor VoiceSession {
         downlinkTurnId = turnId
         downlinkPCMDump.removeAll(keepingCapacity: true)
         await downlinkPacer.beginTurn()
-    }
-
-    private func resetTurnThinkingState() {
-        turnUserTranscript = ""
-        turnReceivedFirstOutput = false
-        turnSpokeThinkingFiller = false
-        processingFillerTask?.cancel()
-        processingFillerTask = nil
-    }
-
-    private func markFirstOutputReceived() {
-        guard !turnReceivedFirstOutput else { return }
-        turnReceivedFirstOutput = true
-        processingFillerTask?.cancel()
-        processingFillerTask = nil
-    }
-
-    private func noteUserTranscript(_ text: String) {
-        turnUserTranscript = text
-        guard !turnSpokeThinkingFiller, !turnReceivedFirstOutput else { return }
-        processingFillerTask?.cancel()
-        processingFillerTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 400_000_000)
-            await self?.speakThinkingFiller(.processing, searchQuery: nil)
-        }
-    }
-
-    private func startProcessingFillerWatch() {
-        processingFillerTask?.cancel()
-        processingFillerTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 700_000_000)
-            await self?.speakProcessingFillerWhenReady()
-        }
-    }
-
-    private func speakProcessingFillerWhenReady() async {
-        if turnUserTranscript.isEmpty {
-            try? await Task.sleep(nanoseconds: 500_000_000)
-        }
-        await speakThinkingFiller(.processing, searchQuery: nil)
-    }
-
-    /// One-shot short phrase via Cartesia while the main pipeline is still working.
-    /// At most one filler per turn (processing or web search, not both).
-    private func speakThinkingFiller(_ kind: ThinkingFiller.Kind, searchQuery: String?) async {
-        guard phase == .streamingTTS, !turnSpokeThinkingFiller else { return }
-        if kind == .processing, turnReceivedFirstOutput { return }
-
-        turnSpokeThinkingFiller = true
-        processingFillerTask?.cancel()
-        processingFillerTask = nil
-
-        guard let fillerTTS = thinkingTTS ?? tts else {
-            turnSpokeThinkingFiller = false
-            return
-        }
-
-        let phrase = ThinkingFiller.phrase(
-            for: kind,
-            userQuestion: turnUserTranscript,
-            searchQuery: searchQuery ?? ""
-        )
-        logger.info("thinking filler", metadata: ["kind": .string("\(kind)"), "phrase": .string(phrase)])
-
-        let contextId = "\(sessionId)-filler-\(UUID().uuidString)"
-        let events = await fillerTTS.beginTurn(contextId: contextId)
-
-        let playback = Task { [weak self] in
-            for await event in events {
-                switch event {
-                case .audio(let pcm):
-                    _ = await self?.sendDownlinkPCM(pcm)
-                case .done, .error:
-                    return
-                }
-            }
-        }
-
-        await fillerTTS.sendTranscriptChunk(phrase, contextId: contextId, isFinal: true)
-        await playback.value
-        await fillerTTS.cancelTurn(contextId: contextId)
     }
 
     private func sendDownlinkPCM(_ pcm: Data) async -> Int {
