@@ -98,6 +98,9 @@ static void captureTask(void *arg) {
     while (true) {
         xSemaphoreTake(s_captureStartSem, portMAX_DELAY);
         frameCount = 0;
+#if HAS_MIC
+        audioIoMicStart();
+#endif
         Serial.println("[MIC] capture session started");
         while (getState() == SESSION_CAPTURING) {
             size_t n = audioIoReadUplinkFrame(frame, sizeof(frame));
@@ -106,6 +109,9 @@ static void captureTask(void *arg) {
                 sendBinary(frame, n);
             }
         }
+#if HAS_MIC
+        audioIoMicStop();
+#endif
         Serial.printf("[MIC] capture stopped, sent %d frames\n", frameCount);
     }
 }
@@ -141,6 +147,7 @@ static void playbackTask(void *arg) {
         bool gotFrame = xQueueReceive(s_playbackQueue, &chunk, pdMS_TO_TICKS(kQueueWaitMs)) == pdTRUE;
         if (!gotFrame) {
             if (getState() != SESSION_SPEAKING) {
+                audioIoSpeakerMute();
                 continue;
             }
             audioIoWriteDownlink(silence, sizeof(silence) / sizeof(silence[0]));
@@ -247,6 +254,7 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
         break;
     case PROTO_MSG_TTS_END:
         setState(SESSION_IDLE);
+        audioIoSpeakerMute();
         Serial.println("[TTS] END — back to idle");
         break;
     case PROTO_MSG_ERROR:

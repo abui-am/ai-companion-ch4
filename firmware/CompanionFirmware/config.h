@@ -14,24 +14,24 @@
 #define COMPANION_DEVICE_TOKEN                                                 \
   "O6k4xgaZBLhPHCbzsbZqiyFcPvM7LfsCrw7fdgjy4wWLW8urQ0ERSgWHoXTKDyB1"
 
-// Capacitive touch toggle button. GPIO4 = Touch0 on ESP32 dev module.
+// Touch sensor (TTP223 etc.): HIGH when touched.
 // Tap once to start listening, tap again to stop.
-#define PIN_BUTTON 4
-#define TOUCH_THRESHOLD 40 // below this value = touched; tune per enclosure
+#define PIN_BUTTON 10
+#define TOUCH_THRESHOLD 40 // unused for digital touch modules; kept for compat
 
 #define HAS_MIC 1
 
 // Mic (I2S RX) — INMP441. L/R pin tied to GND → left channel.
-#define PIN_MIC_BCLK 14 // SCK
-#define PIN_MIC_WS 12   // WS
-#define PIN_MIC_DIN 35  // SD
+#define PIN_MIC_BCLK 11 // SCK / BCLK
+#define PIN_MIC_WS 9    // WS
+#define PIN_MIC_DIN 13  // SD / DIN
 #define MIC_CHANNEL_LEFT true
 
 // Speaker amp (I2S TX) — MAX98357A.
-#define PIN_SPK_BCLK 33 // BCK
-#define PIN_SPK_WS 25   // LRC
-#define PIN_SPK_DOUT 32 // DIN
+#define PIN_SPK_BCLK 6 // BCLK
+#define PIN_SPK_WS 9   // LRC
+#define PIN_SPK_DOUT 7 // DIN
 
 // Speaker output boost (max amplitude ~32767). Lower if you hear clipping.
 #define SPEAKER_BEEP_AMPLITUDE 8000
-#define SPEAKER_PLAYBACK_GAIN 2
+#define SPEAKER_PLAYBACK_GAIN 1

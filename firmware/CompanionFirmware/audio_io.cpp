@@ -14,7 +14,14 @@ static const i2s_port_t SPK_PORT = I2S_NUM_1;
 // Increase this value if audio is clipped; decrease if it's too quiet.
 #define MIC_DATA_SHIFT 14
 
+static bool s_audioInitialized = false;
+static bool s_speakerActive = false;
+
 void audioIoInit() {
+  if (s_audioInitialized) {
+    return;
+  }
+
 #if HAS_MIC
   i2s_config_t micConfig = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -48,6 +55,7 @@ void audioIoInit() {
       Serial.printf("audio: I2S mic ready (bclk=%d ws=%d din=%d @ %d Hz)\n",
                     PIN_MIC_BCLK, PIN_MIC_WS, PIN_MIC_DIN,
                     COMPANION_UPLINK_SAMPLE_RATE);
+      i2s_stop(MIC_PORT);
     }
   }
 #else
@@ -58,7 +66,8 @@ void audioIoInit() {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
       .sample_rate = COMPANION_DOWNLINK_SAMPLE_RATE,
       .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+      // MAX98357 with SD→3.3 V listens on the left slot only.
+      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
       .communication_format = I2S_COMM_FORMAT_STAND_I2S,
       .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
       .dma_buf_count = 8,
@@ -87,9 +96,38 @@ void audioIoInit() {
           "audio: I2S speaker ready (bclk=%d ws=%d dout=%d @ %d Hz)\n",
           PIN_SPK_BCLK, PIN_SPK_WS, PIN_SPK_DOUT,
           COMPANION_DOWNLINK_SAMPLE_RATE);
+      i2s_stop(SPK_PORT);
+      s_speakerActive = false;
     }
   }
   Serial.flush();
+  s_audioInitialized = true;
+}
+
+#if HAS_MIC
+void audioIoMicStart() { i2s_start(MIC_PORT); }
+
+void audioIoMicStop() { i2s_stop(MIC_PORT); }
+#endif
+
+void audioIoSpeakerMute() {
+  if (!s_speakerActive) {
+    return;
+  }
+  i2s_zero_dma_buffer(SPK_PORT);
+  static int16_t silence[256] = {};
+  size_t written = 0;
+  i2s_write(SPK_PORT, silence, sizeof(silence), &written, portMAX_DELAY);
+  i2s_stop(SPK_PORT);
+  s_speakerActive = false;
+}
+
+static void audioIoSpeakerEnsureStarted() {
+  if (s_speakerActive) {
+    return;
+  }
+  i2s_start(SPK_PORT);
+  s_speakerActive = true;
 }
 
 size_t audioIoReadUplinkFrame(uint8_t *out, size_t outCapacity) {
@@ -118,6 +156,7 @@ size_t audioIoReadUplinkFrame(uint8_t *out, size_t outCapacity) {
 }
 
 static void audioIoPlayTone(int frequencyHz, int durationMs, int amplitude) {
+  audioIoSpeakerEnsureStarted();
   i2s_zero_dma_buffer(SPK_PORT);
   const int sampleRate = COMPANION_DOWNLINK_SAMPLE_RATE;
   const int totalSamples = sampleRate * durationMs / 1000;
@@ -134,30 +173,22 @@ static void audioIoPlayTone(int frequencyHz, int durationMs, int amplitude) {
           sinf(2.0f * PI * static_cast<float>(frequencyHz) * t) *
           static_cast<float>(amplitude));
     }
-    static int16_t stereoBuf[2 * (sizeof(monoBuf) / sizeof(monoBuf[0]))];
-    for (int i = 0; i < chunk; i++) {
-      stereoBuf[2 * i] = monoBuf[i];
-      stereoBuf[2 * i + 1] = monoBuf[i];
-    }
     size_t written = 0;
-    i2s_write(SPK_PORT, stereoBuf,
-              static_cast<size_t>(chunk) * 2 * sizeof(int16_t), &written,
-              portMAX_DELAY);
+    i2s_write(SPK_PORT, monoBuf, static_cast<size_t>(chunk) * sizeof(int16_t),
+              &written, portMAX_DELAY);
     samplesPlayed += chunk;
   }
   delay(static_cast<unsigned>(durationMs) + 80);
+  audioIoSpeakerMute();
 }
 
-void audioIoSpeakerBeep() {
-  audioIoPlayTone(880, 120, SPEAKER_BEEP_AMPLITUDE);
-}
+void audioIoSpeakerBeep() { audioIoPlayTone(880, 120, SPEAKER_BEEP_AMPLITUDE); }
 
 void audioIoWriteDownlink(const int16_t *monoSamples, size_t sampleCount) {
-  static int16_t
-      stereoBuf[2 * (COMPANION_DOWNLINK_FRAME_BYTES / sizeof(int16_t))];
-  size_t maxSamples = sizeof(stereoBuf) / sizeof(stereoBuf[0]) / 2;
-  if (sampleCount > maxSamples) {
-    sampleCount = maxSamples;
+  audioIoSpeakerEnsureStarted();
+  static int16_t buf[COMPANION_DOWNLINK_FRAME_BYTES / sizeof(int16_t)];
+  if (sampleCount > sizeof(buf) / sizeof(buf[0])) {
+    sampleCount = sizeof(buf) / sizeof(buf[0]);
   }
   for (size_t i = 0; i < sampleCount; i++) {
     int32_t boosted =
@@ -167,13 +198,11 @@ void audioIoWriteDownlink(const int16_t *monoSamples, size_t sampleCount) {
     } else if (boosted < -32768) {
       boosted = -32768;
     }
-    int16_t sample = static_cast<int16_t>(boosted);
-    stereoBuf[2 * i] = sample;
-    stereoBuf[2 * i + 1] = sample;
+    buf[i] = static_cast<int16_t>(boosted);
   }
 
-  const uint8_t *ptr = reinterpret_cast<const uint8_t *>(stereoBuf);
-  size_t bytesRemaining = sampleCount * 2 * sizeof(int16_t);
+  const uint8_t *ptr = reinterpret_cast<const uint8_t *>(buf);
+  size_t bytesRemaining = sampleCount * sizeof(int16_t);
   while (bytesRemaining > 0) {
     size_t bytesWritten = 0;
     esp_err_t err =
