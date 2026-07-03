@@ -27,4 +27,6 @@ void audioIoSpeakerMute();
 // Stop/start mic I2S clocks when not capturing — reduces crosstalk into speaker.
 void audioIoMicStart();
 void audioIoMicStop();
+// Discard stale I2S DMA data after mic start — call once before first capture frame.
+void audioIoPrimeMic();
 #endif

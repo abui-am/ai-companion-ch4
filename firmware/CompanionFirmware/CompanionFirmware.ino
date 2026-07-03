@@ -19,6 +19,9 @@ static void connectWiFi() {
 
 void setup() {
     Serial.begin(115200);
+    delay(800);
+    Serial.printf("\n[BOOT] CompanionFirmware heap=%u\n",
+                  static_cast<unsigned>(ESP.getFreeHeap()));
     audioIoInit();
     audioIoSpeakerBeep();
     connectWiFi();

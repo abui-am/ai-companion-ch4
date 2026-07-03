@@ -39,6 +39,7 @@ actor VoiceSession {
     private var turnCounter = 0
     private var uplinkFrameCounter = 0
     private var uplinkPCMDump = Data()
+    private var uplinkCaptureStartedAt: Date?
     private var downlinkPCMDump = Data()
     private var downlinkTurnId: String?
     private var dumpOnlyMode = false
@@ -94,6 +95,7 @@ actor VoiceSession {
         phase = .capturing
         uplinkFrameCounter = 0
         uplinkPCMDump.removeAll(keepingCapacity: true)
+        uplinkCaptureStartedAt = Date()
         logger.info("audio.start", metadata: ["session_id": .string(sessionId), "phase": .string("\(phase)")])
     }
 
@@ -104,6 +106,18 @@ actor VoiceSession {
                 metadata: ["session_id": .string(sessionId), "phase": .string("\(phase)"), "bytes": "\(data.count)"]
             )
             return
+        }
+        let expectedBytes = AudioParams.uplink.sampleRate / 1000 * AudioParams.uplink.frameMs * 2
+        if data.count != expectedBytes {
+            logger.warning(
+                "uplink frame size mismatch",
+                metadata: [
+                    "session_id": .string(sessionId),
+                    "frame": "\(uplinkFrameCounter + 1)",
+                    "bytes": "\(data.count)",
+                    "expected": "\(expectedBytes)",
+                ]
+            )
         }
         uplinkFrameCounter += 1
         uplinkPCMDump.append(data)
@@ -128,15 +142,32 @@ actor VoiceSession {
         turnCounter += 1
         let turnId = "turn-\(turnCounter)"
         let frameCount = uplinkFrameCounter
+        let expectedFrames: Int? = uplinkCaptureStartedAt.map { started in
+            max(1, Int(Date().timeIntervalSince(started) * 1000.0 / Double(AudioParams.uplink.frameMs)))
+        }
+        uplinkCaptureStartedAt = nil
         logger.info(
             "audio.stop",
             metadata: [
                 "session_id": .string(sessionId),
                 "turn_id": .string(turnId),
                 "frames": "\(frameCount)",
+                "expected_frames": expectedFrames.map { "\($0)" } ?? "unknown",
                 "phase": .string("\(phase)"),
             ]
         )
+        if let expectedFrames, frameCount + 2 < expectedFrames {
+            logger.warning(
+                "uplink frame deficit — ESP likely dropped frames before they reached the server",
+                metadata: [
+                    "session_id": .string(sessionId),
+                    "turn_id": .string(turnId),
+                    "frames": "\(frameCount)",
+                    "expected_frames": "\(expectedFrames)",
+                    "missing_frames": "\(expectedFrames - frameCount)",
+                ]
+            )
+        }
         logger.info("e2e stage", metadata: ["session_id": .string(sessionId), "stage": "server.audio_stop", "turn_id": .string(turnId)])
         dumpDebugUplinkAudio(uplinkPCMDump, turnId: turnId)
 

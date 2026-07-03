@@ -26,6 +26,8 @@
 #define PIN_MIC_WS 4    // WS
 #define PIN_MIC_DIN 13  // SD / DIN
 #define MIC_CHANNEL_LEFT true
+// INMP441 gain: increase to reduce clipping (try 15–16), decrease if too quiet.
+#define MIC_DATA_SHIFT 15
 
 // Speaker amp (I2S TX) — MAX98357A.
 #define PIN_SPK_BCLK 6 // BCLK
