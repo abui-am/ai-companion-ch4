@@ -35,6 +35,10 @@ actor OpenAIRealtimeService {
     private var eventLoopTask: Task<Void, Never>?
     private var turnContinuation: AsyncStream<RealtimeAudioEvent>.Continuation?
     private var toolCallTask: Task<Void, Never>?
+    /// Set from `response.created` after each `response.create`; `response.done` is
+    /// ignored unless it matches, so a stale done from a prior turn cannot close
+    /// the current AsyncStream before audio deltas arrive.
+    private var activeTurnResponseId: String?
 
     init(
         apiKey: String,
@@ -114,6 +118,7 @@ actor OpenAIRealtimeService {
             return stream
         }
         logger.info("commitAndCreateResponse: socket ok, sending commit+response.create")
+        activeTurnResponseId = nil
         turnContinuation = continuation
         try? await sendJSON(["type": "input_audio_buffer.commit"])
         try? await sendJSON(responseCreatePayload())
@@ -165,6 +170,16 @@ actor OpenAIRealtimeService {
                 turnContinuation?.yield(.inputTranscript(t))
             }
 
+        case "response.created":
+            if let response = json["response"] as? [String: Any],
+               let id = response["id"] as? String
+            {
+                activeTurnResponseId = id
+                logger.debug("realtime response.created", metadata: ["response_id": .string(id)])
+            } else {
+                logger.debug("realtime [response.created]")
+            }
+
         case "response.audio.delta", "response.output_audio.delta":
             guard !textOnlyOutput else { break }
             let b64 = (json["audio"] as? String) ?? (json["delta"] as? String)
@@ -183,7 +198,26 @@ actor OpenAIRealtimeService {
             }
 
         case "response.done":
-            logger.info("realtime response.done")
+            let doneId = (json["response"] as? [String: Any])?["id"] as? String
+            guard let activeTurnResponseId else {
+                logger.warning(
+                    "ignoring response.done before response.created for this turn",
+                    metadata: ["response_id": .string(doneId ?? "unknown")]
+                )
+                break
+            }
+            if let doneId, doneId != activeTurnResponseId {
+                logger.warning(
+                    "ignoring response.done with mismatched id",
+                    metadata: [
+                        "active_response_id": .string(activeTurnResponseId),
+                        "done_response_id": .string(doneId),
+                    ]
+                )
+                break
+            }
+            logger.info("realtime response.done", metadata: ["response_id": .string(activeTurnResponseId)])
+            self.activeTurnResponseId = nil
             if let response = json["response"] as? [String: Any],
                let calls = Self.extractFunctionCalls(from: response),
                !calls.isEmpty,
@@ -344,6 +378,7 @@ actor OpenAIRealtimeService {
         }
 
         guard !Task.isCancelled, turnContinuation != nil else { return }
+        activeTurnResponseId = nil
         try? await sendJSON(responseCreatePayload())
     }
 

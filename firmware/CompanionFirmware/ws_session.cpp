@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <WebSocketsClient.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
@@ -41,11 +42,39 @@ static constexpr int kQueueWaitMs = 120;
 static constexpr int kStarvationFramesBeforeRebuffer = 8;
 static constexpr int kDownlinkFrameMs = COMPANION_FRAME_MS;
 
-// ~1.2 s of mic audio at 60 ms/frame. Absorbs WebSocket writes that stall
-// (library blocks up to WEBSOCKETS_TCP_TIMEOUT = 5 s on a stuck TCP send) so
-// a brief WiFi hiccup no longer overflows the ~256 ms I2S DMA ring and drops
-// audio — see docs/analysis on "recording sounds cut off".
-static constexpr UBaseType_t kUplinkQueueDepth = 20;
+// MARK: - Uplink queue sizing (see analysis in docs / session notes)
+//
+// Mic produces fixed-rate frames; the queue absorbs WiFi/TCP backpressure only.
+// It does NOT need to hold an entire recording if the sender keeps pace.
+//
+//   frame_ms        = 60
+//   frame_rate      = 1000/60 ≈ 16.7 frames/s
+//   frame_bytes     = 1920 (960 × int16 @ 16 kHz)
+//   chunk_bytes     = sizeof(CaptureChunk) ≈ 1924
+//
+// I2S DMA ring (mic): dma_buf_count=8, dma_buf_len=512 @ 32-bit → ~256 ms.
+// captureTask must never block longer than that on network I/O (drop-oldest).
+//
+// Observed uplink durations (server debug WAVs, n≈40):
+//   p50 ≈ 2.6 s (43 frames)   p90 ≈ 8.2 s (136 frames)   max ≈ 19 s (316 frames)
+//
+// Observed stall (queue=24, 115 captured / 86 sent / 29 dropped):
+//   sender averaged ~75% of capture rate → backlog ≈ 29 frames minimum depth.
+//
+// Worst-case single send stall: WEBSOCKETS_TCP_TIMEOUT ≈ 5 s → 5000/60 ≈ 84 frames.
+// Target depth = stall_budget + margin, capped below p90 recording when sender is
+// fully blocked (full-session buffering would need 136+ frames / 260 KB+).
+static constexpr int kUplinkFrameMs = COMPANION_FRAME_MS;
+static constexpr int kUplinkTcpStallMs = 5000;
+static constexpr int kUplinkQueueStallMarginFrames = 12;
+static constexpr int kUplinkQueueTargetDepth =
+    (kUplinkTcpStallMs / kUplinkFrameMs) + kUplinkQueueStallMarginFrames; // 96
+static constexpr int kUplinkQueueMaxDepth = 128; // ~7.7 s @ zero send; covers observed ~115-frame turns
+static constexpr int kUplinkQueueMinDepth = 32;  // ~1.9 s; below this, drops are likely on LAN
+
+static constexpr int kUplinkSendBatchMax = 4;
+static constexpr int kUplinkQueueSendWaitMs = 45;
+static constexpr int kUplinkDropLogInterval = 10;
 
 static UBaseType_t s_prefillTarget = kInitialPrefillFrames;
 
@@ -56,10 +85,23 @@ static String s_sessionId;
 static volatile bool s_sessionReady = false;
 static volatile bool s_playbackNeedPrefill = true;
 
+// Recursive: flushWebSocket() holds this across s_webSocket.loop(), which can
+// synchronously invoke webSocketEvent() (e.g. on CONNECTED/TEXT) — and that
+// handler calls sendText()/handleBinaryFrame() from the *same* task/call
+// stack. A plain mutex would self-deadlock there; recursive lets the same
+// task re-enter. This also now serializes .loop() itself, which used to run
+// concurrently from wsSessionLoop() (main loop task) and uplinkSendTask —
+// WebSocketsClient isn't safe to touch from two tasks at once, and that race
+// was corrupting/dropping outgoing binary frames mid-recording.
 static SemaphoreHandle_t s_wsSendMutex = nullptr;
 static SemaphoreHandle_t s_captureStartSem = nullptr;
 static QueueHandle_t s_playbackQueue = nullptr;
 static QueueHandle_t s_uplinkQueue = nullptr;
+static StaticQueue_t *s_uplinkQueueStruct = nullptr;
+static uint8_t *s_uplinkQueueStorage = nullptr;
+static UBaseType_t s_uplinkQueueDepth = 0;
+static int s_turnCaptured = 0;
+static int s_turnDropped = 0;
 
 static SessionState getState() {
     xSemaphoreTake(s_stateMutex, portMAX_DELAY);
@@ -93,27 +135,150 @@ static void drainUplinkQueue() {
     }
 }
 
+static bool createUplinkQueueAtDepth(UBaseType_t depth, bool preferPsram) {
+    const size_t storageBytes =
+        static_cast<size_t>(depth) * sizeof(CaptureChunk);
+
+    uint8_t *storage = static_cast<uint8_t *>(heap_caps_malloc(
+        storageBytes,
+        preferPsram ? (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+                    : (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+    if (storage == nullptr) {
+        return false;
+    }
+
+    StaticQueue_t *qstruct = static_cast<StaticQueue_t *>(
+        heap_caps_malloc(sizeof(StaticQueue_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (qstruct == nullptr) {
+        heap_caps_free(storage);
+        return false;
+    }
+
+    QueueHandle_t q =
+        xQueueCreateStatic(depth, sizeof(CaptureChunk), storage, qstruct);
+    if (q == nullptr) {
+        heap_caps_free(storage);
+        heap_caps_free(qstruct);
+        return false;
+    }
+
+    s_uplinkQueue = q;
+    s_uplinkQueueStorage = storage;
+    s_uplinkQueueStruct = qstruct;
+    s_uplinkQueueDepth = depth;
+    Serial.printf(
+        "[AUDIO] uplink queue ok depth=%u (~%u ms, %u bytes, %s)\n",
+        static_cast<unsigned>(depth),
+        static_cast<unsigned>(depth * COMPANION_FRAME_MS),
+        static_cast<unsigned>(storageBytes),
+        esp_ptr_external_ram(storage) ? "PSRAM" : "internal");
+    return true;
+}
+
+static bool createUplinkQueue() {
+    const size_t chunkBytes = sizeof(CaptureChunk);
+    const size_t psramBlock =
+        heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t internalBlock =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    int depthByPsram =
+        psramBlock > chunkBytes
+            ? static_cast<int>((psramBlock * 9 / 10) / chunkBytes)
+            : 0;
+    int depthByInternal =
+        internalBlock > chunkBytes + 8192
+            ? static_cast<int>(((internalBlock - 8192) * 9 / 10) / chunkBytes)
+            : 0;
+
+    int tryMax = kUplinkQueueMaxDepth;
+    if (depthByPsram > 0 && depthByPsram < tryMax) {
+        tryMax = depthByPsram;
+    } else if (depthByInternal > 0 && depthByPsram == 0 && depthByInternal < tryMax) {
+        tryMax = depthByInternal;
+    }
+
+    Serial.printf(
+        "[AUDIO] uplink queue sizing: target=%d max=%d min=%d chunk=%u psram=%u internal=%u heap=%u\n",
+        kUplinkQueueTargetDepth, tryMax, kUplinkQueueMinDepth,
+        static_cast<unsigned>(chunkBytes),
+        static_cast<unsigned>(psramBlock),
+        static_cast<unsigned>(internalBlock),
+        static_cast<unsigned>(ESP.getFreeHeap()));
+
+    for (int depth = tryMax; depth >= kUplinkQueueMinDepth; depth -= 8) {
+        if (createUplinkQueueAtDepth(static_cast<UBaseType_t>(depth), true)) {
+            return true;
+        }
+        if (createUplinkQueueAtDepth(static_cast<UBaseType_t>(depth), false)) {
+            return true;
+        }
+        Serial.printf(
+            "[AUDIO] uplink queue alloc failed depth=%d (need %u bytes)\n",
+            depth, static_cast<unsigned>(depth * chunkBytes));
+    }
+
+    Serial.println("[AUDIO] FATAL: uplink queue unavailable — mic will send inline (degraded)");
+    return false;
+}
+
 static void sendText(const String &text) {
-    xSemaphoreTake(s_wsSendMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
     if (s_webSocket.isConnected()) {
         String copy = text;
         s_webSocket.sendTXT(copy);
     }
-    xSemaphoreGive(s_wsSendMutex);
+    xSemaphoreGiveRecursive(s_wsSendMutex);
 }
 
-static void sendBinary(uint8_t *data, size_t len) {
-    xSemaphoreTake(s_wsSendMutex, portMAX_DELAY);
+static void sendTextAndFlush(const String &text) {
+    xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
+    if (s_webSocket.isConnected()) {
+        String copy = text;
+        s_webSocket.sendTXT(copy);
+        s_webSocket.loop();
+    }
+    xSemaphoreGiveRecursive(s_wsSendMutex);
+}
+
+// Send one uplink PCM frame; loop() after each BIN so the WebSockets library
+// actually pushes the frame (batching multiple sendBIN before one loop() was
+// leaving frames stuck in the client buffer).
+static int sendUplinkFrame(const uint8_t *data, size_t len) {
+    if (len == 0) {
+        return 0;
+    }
+    xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
+    int sent = 0;
     if (s_webSocket.isConnected()) {
         s_webSocket.sendBIN(data, len);
+        s_webSocket.loop();
+        sent = 1;
     }
-    xSemaphoreGive(s_wsSendMutex);
+    xSemaphoreGiveRecursive(s_wsSendMutex);
+    return sent;
+}
+
+static int sendBinaryBatch(const CaptureChunk *chunks, int count) {
+    if (count <= 0) {
+        return 0;
+    }
+    int sent = 0;
+    for (int i = 0; i < count; i++) {
+        if (chunks[i].len == 0) {
+            break;
+        }
+        sent += sendUplinkFrame(chunks[i].data, chunks[i].len);
+    }
+    return sent;
 }
 
 static void flushWebSocket() {
-    // Do not hold s_wsSendMutex across loop() — the CONNECTED/TEXT handlers call
-    // sendText/sendBinary and would deadlock on the same mutex.
+    // Recursive mutex: safe even though loop() can re-enter sendText/
+    // sendBinary synchronously via webSocketEvent() on the same task.
+    xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
     s_webSocket.loop();
+    xSemaphoreGiveRecursive(s_wsSendMutex);
 }
 
 static void flushWebSocketRepeated(int count, int delayMs) {
@@ -139,15 +304,19 @@ static void captureTask(void *arg) {
     (void)arg;
     static uint8_t frame[COMPANION_UPLINK_FRAME_BYTES];
     int frameCount = 0;
+    int droppedCount = 0;
     while (true) {
         xSemaphoreTake(s_captureStartSem, portMAX_DELAY);
         drainUplinkQueue();
         frameCount = 0;
+        droppedCount = 0;
 #if HAS_MIC
         audioIoMicStart();
         audioIoPrimeMic();
 #endif
         Serial.println("[MIC] capture session started");
+        Serial.printf("[MIC] queue=%p heap=%u\n", s_uplinkQueue,
+                      static_cast<unsigned>(ESP.getFreeHeap()));
         while (getState() == SESSION_CAPTURING) {
             size_t n = audioIoReadUplinkFrame(frame, sizeof(frame));
             if (n != COMPANION_UPLINK_FRAME_BYTES) {
@@ -155,65 +324,110 @@ static void captureTask(void *arg) {
                 continue;
             }
             if (s_uplinkQueue == nullptr) {
-                vTaskDelay(pdMS_TO_TICKS(5));
+                // Degraded path when queue alloc failed — send inline so uplink
+                // still works (blocks up to one frame time on network I/O).
+                sendUplinkFrame(frame, n);
+                frameCount++;
                 continue;
             }
             CaptureChunk chunk;
             chunk.len = n;
             memcpy(chunk.data, frame, n);
-            if (xQueueSend(s_uplinkQueue, &chunk, 0) != pdTRUE) {
-                // Queue is full — the sender is stalled on the network.
-                // Drop the oldest buffered frame rather than blocking here,
-                // so the mic keeps draining the I2S DMA ring on schedule.
+            if (xQueueSend(s_uplinkQueue, &chunk, pdMS_TO_TICKS(kUplinkQueueSendWaitMs)) != pdTRUE) {
+                // Sender still stalled after a short wait — drop the oldest
+                // buffered frame so the mic keeps draining the I2S DMA ring.
                 CaptureChunk discard;
                 xQueueReceive(s_uplinkQueue, &discard, 0);
                 xQueueSend(s_uplinkQueue, &chunk, 0);
-                Serial.println("[MIC] uplink queue full — dropped oldest buffered frame (network stalled)");
+                droppedCount++;
+                if (droppedCount == 1 || droppedCount % kUplinkDropLogInterval == 0) {
+                    Serial.printf(
+                        "[MIC] uplink queue full — dropped oldest frame (network stalled, total=%d)\n",
+                        droppedCount);
+                }
             }
             frameCount++;
         }
 #if HAS_MIC
         audioIoMicStop();
 #endif
-        Serial.printf("[MIC] capture stopped, captured %d frames from mic\n", frameCount);
+        Serial.printf("[MIC] capture stopped, captured %d frames from mic", frameCount);
+        if (droppedCount > 0) {
+            Serial.printf(" (%d dropped before send)\n", droppedCount);
+        } else {
+            Serial.println();
+        }
         // Sentinel: tells uplinkSendTask to flush and send audio.stop once
         // every real frame captured above has actually been sent.
         if (s_uplinkQueue != nullptr) {
             CaptureChunk endMarker = {};
             endMarker.len = 0;
+            s_turnCaptured = frameCount;
+            s_turnDropped = droppedCount;
             xQueueSend(s_uplinkQueue, &endMarker, portMAX_DELAY);
         } else if (getState() == SESSION_PROCESSING) {
-            sendText(protocolBuildAudioStop());
+            sendTextAndFlush(protocolBuildAudioStop());
+            Serial.printf("[MIC] uplink inline: sent %d frames to server\n", frameCount);
         }
     }
 }
 
 // MARK: - Uplink sender (network)
 
+static void finishUplinkTurn(int sentCount) {
+    if (getState() == SESSION_PROCESSING) {
+        sendTextAndFlush(protocolBuildAudioStop());
+    } else {
+        flushWebSocketRepeated(10, 5);
+    }
+    const int captured = s_turnCaptured;
+    const int dropped = s_turnDropped;
+    const int sendPct = captured > 0 ? (sentCount * 100) / captured : 0;
+    Serial.printf(
+        "[MIC] uplink turn: captured=%d sent=%d dropped=%d send_rate=%d%% queue_depth=%u\n",
+        captured, sentCount, dropped, sendPct,
+        static_cast<unsigned>(s_uplinkQueueDepth));
+    s_turnCaptured = 0;
+    s_turnDropped = 0;
+}
+
 static void uplinkSendTask(void *arg) {
     (void)arg;
-    CaptureChunk chunk;
+    static CaptureChunk batch[kUplinkSendBatchMax];
     int sentCount = 0;
     while (true) {
         if (s_uplinkQueue == nullptr) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        if (xQueueReceive(s_uplinkQueue, &chunk, portMAX_DELAY) != pdTRUE) {
+        if (xQueueReceive(s_uplinkQueue, &batch[0], portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        if (chunk.len == 0) {
-            flushWebSocketRepeated(10, 5);
-            Serial.printf("[MIC] uplink sender: flushed %d frames to server\n", sentCount);
+        if (batch[0].len == 0) {
+            finishUplinkTurn(sentCount);
             sentCount = 0;
-            if (getState() == SESSION_PROCESSING) {
-                sendText(protocolBuildAudioStop());
-            }
             continue;
         }
-        sendBinary(chunk.data, chunk.len);
-        flushWebSocket();
-        sentCount++;
+
+        int batchCount = 1;
+        while (batchCount < kUplinkSendBatchMax) {
+            CaptureChunk next;
+            if (xQueueReceive(s_uplinkQueue, &next, 0) != pdTRUE) {
+                break;
+            }
+            if (next.len == 0) {
+                sentCount += sendBinaryBatch(batch, batchCount);
+                finishUplinkTurn(sentCount);
+                sentCount = 0;
+                batchCount = 0;
+                break;
+            }
+            batch[batchCount++] = next;
+        }
+
+        if (batchCount > 0) {
+            sentCount += sendBinaryBatch(batch, batchCount);
+        }
     }
 }
 
@@ -308,11 +522,18 @@ static void onButtonEvent(ButtonEvent event, void *ctx) {
 
     switch (s) {
     case SESSION_IDLE:
-        audioIoSpeakerBeep();
-        sendText(protocolBuildAudioStart());
+        // Kick off mic start + priming on captureTask *before* the blocking
+        // beep — mic (MIC_PORT) and speaker (SPK_PORT) are separate I2S
+        // peripherals, so priming (~360-400ms) runs in parallel with the
+        // beep (~200-226ms) on this task instead of stacking after it. The
+        // beep doubles as the "go ahead and talk" cue, so hiding priming
+        // behind it removes ~600ms of dead air that used to eat the start
+        // of the user's first word.
         setState(SESSION_CAPTURING);
         xSemaphoreGive(s_captureStartSem);
+        sendTextAndFlush(protocolBuildAudioStart());
         Serial.println("[BUTTON] tap: IDLE → CAPTURING (mic ON)");
+        audioIoSpeakerBeep();
         break;
     case SESSION_CAPTURING:
         setState(SESSION_PROCESSING);
@@ -435,7 +656,7 @@ void wsSessionBegin() {
                   static_cast<unsigned>(ESP.getFreeHeap()));
 
     s_stateMutex = xSemaphoreCreateMutex();
-    s_wsSendMutex = xSemaphoreCreateMutex();
+    s_wsSendMutex = xSemaphoreCreateRecursiveMutex();
     s_captureStartSem = xSemaphoreCreateBinary();
     s_playbackQueue = xQueueCreate(kPlaybackQueueDepth, sizeof(PlaybackChunk));
     if (s_playbackQueue == nullptr) {
@@ -445,19 +666,22 @@ void wsSessionBegin() {
         Serial.printf("[AUDIO] playback queue ok depth=%u\n",
                       static_cast<unsigned>(kPlaybackQueueDepth));
     }
-    s_uplinkQueue = xQueueCreate(kUplinkQueueDepth, sizeof(CaptureChunk));
-    if (s_uplinkQueue == nullptr) {
-        Serial.printf("[AUDIO] WARNING: uplink queue alloc failed (need %u bytes)\n",
-                      static_cast<unsigned>(kUplinkQueueDepth * sizeof(CaptureChunk)));
-    } else {
-        Serial.printf("[AUDIO] uplink queue ok depth=%u (~%u ms buffered)\n",
-                      static_cast<unsigned>(kUplinkQueueDepth),
-                      static_cast<unsigned>(kUplinkQueueDepth * COMPANION_FRAME_MS));
+    if (!createUplinkQueue()) {
+        Serial.println("[MIC] will use inline uplink (no queue buffer)");
     }
 
-    xTaskCreate(captureTask, "audio_capture", 8192, NULL, 12, NULL);
-    xTaskCreate(uplinkSendTask, "audio_uplink_send", 8192, NULL, 11, NULL);
-    xTaskCreate(playbackTask, "audio_playback", 8192, NULL, 14, NULL);
+    BaseType_t captureOk =
+        xTaskCreate(captureTask, "audio_capture", 8192, NULL, 12, NULL);
+    BaseType_t uplinkOk =
+        xTaskCreate(uplinkSendTask, "audio_uplink_send", 8192, NULL, 13, NULL);
+    BaseType_t playbackOk =
+        xTaskCreate(playbackTask, "audio_playback", 8192, NULL, 14, NULL);
+    if (captureOk != pdPASS || uplinkOk != pdPASS || playbackOk != pdPASS) {
+        Serial.printf("[AUDIO] FATAL: task create failed capture=%d uplink=%d playback=%d heap=%u\n",
+                      static_cast<int>(captureOk), static_cast<int>(uplinkOk),
+                      static_cast<int>(playbackOk),
+                      static_cast<unsigned>(ESP.getFreeHeap()));
+    }
 
     static String authHeader = String("Authorization: Bearer ") + COMPANION_DEVICE_TOKEN;
     s_webSocket.setExtraHeaders(authHeader.c_str());

@@ -2,10 +2,10 @@
 
 // Fill these in before flashing. Mirrors the showcase-phase auth model in
 // the plan: shared compile-time token, no rotation, LAN-only.
-#define WIFI_SSID "sayaMayunn"
-#define WIFI_PASSWORD "123456789"
+#define WIFI_SSID "Wifi iuran"
+#define WIFI_PASSWORD "sekgangguan"
 
-#define COMPANION_SERVER_HOST "10.75.190.134"
+#define COMPANION_SERVER_HOST "192.168.1.3"
 #define COMPANION_SERVER_PORT 8080
 #define COMPANION_SERVER_PATH "/ws"
 #define COMPANION_USE_TLS false // true => wss:// (beginSSL)

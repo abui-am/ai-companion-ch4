@@ -182,6 +182,20 @@ actor VoiceSession {
             return
         }
 
+        if frameCount == 0 {
+            logger.warning(
+                "audio.stop with zero uplink frames — skipping AI turn",
+                metadata: ["session_id": .string(sessionId), "turn_id": .string(turnId)]
+            )
+            phase = .connected
+            uplinkFrameCounter = 0
+            uplinkPCMDump.removeAll(keepingCapacity: true)
+            Task {
+                try? await send(ErrorMessage(code: "no_uplink_audio", message: "No mic audio received — hold longer and try again"))
+            }
+            return
+        }
+
         phase = .processing
         pipelineTask = Task { [weak self] in
             await self?.runRealtimeTurn(turnId: turnId)
