@@ -1,8 +1,82 @@
+# ── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# ── Secrets & local config ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.mobileprovision
+
+# ── Swift / SPM / Xcode ────────────────────────────────────────────────────────
 .build/
 .swiftpm/
+Packages/
+DerivedData/
 *.xcodeproj
-.DS_Store
-.env
+*.xcworkspace
+xcuserdata/
+*.xcuserstate
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+*.profraw
+*.profdata
+coverage/
+*.gcno
+*.gcda
+
+# ── ESP32 / Arduino firmware ─────────────────────────────────────────────────
+# Arduino CLI / IDE build output
+firmware/**/build/
+*.elf
+*.bin
+*.hex
+*.map
+
+# PlatformIO
+.pio/
+.piolibdeps/
+
+# ESP-IDF (if used alongside Arduino)
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# ── CompanionServer local artifacts ────────────────────────────────────────────
 CompanionServer/debug-audio/
 CompanionServer/.kokoro-models/
+CompanionServer/benchmark*
+CompanionServer/realtime-output*
 CompanionServer/kokoro-smoke-test.wav
+CompanionServer/*.wav
+CompanionServer/*.m4a
+
+# ── Local test recordings (repo root) ──────────────────────────────────────────
+/*.wav
+/*.m4a
+/*.mp3
+/*.flac
+
+# ── Editor / IDE (machine-specific) ────────────────────────────────────────────
+.idea/
+*.swp
+*.swo
+*~
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+
+# ── Logs & temp files ──────────────────────────────────────────────────────────
+*.log
+tmp/
+temp/
