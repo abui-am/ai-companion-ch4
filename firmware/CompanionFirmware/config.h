@@ -1,5 +1,6 @@
 #pragma once
 
+// Stable stack v1 — interaction model and pins: docs/STABLE_V1.md
 // Arduino IDE: Tools → PSRAM → QSPI PSRAM (CoreS3 and most ESP32-S3 boards).
 
 // Fill these in before flashing. Mirrors the showcase-phase auth model in

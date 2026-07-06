@@ -1,6 +1,6 @@
-# Testing CompanionFirmware (v2)
+# Testing CompanionFirmware (v2 stable)
 
-Production firmware: ESP32 mic + speaker on one `/ws` session. Stack spec: **[docs/STABLE_V1.md](../docs/STABLE_V1.md)**.
+Production firmware: ESP32 mic + speaker on one `/ws` session. **Stable** tap + client VAD — see [docs/STABLE_V1.md](../docs/STABLE_V1.md) (§ Client VAD).
 
 For bench testing without ESP mic hardware, use **[TestFirmware](TestFirmware/TESTING.md)** (v1: Mac **TestClient** mic → server → ESP speaker on `/speaker`).
 

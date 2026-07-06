@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 
-// Stable wire protocol version — see docs/STABLE_V1.md.
+// Stable wire protocol + client VAD interaction — see docs/STABLE_V1.md.
 #define COMPANION_PROTOCOL_VERSION "v1"
 
 // Mirrors CompanionServer/Sources/CompanionServer/WireProtocol.swift.

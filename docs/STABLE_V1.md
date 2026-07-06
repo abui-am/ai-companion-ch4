@@ -2,7 +2,9 @@
 
 This document is the canonical reference for **stack v1**: the current working configuration used for showcase and hardware testing. When someone says “run v1” or “stable stack,” they mean the settings and behaviors described here.
 
-**Code anchors:** `CompanionStack.protocolVersion` / `CompanionStack.pipelineProfile` (Swift), `COMPANION_PROTOCOL_VERSION` (firmware).
+**Stable as of 2026-07-06:** tap-to-talk + hands-free adaptive VAD (no on-device wake word). See [§ Client VAD (stable)](#client-vad-stable).
+
+**Code anchors:** `CompanionStack.protocolVersion` / `CompanionStack.pipelineProfile` (Swift), `COMPANION_PROTOCOL_VERSION` (firmware), VAD constants in `ws_session.cpp`.
 
 ---
 
@@ -12,7 +14,7 @@ This document is the canonical reference for **stack v1**: the current working c
 | **Pipeline profile** | `v1` | OpenAI Realtime API — single WebSocket round-trip for speech-in / speech-out |
 | **Wire protocol** | `v1` | JSON events on text frames; raw 16-bit PCM on binary frames (no per-frame header) |
 | **Firmware (split test)** | TestFirmware **v1** | Mac mic on `/ws` → server → ESP speaker on `/speaker` |
-| **Firmware (integrated)** | CompanionFirmware **v2** | ESP mic + speaker on one `/ws` session |
+| **Firmware (integrated)** | CompanionFirmware **v2** | ESP mic + speaker on one `/ws` session; **tap + client VAD** (stable) |
 
 The server runs **only** the OpenAI Realtime pipeline. Legacy multi-stage paths (Cartesia Sonic/Kokoro TTS, Cartesia STT, REST chat) were removed — rebuild guide: [ARCHIVED_LEGACY_PIPELINE.md](ARCHIVED_LEGACY_PIPELINE.md).
 
@@ -42,7 +44,7 @@ Copy `CompanionServer/.env.example` and fill secrets before running.
 - Endpoint: `wss://api.openai.com/v1/realtime?model=<OPENAI_REALTIME_MODEL>`
 - Auth: `Authorization: Bearer <OPENAI_API_KEY>` only (no beta header)
 - Session: `type: "realtime"`, `audio.input` / `audio.output` at **24 kHz PCM**
-- Server VAD: disabled (`turn_detection: null`) — client sends `audio.stop` (push-to-talk)
+- Server VAD: disabled (`turn_detection: null`) — **client adaptive VAD** sends `audio.stop` at end-of-speech (not hold-to-talk)
 - Input transcription: `whisper-1` (emits `transcript.final` to client)
 - System prompt: `CompanionPrompt.system` (“Botchill”)
 
@@ -117,27 +119,87 @@ TestClient (/ws) ──mic──► CompanionServer ──► OpenAI Realtime
 - Speaker: ESP32-S3 + MAX98357A
 - Guide: `firmware/TestFirmware/TESTING.md`
 
-### CompanionFirmware v2 (integrated path)
+### CompanionFirmware v2 (integrated path) — **stable**
 
 ```
 ESP32 (/ws) ──mic + speaker──► CompanionServer ──► OpenAI Realtime
 ```
 
-- Push-to-talk on GPIO4 (touch)
-- INMP441 mic + MAX98357A speaker
-- Guide: `firmware/TESTING.md`
+**Interaction (stable):**
 
-### Shared hardware (both sketches)
+1. **Tap once** → mic on, beep, start capturing.
+2. **Speak**, pause **~1 s** → client VAD ends turn, sends `audio.stop`.
+3. **AI replies** → mic reopens automatically when TTS finishes (hands-free follow-up).
+4. **Tap again** anytime → end conversation (including barge-in during TTS).
 
-| Signal   |   GPIO   |
-|----------|----------|
-| Mic BCLK | 14       |
-| Mic WS   | 12       |
-| Mic DIN  | 35       |
-| Speaker BCLK | 33   |
-| Speaker WS | 25     |
-| Speaker DOUT | 32   |
-| Button / touch | 4  |
+Safety: **4 s** no-speech timeout if you tap but never talk.
+
+Implementation: `ws_session.cpp` (session state machine + VAD), `audio_io.cpp` (VAD metrics). Guide: `firmware/TESTING.md`.
+
+#### CompanionFirmware GPIO (`config.h`)
+
+| Signal | GPIO |
+|--------|------|
+| Mic BCLK | 12 |
+| Mic WS | 4 |
+| Mic DIN | 13 |
+| Speaker BCLK | 6 |
+| Speaker WS | 7 |
+| Speaker DOUT | 5 |
+| Touch button | 11 |
+
+`MIC_DATA_SHIFT=14`, PSRAM required for uplink queue.
+
+### TestFirmware v1 hardware (split path only)
+
+| Signal | GPIO |
+|--------|------|
+| Mic BCLK | 14 |
+| Mic WS | 12 |
+| Mic DIN | 35 |
+| Speaker BCLK | 33 |
+| Speaker WS | 25 |
+| Speaker DOUT | 32 |
+| Button / touch | 4 |
+
+---
+
+## Client VAD (stable)
+
+On-device end-of-speech detection for CompanionFirmware v2. Uplink audio sent to the server is **unchanged**; VAD runs on a filtered analysis path only.
+
+### Algorithm (summary)
+
+1. **High-pass ~300 Hz** on VAD path — reduces HVAC rumble.
+2. **Adaptive noise floor** — learns room background; capped at 550.
+3. **Hysteresis** — harder bar to *start* speech, lower bar to *continue*.
+4. **Speech shape** — crest factor + zero-crossing rate reject steady fan hum.
+5. **End-of-turn** — 1 s silence after latched speech → `audio.stop`.
+
+### Stable constants (`ws_session.cpp`)
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `kEndOfSpeechSilenceMs` | 1000 | Pause after speech → send turn |
+| `kNoSpeechTimeoutMs` | 4000 | Tap but never spoke → give up |
+| `kVoiceOnsetMargin` | 450 | Energy above floor to *start* speech |
+| `kVoiceOffsetMargin` | 150 | Energy above floor to *continue* speech |
+| `kVoiceOnsetMinFrames` | 3 | ~180 ms sustained onset (~60 ms frames) |
+| `kNoiseFloorMax` | 550 | Cap floor inflation in loud rooms |
+| `kMinCrestX100` | 220 | Onset: peak/mean ≥ 2.2× |
+| `kMinOffsetCrestX100` | 140 | Continue: peak/mean ≥ 1.4× |
+| `kMinZcrX1000` | 55 | Onset: ~5.5% zero-crossings |
+
+Serial tuning aid: `[VAD] energy=... peak=... crest=... zcr=... floor=... on=... off=... voiced=...`
+
+### Session states
+
+| State | Meaning |
+|-------|---------|
+| `SESSION_IDLE` | Waiting for tap |
+| `SESSION_CAPTURING` | Mic on, VAD watching |
+| `SESSION_PROCESSING` | Turn sent, waiting for AI |
+| `SESSION_SPEAKING` | TTS playback |
 
 ---
 
@@ -153,7 +215,7 @@ swift run CompanionServer
 
 **Terminal 2 — integrated device (CompanionFirmware v2)**
 
-Flash `firmware/CompanionFirmware`, set `config.h` host + token, hold button to talk.
+Flash `firmware/CompanionFirmware`, set `config.h` host + token, **tap once** to start a conversation.
 
 **Or — split test (TestFirmware v1 + TestClient)**
 
@@ -168,6 +230,8 @@ swift run TestClient
 
 - Binary audio is **PCM**, not Opus — firmware `pcm_codec` chunks frames only; no libopus yet
 - `device_command` (LED) is validated server-side (`CmdRouter`) but not wired on ESP yet
+- Client VAD may need constant tuning in very noisy rooms — see [§ Client VAD (stable)](#client-vad-stable)
+- On-device wake word removed (Edge Impulse too slow); tap + VAD is the stable interaction model
 - Prerecorded benchmark tools (`SpeakerBenchmark`, `TTSBenchmark`) removed — see [ARCHIVED_LEGACY_PIPELINE.md](ARCHIVED_LEGACY_PIPELINE.md) to restore
 
 ---

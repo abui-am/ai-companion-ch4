@@ -317,6 +317,9 @@ static void flushWebSocketRepeated(int count, int delayMs) {
 
 // MARK: - Seamless turn-taking, bookended by taps
 //
+// STABLE (2026-07-06) — tap + adaptive noisy-room VAD. Constants below are
+// canonical; update docs/STABLE_V1.md § Client VAD if you change them.
+//
 // One tap starts a conversation; from then on it runs hands-free — talk,
 // pause, the AI answers, talk again — until another tap ends it (or, as a
 // safety net, the user never says anything at all). No wake word.

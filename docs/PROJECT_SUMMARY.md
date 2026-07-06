@@ -1,6 +1,7 @@
 # AI Companion — Project Summary
 
 **Last updated:** 2026-07-06  
+**Status:** **Stable** — tap-to-talk + hands-free adaptive VAD (see [STABLE_V1.md](STABLE_V1.md))  
 **Scope:** ESP32-S3 voice companion firmware + Swift CompanionServer backend
 
 This document summarizes the current stack, what was accomplished during the wake-word debug session, and where the project stands today. For the full wake-word investigation log, see [WAKE_WORD_DEBUG_REPORT.md](WAKE_WORD_DEBUG_REPORT.md). For the stable v1 stack spec, see [STABLE_V1.md](STABLE_V1.md).
@@ -170,4 +171,4 @@ Priority recommendations from the debug report:
 4. **Server-side wake detection** on the uplink stream (higher latency, no on-device NN)
 5. **Do not re-enable ESP-NN** until the exported model supports ESP32-S3 optimized kernels without arena overflow
 
-Until then, **tap-to-talk + hands-free VAD** is the product interaction model.
+Until then, **tap-to-talk + hands-free VAD** is the **stable** product interaction model (documented in [STABLE_V1.md](STABLE_V1.md)).
