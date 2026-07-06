@@ -133,7 +133,14 @@ actor OpenAIRealtimeService {
     func cancelResponse() async {
         toolCallTask?.cancel()
         toolCallTask = nil
-        try? await sendJSON(["type": "response.cancel"])
+        // Only OpenAI has anything to cancel once response.created has set
+        // activeTurnResponseId — e.g. a device abort before audio.stop was
+        // ever sent (no commitAndCreateResponse call yet) has no in-flight
+        // response, and response.cancel would just log a spurious
+        // "Cancellation failed: no active response found" API error.
+        if activeTurnResponseId != nil {
+            try? await sendJSON(["type": "response.cancel"])
+        }
         finishTurn(with: nil)
     }
 

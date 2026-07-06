@@ -11,14 +11,9 @@ For bench testing without ESP mic hardware, use **[TestFirmware](TestFirmware/TE
   - **ArduinoJson** (Benoit Blanchon)
   - **WebSockets** (Markus Sattler / Links2004)
 3. Tools → Board → **ESP32S3 Dev Module** (works for ESP32-S3 Mini/Super Mini boards too — there's no separate "Mini" board entry).
-4. Tools → **Partition Scheme** → **Huge APP (3MB No OTA/1MB SPIFFS)**.
-   The Edge Impulse wake-word library pushes the sketch past the default 1.2 MB app limit (~1.7 MB compiled). Without this step you get `text section exceeds available space in board`.
-   **Re-check this every time you change the Board selection** — switching boards resets Partition Scheme back to the 1.2 MB default, which silently reproduces this error.
-   Alternative with OTA: **Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)**. Both fit within 4 MB flash (~3.97 MB used total) — confirm Tools → **Flash Size** matches your module (4MB is standard for S3 Mini/Super Mini boards).
+4. Tools → **Partition Scheme** → default (1.2 MB app) is fine now that the Edge Impulse wake-word model is gone; use **Huge APP** only if you need the extra flash headroom for other reasons.
 5. Tools → USB CDC On Boot → **Enabled** on ESP32-S3 (so `Serial` shows up over USB without a separate UART adapter).
-6. Library Manager → install **adjiemuliadi-project-1_inferencing** (Edge Impulse wake-word model) if not already present.
-
-
+6. Tools → **PSRAM** → **QSPI PSRAM** (M5Stack CoreS3 / most S3 devkits; use OPI only if your module datasheet says octal PSRAM) — used for the uplink audio queue.
 
 ## 2. Configure
 
@@ -78,7 +73,7 @@ connecting to <ssid>..... connected
 I2S mic + speaker channels ready
 ws connected
 session ready: <uuid>
-ready, hold button to talk
+>>> READY — connecting mic / server OK; wait for LISTENING <<<
 ```
 
 If it loops on `connecting to <ssid>` — check `WIFI_SSID`/`WIFI_PASSWORD`. If it logs `ws connected` but never `session ready`, the most likely cause is `COMPANION_DEVICE_TOKEN` not matching the server's `DEVICE_TOKEN` (server replies `.dontUpgrade`, the WS handshake fails, and the library will keep retrying `ws connected`/disconnect).
@@ -87,15 +82,23 @@ If it loops on `connecting to <ssid>` — check `WIFI_SSID`/`WIFI_PASSWORD`. If 
 
 Run these in order, watching both the ESP32 serial monitor and the server's terminal output.
 
-1. **Single turn** — hold the button, speak a short sentence, release.
-  - Serial: `button pressed` → (server: pipeline runs) → `transcript: ...` → `session ready` is *not* re-sent (only on (re)connect) → audio should play back through the speaker → button task otherwise idle.
+There's no wake word. Conversations are bookended by a single tap: **tap once to start**, then it's hands-free — talk, pause ~1s, the AI answers, talk again, pause, it answers again — until **you tap again to end it** (that second tap works at any point, including mid AI-reply). A no-speech safety timeout (4s of total silence with nothing ever said) also ends the conversation on its own. See `kEndOfSpeechSilenceMs` / `kNoSpeechTimeoutMs` / the adaptive-VAD constants in `ws_session.cpp`.
+
+1. **Single turn** — tap once, speak a short sentence, then go quiet for ~1s.
+  - Serial: `[BUTTON] pressed` → `[BUTTON] tap: IDLE → CAPTURING (mic ON)` + beep → `[VAD] energy=... peak=... crest=... zcr=... floor=... on=... off=...` lines while you talk → `[VAD] user paused after speaking — ending turn, sending to AI` → (server: pipeline runs) → `transcript: ...` → audio plays back through the speaker.
   - Server terminal: should show the latency.report log line for the turn.
-2. **Push-to-talk timing** — confirm capture only sends frames between press and release (check the server doesn't log `audio_too_short` if you spoke for >1s; if it does, audio isn't reaching the mic — check wiring/`MIC_CHANNEL_LEFT`).
-3. **Barge-in / abort** — start a turn, wait for TTS playback to start (`ws_session` state `SESSION_SPEAKING`), then press the button again mid-playback.
-  - Expect: audio stops immediately, serial shows the abort being sent, server log shows the pipeline cancelled, no further binary frames arrive.
-4. **WiFi drop mid-turn** — start a turn, then power off the WiFi AP (or walk the device out of range) before `tts.end`.
+2. **Seamless follow-up** — after the AI finishes replying, don't tap anything; just start talking again.
+  - Expect serial: `[TTS] END — listening for reply` immediately followed by `[AUTO] AI finished speaking: IDLE → CAPTURING (mic ON)` and a beep, then the same pause-triggers-response flow as turn 1 — no button press needed.
+3. **No-speech give-up** — tap once and just don't say anything for ~4s.
+  - Expect serial: `[VAD] no speech at all — giving up, ending conversation`, `[SESSION] end conversation (no_speech_timeout) → IDLE`, an `abort` sent to the server, then `[TTS] END (no active playback) — back to idle` when the server's abort-cleanup `tts.end` arrives — and the device staying in `SESSION_IDLE`, **not** re-triggering another capture.
+  - Watch the `[VAD] energy=... crest=... zcr=... on=... off=...` lines to tell whether the timeout fired because you were actually silent or the threshold needs tuning for your mic/room. In noise, `crest` and `zcr` should stay below the speech gate until you talk; if `voiced=1` while you're silent, raise `kVoiceOnsetMargin` or `kMinCrestX100` in `ws_session.cpp`.
+4. **Tap to end mid-conversation** — start a turn (or wait for a seamless follow-up window) and tap once instead of speaking.
+  - Expect: `[SESSION] end conversation (user_tap) → IDLE` — capture stops immediately, no turn gets sent.
+5. **Barge-in** — start a turn, wait for TTS playback to start (`ws_session` state `SESSION_SPEAKING`), then tap.
+  - Expect: audio stops immediately (speaker muted, playback queue drained), `[SESSION] end conversation (user_tap) → IDLE`, server log shows the pipeline/response cancelled, no further binary frames arrive.
+6. **WiFi drop mid-turn** — start a turn, then power off the WiFi AP (or walk the device out of range) before `tts.end`.
   - Expect: serial logs `ws disconnected, resetting local session state`; once WiFi/AP returns, the library auto-reconnects and you get a **new** `session ready` with a different session ID (no resume, per the kill-on-disconnect policy in the project plan).
-5. **Repeat turns back to back** — 3-4 consecutive press/release cycles with no errors or stuck state (device should always return to "ready, hold button to talk" behavior, i.e. next press always starts a fresh capture).
+7. **Repeat turns back to back** — 3-4 consecutive tap-started conversations, each with a couple of seamless follow-up turns, with no errors or stuck state.
 
 
 

@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 #include <driver/i2s.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include "config.h"
 #include "protocol.h"
@@ -11,6 +13,9 @@ static const i2s_port_t SPK_PORT = I2S_NUM_1;
 
 static bool s_audioInitialized = false;
 static bool s_speakerActive = false;
+#if HAS_MIC
+static bool s_micRunning = false;
+#endif
 
 void audioIoInit() {
   if (s_audioInitialized) {
@@ -100,17 +105,34 @@ void audioIoInit() {
 }
 
 #if HAS_MIC
-void audioIoMicStart() { i2s_start(MIC_PORT); }
+void audioIoMicStart() {
+  i2s_start(MIC_PORT);
+  s_micRunning = true;
+}
 
-void audioIoMicStop() { i2s_stop(MIC_PORT); }
+void audioIoMicStop() {
+  i2s_stop(MIC_PORT);
+  s_micRunning = false;
+}
+
+bool audioIoMicIsRunning() { return s_micRunning; }
 
 void audioIoPrimeMic() {
+  audioIoVadFilterReset();
   i2s_zero_dma_buffer(MIC_PORT);
+  vTaskDelay(pdMS_TO_TICKS(50));
   static uint8_t trash[COMPANION_UPLINK_FRAME_BYTES];
-  int32_t bestPeak = 0;
-  for (int i = 0; i < 6; i++) {
-    size_t nbytes = audioIoReadUplinkFrame(trash, sizeof(trash));
-    if (nbytes >= sizeof(int16_t)) {
+  int32_t peak = 5000;
+  for (int round = 0; round < 8 && peak > 4000; round++) {
+    for (int i = 0; i < 8; i++) {
+      audioIoReadUplinkFrame(trash, sizeof(trash));
+    }
+    peak = 0;
+    for (int i = 0; i < 4; i++) {
+      size_t nbytes = audioIoReadUplinkFrame(trash, sizeof(trash));
+      if (nbytes < sizeof(int16_t)) {
+        continue;
+      }
       const int16_t *samples = reinterpret_cast<const int16_t *>(trash);
       const size_t count = nbytes / sizeof(int16_t);
       for (size_t j = 0; j < count; j++) {
@@ -118,13 +140,18 @@ void audioIoPrimeMic() {
         if (v < 0) {
           v = -v;
         }
-        if (v > bestPeak) {
-          bestPeak = v;
+        if (v > peak) {
+          peak = v;
         }
       }
     }
   }
-  Serial.printf("audio: mic primed (peak=%ld)\n", static_cast<long>(bestPeak));
+  if (peak > 4000) {
+    Serial.printf("audio: mic primed (peak=%ld — I2S still settling)\n",
+                  static_cast<long>(peak));
+  } else {
+    Serial.printf("audio: mic primed (peak=%ld)\n", static_cast<long>(peak));
+  }
 }
 #endif
 
@@ -218,6 +245,75 @@ static void audioIoPlayTone(int frequencyHz, int durationMs, int amplitude) {
 }
 
 void audioIoSpeakerBeep() { audioIoPlayTone(880, 120, SPEAKER_BEEP_AMPLITUDE); }
+
+// One-pole HPF ~300 Hz @ 16 kHz — attenuates fan/AC rumble for VAD only.
+static constexpr float kVadHpfAlpha = 0.889f;
+static float s_vadHpfPrevIn = 0.0f;
+static float s_vadHpfPrevOut = 0.0f;
+
+void audioIoVadFilterReset() {
+  s_vadHpfPrevIn = 0.0f;
+  s_vadHpfPrevOut = 0.0f;
+}
+
+static int16_t audioIoVadHighPassSample(int16_t sample) {
+  const float x = static_cast<float>(sample);
+  const float y =
+      kVadHpfAlpha * (s_vadHpfPrevOut + x - s_vadHpfPrevIn);
+  s_vadHpfPrevIn = x;
+  s_vadHpfPrevOut = y;
+  if (y > 32767.0f) {
+    return 32767;
+  }
+  if (y < -32768.0f) {
+    return -32768;
+  }
+  return static_cast<int16_t>(y);
+}
+
+AudioFrameVadMetrics audioIoAnalyzeVadFrame(const uint8_t *frame, size_t len) {
+  AudioFrameVadMetrics metrics = {};
+  const int16_t *samples = reinterpret_cast<const int16_t *>(frame);
+  const size_t count = len / sizeof(int16_t);
+  if (count == 0) {
+    return metrics;
+  }
+
+  int64_t sumAbs = 0;
+  uint32_t peak = 0;
+  uint32_t zeroCrossings = 0;
+  int32_t prevSign = 0;
+
+  for (size_t i = 0; i < count; i++) {
+    const int16_t filtered = audioIoVadHighPassSample(samples[i]);
+    const int32_t absFiltered = (filtered < 0) ? -filtered : filtered;
+    sumAbs += absFiltered;
+    if (static_cast<uint32_t>(absFiltered) > peak) {
+      peak = static_cast<uint32_t>(absFiltered);
+    }
+    const int32_t sign =
+        (filtered > 0) ? 1 : ((filtered < 0) ? -1 : 0);
+    if (sign != 0 && prevSign != 0 && sign != prevSign) {
+      zeroCrossings++;
+    }
+    if (sign != 0) {
+      prevSign = sign;
+    }
+  }
+
+  metrics.energy =
+      static_cast<uint32_t>(sumAbs / static_cast<int64_t>(count));
+  metrics.peak = peak;
+  metrics.crestX100 =
+      metrics.energy > 0 ? (peak * 100U) / metrics.energy : 0U;
+  metrics.zcrX1000 =
+      static_cast<uint32_t>((zeroCrossings * 1000ULL) / count);
+  return metrics;
+}
+
+uint32_t audioIoFrameEnergy(const uint8_t *frame, size_t len) {
+  return audioIoAnalyzeVadFrame(frame, len).energy;
+}
 
 void audioIoWriteDownlink(const int16_t *monoSamples, size_t sampleCount) {
   audioIoSpeakerEnsureStarted();

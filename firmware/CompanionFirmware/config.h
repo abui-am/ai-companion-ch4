@@ -1,19 +1,13 @@
 #pragma once
 
-// Edge Impulse wake-word model adds ~400 KB — sketch is ~1.7 MB total.
-// Default ESP32/ESP32-S3 partition is only ~1.2 MB app; before upload set:
-//   Tools → Partition Scheme → Huge APP (3MB No OTA/1MB SPIFFS)
-// or, if you need OTA: Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS).
-// Both fit a standard 4MB flash module. NOTE: changing Tools → Board resets
-// this menu back to the 1.2 MB default — re-check it after every board
-// change or you'll see "text section exceeds available space in board".
+// Arduino IDE: Tools → PSRAM → QSPI PSRAM (CoreS3 and most ESP32-S3 boards).
 
 // Fill these in before flashing. Mirrors the showcase-phase auth model in
 // the plan: shared compile-time token, no rotation, LAN-only.
-#define WIFI_SSID "Wifi iuran"
-#define WIFI_PASSWORD "sekgangguan"
+#define WIFI_SSID "sayaMayunnn"
+#define WIFI_PASSWORD "1234567890"
 
-#define COMPANION_SERVER_HOST "192.168.1.3"
+#define COMPANION_SERVER_HOST "10.156.248.98"
 #define COMPANION_SERVER_PORT 8080
 #define COMPANION_SERVER_PATH "/ws"
 #define COMPANION_USE_TLS false // true => wss:// (beginSSL)
@@ -23,7 +17,9 @@
   "O6k4xgaZBLhPHCbzsbZqiyFcPvM7LfsCrw7fdgjy4wWLW8urQ0ERSgWHoXTKDyB1"
 
 // Touch sensor (TTP223 etc.): HIGH when touched.
-// Tap once to start listening, tap again to stop.
+// Tap once to start a conversation; tap again anytime to end it (including
+// barging in mid AI-reply). Turns in between are automatic — see
+// ws_session.cpp's silence-based VAD turn-taking.
 #define PIN_BUTTON 11
 #define TOUCH_THRESHOLD 40 // unused for digital touch modules; kept for compat
 
@@ -34,7 +30,7 @@
 #define PIN_MIC_WS 4    // WS
 #define PIN_MIC_DIN 13  // SD / DIN
 #define MIC_CHANNEL_LEFT true
-// INMP441 gain: increase to reduce clipping (try 15–16), decrease if too quiet.
+// Voice uplink / capture — tuned for server STT.
 #define MIC_DATA_SHIFT 14
 
 // Speaker amp (I2S TX) — MAX98357A.
@@ -44,4 +40,4 @@
 
 // Speaker output boost (max amplitude ~32767). Lower if you hear clipping.
 #define SPEAKER_BEEP_AMPLITUDE 8000
-#define SPEAKER_PLAYBACK_GAIN 0.5
+#define SPEAKER_PLAYBACK_GAIN 1.5

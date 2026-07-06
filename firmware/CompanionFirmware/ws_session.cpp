@@ -13,26 +13,25 @@
 #include "config.h"
 #include "pcm_codec.h"
 #include "protocol.h"
-#include "wake_word.h"
 
 enum SessionState {
-    SESSION_IDLE,
-    SESSION_CAPTURING,
-    SESSION_PROCESSING,
-    SESSION_SPEAKING,
+  SESSION_IDLE,
+  SESSION_CAPTURING,
+  SESSION_PROCESSING,
+  SESSION_SPEAKING,
 };
 
 struct PlaybackChunk {
-    size_t len;
-    uint8_t data[COMPANION_DOWNLINK_FRAME_BYTES];
+  size_t len;
+  uint8_t data[COMPANION_DOWNLINK_FRAME_BYTES];
 };
 
 // Uplink capture chunk. len == 0 is a sentinel meaning "capture ended, flush
 // and send audio.stop" — lets uplinkSendTask know when to close out a turn
 // without needing a second cross-task signal.
 struct CaptureChunk {
-    size_t len;
-    uint8_t data[COMPANION_UPLINK_FRAME_BYTES];
+  size_t len;
+  uint8_t data[COMPANION_UPLINK_FRAME_BYTES];
 };
 
 static constexpr UBaseType_t kPlaybackQueueDepth = 12;
@@ -57,21 +56,28 @@ static constexpr int kDownlinkFrameMs = COMPANION_FRAME_MS;
 // captureTask must never block longer than that on network I/O (drop-oldest).
 //
 // Observed uplink durations (server debug WAVs, n≈40):
-//   p50 ≈ 2.6 s (43 frames)   p90 ≈ 8.2 s (136 frames)   max ≈ 19 s (316 frames)
+//   p50 ≈ 2.6 s (43 frames)   p90 ≈ 8.2 s (136 frames)   max ≈ 19 s (316
+//   frames)
 //
 // Observed stall (queue=24, 115 captured / 86 sent / 29 dropped):
 //   sender averaged ~75% of capture rate → backlog ≈ 29 frames minimum depth.
 //
-// Worst-case single send stall: WEBSOCKETS_TCP_TIMEOUT ≈ 5 s → 5000/60 ≈ 84 frames.
-// Target depth = stall_budget + margin, capped below p90 recording when sender is
-// fully blocked (full-session buffering would need 136+ frames / 260 KB+).
+// Worst-case single send stall: WEBSOCKETS_TCP_TIMEOUT ≈ 5 s → 5000/60 ≈ 84
+// frames. Target depth = stall_budget + margin, capped below p90 recording when
+// sender is fully blocked (full-session buffering would need 136+ frames / 260
+// KB+).
+//
+// No wake-word classifier anymore, so there's no internal-RAM DSP scratch to
+// protect — the queue can use whatever internal RAM is actually free, and the
+// cap is raised well past the old wake-word-constrained ceiling.
 static constexpr int kUplinkFrameMs = COMPANION_FRAME_MS;
 static constexpr int kUplinkTcpStallMs = 5000;
 static constexpr int kUplinkQueueStallMarginFrames = 12;
 static constexpr int kUplinkQueueTargetDepth =
     (kUplinkTcpStallMs / kUplinkFrameMs) + kUplinkQueueStallMarginFrames; // 96
-static constexpr int kUplinkQueueMaxDepth = 128; // ~7.7 s @ zero send; covers observed ~115-frame turns
-static constexpr int kUplinkQueueMinDepth = 32;  // ~1.9 s; below this, drops are likely on LAN
+static constexpr int kUplinkQueueMaxDepth = 256; // ~15.4 s @ zero send
+static constexpr int kUplinkQueueMinDepth =
+    16; // ~1 s; used when memory is tight
 
 static constexpr int kUplinkSendBatchMax = 4;
 static constexpr int kUplinkQueueSendWaitMs = 45;
@@ -85,6 +91,14 @@ static SessionState s_state = SESSION_IDLE;
 static String s_sessionId;
 static volatile bool s_sessionReady = false;
 static volatile bool s_playbackNeedPrefill = true;
+
+// Given by captureTask once the mic is actually running (started + primed
+// if it was cold) and the uplink queue/turn state are reset for a new
+// capture — see the CAPTURING-entry block below. postAudioStartAndBeep()
+// waits on this before cueing the user with the beep, so the beep can't
+// fire while the mic is still cold-starting (e.g. right after the AI
+// finishes speaking, when the mic has to restart from OFF).
+static SemaphoreHandle_t s_micReadySem = nullptr;
 
 // Recursive: flushWebSocket() holds this across s_webSocket.loop(), which can
 // synchronously invoke webSocketEvent() (e.g. on CONNECTED/TEXT) — and that
@@ -104,222 +118,385 @@ static int s_turnCaptured = 0;
 static int s_turnDropped = 0;
 
 static SessionState getState() {
-    xSemaphoreTake(s_stateMutex, portMAX_DELAY);
-    SessionState s = s_state;
-    xSemaphoreGive(s_stateMutex);
-    return s;
+  xSemaphoreTake(s_stateMutex, portMAX_DELAY);
+  SessionState s = s_state;
+  xSemaphoreGive(s_stateMutex);
+  return s;
 }
 
 static void setState(SessionState s) {
-    xSemaphoreTake(s_stateMutex, portMAX_DELAY);
-    s_state = s;
-    xSemaphoreGive(s_stateMutex);
+  xSemaphoreTake(s_stateMutex, portMAX_DELAY);
+  s_state = s;
+  xSemaphoreGive(s_stateMutex);
 }
 
 static void drainPlaybackQueue() {
-    if (s_playbackQueue == nullptr) {
-        return;
-    }
-    PlaybackChunk chunk;
-    while (xQueueReceive(s_playbackQueue, &chunk, 0) == pdTRUE) {
-    }
-    s_playbackNeedPrefill = true;
+  if (s_playbackQueue == nullptr) {
+    return;
+  }
+  PlaybackChunk chunk;
+  while (xQueueReceive(s_playbackQueue, &chunk, 0) == pdTRUE) {
+  }
+  s_playbackNeedPrefill = true;
 }
 
 static void drainUplinkQueue() {
-    if (s_uplinkQueue == nullptr) {
-        return;
-    }
-    CaptureChunk chunk;
-    while (xQueueReceive(s_uplinkQueue, &chunk, 0) == pdTRUE) {
-    }
+  if (s_uplinkQueue == nullptr) {
+    return;
+  }
+  CaptureChunk chunk;
+  while (xQueueReceive(s_uplinkQueue, &chunk, 0) == pdTRUE) {
+  }
 }
 
 static bool createUplinkQueueAtDepth(UBaseType_t depth, bool preferPsram) {
-    const size_t storageBytes =
-        static_cast<size_t>(depth) * sizeof(CaptureChunk);
+  const size_t storageBytes = static_cast<size_t>(depth) * sizeof(CaptureChunk);
 
-    uint8_t *storage = static_cast<uint8_t *>(heap_caps_malloc(
-        storageBytes,
-        preferPsram ? (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
-                    : (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
-    if (storage == nullptr) {
-        return false;
-    }
+  uint8_t *storage = static_cast<uint8_t *>(heap_caps_malloc(
+      storageBytes, preferPsram ? (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+                                : (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+  if (storage == nullptr) {
+    return false;
+  }
 
-    StaticQueue_t *qstruct = static_cast<StaticQueue_t *>(
-        heap_caps_malloc(sizeof(StaticQueue_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    if (qstruct == nullptr) {
-        heap_caps_free(storage);
-        return false;
-    }
+  StaticQueue_t *qstruct = static_cast<StaticQueue_t *>(heap_caps_malloc(
+      sizeof(StaticQueue_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (qstruct == nullptr) {
+    heap_caps_free(storage);
+    return false;
+  }
 
-    QueueHandle_t q =
-        xQueueCreateStatic(depth, sizeof(CaptureChunk), storage, qstruct);
-    if (q == nullptr) {
-        heap_caps_free(storage);
-        heap_caps_free(qstruct);
-        return false;
-    }
+  QueueHandle_t q =
+      xQueueCreateStatic(depth, sizeof(CaptureChunk), storage, qstruct);
+  if (q == nullptr) {
+    heap_caps_free(storage);
+    heap_caps_free(qstruct);
+    return false;
+  }
 
-    s_uplinkQueue = q;
-    s_uplinkQueueStorage = storage;
-    s_uplinkQueueStruct = qstruct;
-    s_uplinkQueueDepth = depth;
-    Serial.printf(
-        "[AUDIO] uplink queue ok depth=%u (~%u ms, %u bytes, %s)\n",
-        static_cast<unsigned>(depth),
-        static_cast<unsigned>(depth * COMPANION_FRAME_MS),
-        static_cast<unsigned>(storageBytes),
-        esp_ptr_external_ram(storage) ? "PSRAM" : "internal");
-    return true;
+  s_uplinkQueue = q;
+  s_uplinkQueueStorage = storage;
+  s_uplinkQueueStruct = qstruct;
+  s_uplinkQueueDepth = depth;
+  Serial.printf("[AUDIO] uplink queue ok depth=%u (~%u ms, %u bytes, %s)\n",
+                static_cast<unsigned>(depth),
+                static_cast<unsigned>(depth * COMPANION_FRAME_MS),
+                static_cast<unsigned>(storageBytes),
+                esp_ptr_external_ram(storage) ? "PSRAM" : "internal");
+  return true;
 }
 
 static bool createUplinkQueue() {
-    const size_t chunkBytes = sizeof(CaptureChunk);
-    const size_t psramBlock =
-        heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    const size_t internalBlock =
-        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t chunkBytes = sizeof(CaptureChunk);
+  const size_t psramBlock =
+      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  const size_t internalBlock =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
-    int depthByPsram =
-        psramBlock > chunkBytes
-            ? static_cast<int>((psramBlock * 9 / 10) / chunkBytes)
-            : 0;
-    int depthByInternal =
-        internalBlock > chunkBytes + 8192
-            ? static_cast<int>(((internalBlock - 8192) * 9 / 10) / chunkBytes)
-            : 0;
+  int depthByPsram = psramBlock > chunkBytes
+                         ? static_cast<int>((psramBlock * 9 / 10) / chunkBytes)
+                         : 0;
+  int depthByInternal =
+      internalBlock > chunkBytes
+          ? static_cast<int>((internalBlock * 9 / 10) / chunkBytes)
+          : 0;
 
-    int tryMax = kUplinkQueueMaxDepth;
-    if (depthByPsram > 0 && depthByPsram < tryMax) {
-        tryMax = depthByPsram;
-    } else if (depthByInternal > 0 && depthByPsram == 0 && depthByInternal < tryMax) {
-        tryMax = depthByInternal;
+  int tryMax = kUplinkQueueMaxDepth;
+  if (depthByPsram > 0 && depthByPsram < tryMax) {
+    tryMax = depthByPsram;
+  } else if (depthByPsram == 0 && depthByInternal > 0 &&
+             depthByInternal < tryMax) {
+    tryMax = depthByInternal;
+  }
+
+  Serial.printf("[AUDIO] uplink queue sizing: target=%d max=%d min=%d chunk=%u "
+                "psram=%u internal=%u heap=%u\n",
+                kUplinkQueueTargetDepth, tryMax, kUplinkQueueMinDepth,
+                static_cast<unsigned>(chunkBytes),
+                static_cast<unsigned>(psramBlock),
+                static_cast<unsigned>(internalBlock),
+                static_cast<unsigned>(ESP.getFreeHeap()));
+
+  for (int depth = tryMax; depth >= kUplinkQueueMinDepth; depth -= 8) {
+    if (createUplinkQueueAtDepth(static_cast<UBaseType_t>(depth), true)) {
+      return true;
     }
-
+    if (createUplinkQueueAtDepth(static_cast<UBaseType_t>(depth), false)) {
+      return true;
+    }
     Serial.printf(
-        "[AUDIO] uplink queue sizing: target=%d max=%d min=%d chunk=%u psram=%u internal=%u heap=%u\n",
-        kUplinkQueueTargetDepth, tryMax, kUplinkQueueMinDepth,
-        static_cast<unsigned>(chunkBytes),
-        static_cast<unsigned>(psramBlock),
-        static_cast<unsigned>(internalBlock),
-        static_cast<unsigned>(ESP.getFreeHeap()));
+        "[AUDIO] uplink queue alloc failed depth=%d (need %u bytes)\n", depth,
+        static_cast<unsigned>(depth * chunkBytes));
+  }
 
-    for (int depth = tryMax; depth >= kUplinkQueueMinDepth; depth -= 8) {
-        if (createUplinkQueueAtDepth(static_cast<UBaseType_t>(depth), true)) {
-            return true;
-        }
-        if (createUplinkQueueAtDepth(static_cast<UBaseType_t>(depth), false)) {
-            return true;
-        }
-        Serial.printf(
-            "[AUDIO] uplink queue alloc failed depth=%d (need %u bytes)\n",
-            depth, static_cast<unsigned>(depth * chunkBytes));
-    }
+  Serial.println("[AUDIO] FATAL: uplink queue unavailable — mic will send "
+                 "inline (degraded)");
+  return false;
+}
 
-    Serial.println("[AUDIO] FATAL: uplink queue unavailable — mic will send inline (degraded)");
-    return false;
+// Uplink queue is sized off free heap at first-capture time; allocate lazily
+// rather than at boot so it can claim whatever RAM is actually available.
+static void ensureUplinkQueue() {
+  if (s_uplinkQueue != nullptr) {
+    return;
+  }
+  Serial.printf("[AUDIO] lazy uplink queue alloc heap=%u psram=%u\n",
+                static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(ESP.getFreePsram()));
+  if (!createUplinkQueue()) {
+    Serial.println(
+        "[MIC] uplink queue unavailable — inline send for this turn");
+  }
 }
 
 static void sendText(const String &text) {
-    xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
-    if (s_webSocket.isConnected()) {
-        String copy = text;
-        s_webSocket.sendTXT(copy);
-    }
-    xSemaphoreGiveRecursive(s_wsSendMutex);
+  xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
+  if (s_webSocket.isConnected()) {
+    String copy = text;
+    s_webSocket.sendTXT(copy);
+  }
+  xSemaphoreGiveRecursive(s_wsSendMutex);
 }
 
 static void sendTextAndFlush(const String &text) {
-    xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
-    if (s_webSocket.isConnected()) {
-        String copy = text;
-        s_webSocket.sendTXT(copy);
-        s_webSocket.loop();
-    }
-    xSemaphoreGiveRecursive(s_wsSendMutex);
+  xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
+  if (s_webSocket.isConnected()) {
+    String copy = text;
+    s_webSocket.sendTXT(copy);
+    s_webSocket.loop();
+  }
+  xSemaphoreGiveRecursive(s_wsSendMutex);
 }
 
 // Send one uplink PCM frame; loop() after each BIN so the WebSockets library
 // actually pushes the frame (batching multiple sendBIN before one loop() was
 // leaving frames stuck in the client buffer).
 static int sendUplinkFrame(const uint8_t *data, size_t len) {
-    if (len == 0) {
-        return 0;
-    }
-    xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
-    int sent = 0;
-    if (s_webSocket.isConnected()) {
-        s_webSocket.sendBIN(data, len);
-        s_webSocket.loop();
-        sent = 1;
-    }
-    xSemaphoreGiveRecursive(s_wsSendMutex);
-    return sent;
+  if (len == 0) {
+    return 0;
+  }
+  xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
+  int sent = 0;
+  if (s_webSocket.isConnected()) {
+    s_webSocket.sendBIN(data, len);
+    s_webSocket.loop();
+    sent = 1;
+  }
+  xSemaphoreGiveRecursive(s_wsSendMutex);
+  return sent;
 }
 
 static int sendBinaryBatch(const CaptureChunk *chunks, int count) {
-    if (count <= 0) {
-        return 0;
+  if (count <= 0) {
+    return 0;
+  }
+  int sent = 0;
+  for (int i = 0; i < count; i++) {
+    if (chunks[i].len == 0) {
+      break;
     }
-    int sent = 0;
-    for (int i = 0; i < count; i++) {
-        if (chunks[i].len == 0) {
-            break;
-        }
-        sent += sendUplinkFrame(chunks[i].data, chunks[i].len);
-    }
-    return sent;
+    sent += sendUplinkFrame(chunks[i].data, chunks[i].len);
+  }
+  return sent;
 }
 
 static void flushWebSocket() {
-    // Recursive mutex: safe even though loop() can re-enter sendText/
-    // sendBinary synchronously via webSocketEvent() on the same task.
-    xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
-    s_webSocket.loop();
-    xSemaphoreGiveRecursive(s_wsSendMutex);
+  // Recursive mutex: safe even though loop() can re-enter sendText/
+  // sendBinary synchronously via webSocketEvent() on the same task.
+  xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
+  s_webSocket.loop();
+  xSemaphoreGiveRecursive(s_wsSendMutex);
 }
 
 static void flushWebSocketRepeated(int count, int delayMs) {
-    for (int i = 0; i < count; i++) {
-        flushWebSocket();
-        vTaskDelay(pdMS_TO_TICKS(delayMs));
-    }
+  for (int i = 0; i < count; i++) {
+    flushWebSocket();
+    vTaskDelay(pdMS_TO_TICKS(delayMs));
+  }
 }
 
-// MARK: - IDLE -> CAPTURING transition (shared by button + wake word)
+// MARK: - Seamless turn-taking, bookended by taps
+//
+// One tap starts a conversation; from then on it runs hands-free — talk,
+// pause, the AI answers, talk again — until another tap ends it (or, as a
+// safety net, the user never says anything at all). No wake word.
+//
+//   tap -> talk -> silence ~1s -> AI answers -> talk -> silence ~1s -> AI
+//   answers -> ... -> tap (ends it any time, including mid AI-reply)
+static constexpr uint32_t kEndOfSpeechSilenceMs =
+    1000; // pause after speech -> send turn to AI
+static constexpr uint32_t kNoSpeechTimeoutMs =
+    4000; // never spoke at all -> give up, end conversation
+
+// A fixed amplitude threshold gets fooled by room noise (fans/AC/etc. — see
+// docs/WAKE_WORD_DEBUG_REPORT.md, the "noise" label dominated 0.7-0.95 of
+// the old wake-word classifier's output for the same reason). Instead track
+// a slow-moving noise floor from frames that *aren't* speech, and require
+// several consecutive speech-like frames above floor+onset margin before
+// latching voice. Hysteresis (higher onset, lower offset) plus crest factor
+// and zero-crossing rate reject steady HVAC noise that shares amplitude with
+// speech but not its dynamics.
+static constexpr float kNoiseFloorRiseAlpha =
+    0.04f; // EMA smoothing when a non-voiced frame is *louder* than the floor
+static constexpr uint32_t kNoiseFloorMin =
+    80; // clamp so a silent room doesn't zero the margin
+static constexpr uint32_t kNoiseFloorMax =
+    550; // cap runaway floor inflation in loud ambient rooms
+static constexpr uint32_t kVoiceOnsetMargin =
+    450; // filtered energy must clear floor + this to start speech
+static constexpr uint32_t kVoiceOffsetMargin =
+    150; // once latched, lower bar keeps soft trailing syllables alive
+static constexpr uint32_t kVoiceOnsetMinFrames =
+    3; // consecutive speech-like frames (~180ms @ 60ms frames)
+static constexpr uint32_t kFloorSeedFrames =
+    3; // minimum of this many frames for initial floor (floor also warms in IDLE)
+static constexpr uint32_t kMinCrestX100 =
+    220; // peak/mean >= 2.2 — speech is spikier than steady fan hum
+static constexpr uint32_t kMinOffsetCrestX100 =
+    140; // looser crest gate while latched — still rejects flat HVAC hum
+static constexpr uint32_t kMinZcrX1000 =
+    55; // ~5.5% crossings — rejects low-frequency rumble
+
+static bool vadFrameLooksLikeSpeech(const AudioFrameVadMetrics &metrics) {
+  return metrics.crestX100 >= kMinCrestX100 &&
+         metrics.zcrX1000 >= kMinZcrX1000;
+}
+
+static void vadTrackNoiseFloor(uint32_t frameEnergy, float &noiseFloor) {
+  if (frameEnergy < static_cast<uint32_t>(noiseFloor)) {
+    noiseFloor = static_cast<float>(frameEnergy);
+  } else {
+    noiseFloor +=
+        (static_cast<float>(frameEnergy) - noiseFloor) * kNoiseFloorRiseAlpha;
+  }
+  if (noiseFloor < static_cast<float>(kNoiseFloorMin)) {
+    noiseFloor = static_cast<float>(kNoiseFloorMin);
+  }
+  if (noiseFloor > static_cast<float>(kNoiseFloorMax)) {
+    noiseFloor = static_cast<float>(kNoiseFloorMax);
+  }
+}
+
+// Updates the adaptive noise floor and reports whether this frame counts as
+// active voice for silence-timer purposes. `noiseFloor`/`seedCount`/
+// `onsetStreak` persist across calls; pass `speechLatched=true` once the user
+// has started speaking this turn so offset (not onset) thresholds apply.
+static bool vadUpdate(const AudioFrameVadMetrics &metrics, float &noiseFloor,
+                      uint32_t &seedCount, uint32_t &onsetStreak,
+                      bool speechLatched) {
+  const uint32_t energy = metrics.energy;
+
+  if (seedCount < kFloorSeedFrames) {
+    // Minimum, not average, while seeding — a single loud transient
+    // right after mic prime/beep/button-tap can otherwise drag the
+    // "floor" well above the real ambient level for many seconds
+    // (observed: seeded at 1390 while actual ambient was ~150-300,
+    // silently eating real speech under the inflated threshold).
+    if (seedCount == 0 || energy < static_cast<uint32_t>(noiseFloor)) {
+      noiseFloor = static_cast<float>(energy);
+    }
+    seedCount++;
+    onsetStreak = 0;
+    return false;
+  }
+
+  const uint32_t onsetThreshold =
+      static_cast<uint32_t>(noiseFloor) + kVoiceOnsetMargin;
+  const uint32_t offsetThreshold =
+      static_cast<uint32_t>(noiseFloor) + kVoiceOffsetMargin;
+  const bool meetsOnset = energy >= onsetThreshold &&
+                          vadFrameLooksLikeSpeech(metrics);
+  const bool meetsOffset =
+      energy >= offsetThreshold && metrics.crestX100 >= kMinOffsetCrestX100;
+
+  bool isVoiceFrame = false;
+  if (speechLatched) {
+    isVoiceFrame = meetsOffset;
+    if (!isVoiceFrame) {
+      vadTrackNoiseFloor(energy, noiseFloor);
+    }
+  } else if (meetsOnset) {
+    onsetStreak++;
+    isVoiceFrame = onsetStreak >= kVoiceOnsetMinFrames;
+  } else {
+    onsetStreak = 0;
+    vadTrackNoiseFloor(energy, noiseFloor);
+  }
+
+  return isVoiceFrame;
+}
+
+// MARK: - IDLE -> CAPTURING transition
+
+static constexpr int kMicReadyWaitMs = 2000;
+
+static void postAudioStartAndBeep(const char *trigger) {
+  sendTextAndFlush(protocolBuildAudioStart());
+  // Clear any stale signal (e.g. left over if a previous wait here timed
+  // out) before waiting for this turn's actual "mic ready" give.
+  xSemaphoreTake(s_micReadySem, 0);
+  if (xSemaphoreTake(s_micReadySem, pdMS_TO_TICKS(kMicReadyWaitMs)) != pdTRUE) {
+    Serial.println("[MIC] WARNING: mic-ready wait timed out — beeping anyway");
+  }
+  audioIoSpeakerBeep();
+  Serial.printf("%s: IDLE → CAPTURING (mic ON)\n", trigger);
+}
+
+static void captureKickoffTask(void *arg) {
+  postAudioStartAndBeep(static_cast<const char *>(arg));
+  vTaskDelete(nullptr);
+}
+
+static void kickoffCaptureAsync(const char *trigger) {
+  setState(SESSION_CAPTURING);
+  xTaskCreate(captureKickoffTask, "capture_kick", 4096,
+              const_cast<char *>(trigger), 10, nullptr);
+}
 
 static void startListening(const char *trigger) {
-    setState(SESSION_CAPTURING);
-    sendTextAndFlush(protocolBuildAudioStart());
-    Serial.printf("%s: IDLE → CAPTURING (mic ON)\n", trigger);
-    audioIoSpeakerBeep();
+  setState(SESSION_CAPTURING);
+  postAudioStartAndBeep(trigger);
+}
+
+// Ends the whole conversation right now: tells the server (so it cancels
+// any in-flight response instead of being left waiting on a turn that's
+// never coming — see cancelResponse()'s activeTurnResponseId guard on the
+// server side), clears local audio state, and goes back to idle. Used both
+// for a deliberate tap-to-end and for the no-speech safety timeout.
+static void endConversation(const char *reason) {
+  sendTextAndFlush(protocolBuildAbort(s_sessionId, reason));
+  drainPlaybackQueue();
+  drainUplinkQueue();
+  audioIoSpeakerMute();
+  setState(SESSION_IDLE);
+  Serial.printf("[SESSION] end conversation (%s) → IDLE\n", reason);
 }
 
 static void finishCaptureSession(int frameCount, int droppedCount) {
 #if HAS_MIC
-    audioIoMicStop();
+  audioIoMicStop();
 #endif
-    Serial.printf("[MIC] capture stopped, captured %d frames from mic", frameCount);
-    if (droppedCount > 0) {
-        Serial.printf(" (%d dropped before send)\n", droppedCount);
-    } else {
-        Serial.println();
-    }
-    if (s_uplinkQueue != nullptr) {
-        CaptureChunk endMarker = {};
-        endMarker.len = 0;
-        s_turnCaptured = frameCount;
-        s_turnDropped = droppedCount;
-        xQueueSend(s_uplinkQueue, &endMarker, portMAX_DELAY);
-    } else if (getState() == SESSION_PROCESSING) {
-        sendTextAndFlush(protocolBuildAudioStop());
-        Serial.printf("[MIC] uplink inline: sent %d frames to server\n", frameCount);
-    }
+  Serial.printf("[MIC] capture stopped, captured %d frames from mic",
+                frameCount);
+  if (droppedCount > 0) {
+    Serial.printf(" (%d dropped before send)\n", droppedCount);
+  } else {
+    Serial.println();
+  }
+  if (s_uplinkQueue != nullptr) {
+    CaptureChunk endMarker = {};
+    endMarker.len = 0;
+    s_turnCaptured = frameCount;
+    s_turnDropped = droppedCount;
+    xQueueSend(s_uplinkQueue, &endMarker, portMAX_DELAY);
+  } else if (getState() == SESSION_PROCESSING) {
+    sendTextAndFlush(protocolBuildAudioStop());
+    Serial.printf("[MIC] uplink inline: sent %d frames to server\n",
+                  frameCount);
+  }
 }
 
-// MARK: - Capture (uplink) + wake-word listening
+// MARK: - Capture (uplink)
 //
 // Reading the mic and sending over the network used to happen in the same
 // loop iteration (read → sendBIN → loop()). sendBIN() blocks the calling
@@ -331,423 +508,514 @@ static void finishCaptureSession(int frameCount, int droppedCount) {
 // owns all the network I/O, so a slow/stalled socket write no longer blocks
 // mic reads.
 //
-// While idle (and session-ready) this task also feeds the Edge Impulse
-// wake-word classifier on the same mic stream.
+// No wake word: capture starts on a tap or automatically right after the AI
+// finishes speaking (see PROTO_MSG_TTS_END). While capturing, this task also
+// runs the adaptive noise-floor VAD (see vadUpdate() above) to decide when
+// the turn is over — kEndOfSpeechSilenceMs / kNoSpeechTimeoutMs.
 
 static void captureTask(void *arg) {
-    (void)arg;
-    static uint8_t frame[COMPANION_UPLINK_FRAME_BYTES];
-    int frameCount = 0;
-    int droppedCount = 0;
-    SessionState lastState = SESSION_IDLE;
-    bool micActive = false;
+  (void)arg;
+  static uint8_t frame[COMPANION_UPLINK_FRAME_BYTES];
+  int frameCount = 0;
+  int droppedCount = 0;
+  SessionState lastState = SESSION_IDLE;
+  bool micActive = false;
+  uint32_t turnStartMs = 0;
+  uint32_t lastVoiceMs = 0;
+  bool heardVoiceThisTurn = false;
+  // Adaptive VAD state — persists across IDLE/CAPTURING so the noise floor
+  // keeps tracking the room even between turns; onsetStreak resets per turn.
+  float noiseFloor = 0.0f;
+  uint32_t noiseFloorSeedCount = 0;
+  uint32_t onsetStreak = 0;
+  uint32_t vadLogCounter = 0;
 
-    while (true) {
-        SessionState s = getState();
+  while (true) {
+    SessionState s = getState();
 
-        if (lastState == SESSION_CAPTURING && s != SESSION_CAPTURING) {
-            finishCaptureSession(frameCount, droppedCount);
-            frameCount = 0;
-            droppedCount = 0;
-        }
-
-        if (s == SESSION_PROCESSING || s == SESSION_SPEAKING) {
-            if (micActive) {
-#if HAS_MIC
-                audioIoMicStop();
-#endif
-                micActive = false;
-            }
-            lastState = s;
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
-
-        if (!micActive) {
-#if HAS_MIC
-            audioIoMicStart();
-#endif
-            micActive = true;
-        }
-
-        if (s == SESSION_CAPTURING && lastState != SESSION_CAPTURING) {
-            drainUplinkQueue();
-            frameCount = 0;
-            droppedCount = 0;
-#if HAS_MIC
-            audioIoPrimeMic();
-#endif
-            Serial.println("[MIC] capture session started");
-            Serial.printf("[MIC] queue=%p heap=%u\n", s_uplinkQueue,
-                          static_cast<unsigned>(ESP.getFreeHeap()));
-        }
-
-        lastState = s;
-
-        size_t n = audioIoReadUplinkFrame(frame, sizeof(frame));
-        if (n == 0) {
-            continue;
-        }
-
-        switch (s) {
-        case SESSION_IDLE:
-            if (s_sessionReady &&
-                wakeWordFeed(reinterpret_cast<const int16_t *>(frame),
-                             n / sizeof(int16_t))) {
-                startListening("[WAKE] \"hey_botchill\" detected");
-            }
-            break;
-        case SESSION_CAPTURING:
-            if (n != COMPANION_UPLINK_FRAME_BYTES) {
-                vTaskDelay(pdMS_TO_TICKS(5));
-                break;
-            }
-            if (s_uplinkQueue == nullptr) {
-                sendUplinkFrame(frame, n);
-                frameCount++;
-                break;
-            }
-            CaptureChunk chunk;
-            chunk.len = n;
-            memcpy(chunk.data, frame, n);
-            if (xQueueSend(s_uplinkQueue, &chunk, pdMS_TO_TICKS(kUplinkQueueSendWaitMs)) != pdTRUE) {
-                CaptureChunk discard;
-                xQueueReceive(s_uplinkQueue, &discard, 0);
-                xQueueSend(s_uplinkQueue, &chunk, 0);
-                droppedCount++;
-                if (droppedCount == 1 || droppedCount % kUplinkDropLogInterval == 0) {
-                    Serial.printf(
-                        "[MIC] uplink queue full — dropped oldest frame (network stalled, total=%d)\n",
-                        droppedCount);
-                }
-            }
-            frameCount++;
-            break;
-        case SESSION_PROCESSING:
-        case SESSION_SPEAKING:
-            break;
-        }
+    if (lastState == SESSION_CAPTURING && s != SESSION_CAPTURING) {
+      finishCaptureSession(frameCount, droppedCount);
+      frameCount = 0;
+      droppedCount = 0;
     }
+
+    if (s == SESSION_PROCESSING || s == SESSION_SPEAKING) {
+      if (micActive) {
+#if HAS_MIC
+        audioIoMicStop();
+#endif
+        micActive = false;
+      }
+      lastState = s;
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+    if (!micActive) {
+#if HAS_MIC
+      audioIoMicStart();
+      audioIoPrimeMic();
+#endif
+      micActive = true;
+    }
+
+    if (s == SESSION_CAPTURING && lastState != SESSION_CAPTURING) {
+      ensureUplinkQueue();
+      drainUplinkQueue();
+      frameCount = 0;
+      droppedCount = 0;
+      // No re-prime here: the mic has been running continuously since IDLE
+      // (see the !micActive prime above, which only fires on a cold
+      // start/restart). Re-priming on every CAPTURING entry used to also
+      // reset the wake-word classifier's MFCC window — now that wake word
+      // is gone, it did nothing but discard ~0.5-0.8s of real audio right
+      // after the beep (up to 8 rounds x 12 blocking 60ms frame reads),
+      // eating the start of whatever the user said first.
+      // Start the no-speech timeout right away, since there's no priming
+      // delay to wait out anymore.
+      turnStartMs = millis();
+      lastVoiceMs = 0;
+      heardVoiceThisTurn = false;
+      onsetStreak = 0;
+      audioIoVadFilterReset();
+      Serial.println("[MIC] capture session started");
+      Serial.printf("[MIC] queue=%p heap=%u\n", s_uplinkQueue,
+                    static_cast<unsigned>(ESP.getFreeHeap()));
+      // Mic + queue are ready for real frames now — let the beep fire.
+      xSemaphoreGive(s_micReadySem);
+    }
+
+    lastState = s;
+
+    size_t n = audioIoReadUplinkFrame(frame, sizeof(frame));
+    if (n == 0) {
+      continue;
+    }
+
+    switch (s) {
+    case SESSION_IDLE: {
+      // No turn in progress — just keep the noise floor adapted so
+      // it's already warm when a turn actually starts.
+      uint32_t idleStreak = 0;
+      const AudioFrameVadMetrics idleMetrics =
+          audioIoAnalyzeVadFrame(frame, n);
+      vadUpdate(idleMetrics, noiseFloor, noiseFloorSeedCount, idleStreak,
+                false);
+      break;
+    }
+    case SESSION_CAPTURING: {
+      if (n != COMPANION_UPLINK_FRAME_BYTES) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        break;
+      }
+
+      const AudioFrameVadMetrics metrics = audioIoAnalyzeVadFrame(frame, n);
+      uint32_t nowMs = millis();
+      if (vadUpdate(metrics, noiseFloor, noiseFloorSeedCount, onsetStreak,
+                    heardVoiceThisTurn)) {
+        lastVoiceMs = nowMs;
+        heardVoiceThisTurn = true;
+      }
+      // ~1 line/sec so the threshold/margin can be tuned from serial
+      // logs without drowning them.
+      if ((vadLogCounter++ % 16) == 0) {
+        const uint32_t onsetThr =
+            static_cast<uint32_t>(noiseFloor) + kVoiceOnsetMargin;
+        const uint32_t offsetThr =
+            static_cast<uint32_t>(noiseFloor) + kVoiceOffsetMargin;
+        Serial.printf(
+            "[VAD] energy=%u peak=%u crest=%u zcr=%u floor=%d "
+            "on=%u off=%u streak=%u voiced=%d\n",
+            static_cast<unsigned>(metrics.energy),
+            static_cast<unsigned>(metrics.peak),
+            static_cast<unsigned>(metrics.crestX100),
+            static_cast<unsigned>(metrics.zcrX1000),
+            static_cast<int>(noiseFloor), static_cast<unsigned>(onsetThr),
+            static_cast<unsigned>(offsetThr),
+            static_cast<unsigned>(onsetStreak), heardVoiceThisTurn ? 1 : 0);
+      }
+      if (heardVoiceThisTurn) {
+        if (nowMs - lastVoiceMs >= kEndOfSpeechSilenceMs) {
+          Serial.println(
+              "[VAD] user paused after speaking — ending turn, sending to AI");
+          setState(SESSION_PROCESSING);
+          break;
+        }
+      } else if (nowMs - turnStartMs >= kNoSpeechTimeoutMs) {
+        Serial.println(
+            "[VAD] no speech at all — giving up, ending conversation");
+        endConversation("no_speech_timeout");
+        break;
+      }
+
+      if (s_uplinkQueue == nullptr) {
+        sendUplinkFrame(frame, n);
+        frameCount++;
+        break;
+      }
+      CaptureChunk chunk;
+      chunk.len = n;
+      memcpy(chunk.data, frame, n);
+      if (xQueueSend(s_uplinkQueue, &chunk,
+                     pdMS_TO_TICKS(kUplinkQueueSendWaitMs)) != pdTRUE) {
+        CaptureChunk discard;
+        xQueueReceive(s_uplinkQueue, &discard, 0);
+        xQueueSend(s_uplinkQueue, &chunk, 0);
+        droppedCount++;
+        if (droppedCount == 1 || droppedCount % kUplinkDropLogInterval == 0) {
+          Serial.printf("[MIC] uplink queue full — dropped oldest frame "
+                        "(network stalled, total=%d)\n",
+                        droppedCount);
+        }
+      }
+      frameCount++;
+      break;
+    }
+    case SESSION_PROCESSING:
+    case SESSION_SPEAKING:
+      break;
+    }
+  }
 }
 
 // MARK: - Uplink sender (network)
 
 static void finishUplinkTurn(int sentCount) {
-    if (getState() == SESSION_PROCESSING) {
-        sendTextAndFlush(protocolBuildAudioStop());
-    } else {
-        flushWebSocketRepeated(10, 5);
-    }
-    const int captured = s_turnCaptured;
-    const int dropped = s_turnDropped;
-    const int sendPct = captured > 0 ? (sentCount * 100) / captured : 0;
-    Serial.printf(
-        "[MIC] uplink turn: captured=%d sent=%d dropped=%d send_rate=%d%% queue_depth=%u\n",
-        captured, sentCount, dropped, sendPct,
-        static_cast<unsigned>(s_uplinkQueueDepth));
-    s_turnCaptured = 0;
-    s_turnDropped = 0;
+  if (getState() == SESSION_PROCESSING) {
+    sendTextAndFlush(protocolBuildAudioStop());
+  } else {
+    flushWebSocketRepeated(10, 5);
+  }
+  const int captured = s_turnCaptured;
+  const int dropped = s_turnDropped;
+  const int sendPct = captured > 0 ? (sentCount * 100) / captured : 0;
+  Serial.printf("[MIC] uplink turn: captured=%d sent=%d dropped=%d "
+                "send_rate=%d%% queue_depth=%u\n",
+                captured, sentCount, dropped, sendPct,
+                static_cast<unsigned>(s_uplinkQueueDepth));
+  s_turnCaptured = 0;
+  s_turnDropped = 0;
 }
 
 static void uplinkSendTask(void *arg) {
-    (void)arg;
-    static CaptureChunk batch[kUplinkSendBatchMax];
-    int sentCount = 0;
-    while (true) {
-        if (s_uplinkQueue == nullptr) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-        if (xQueueReceive(s_uplinkQueue, &batch[0], portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-        if (batch[0].len == 0) {
-            finishUplinkTurn(sentCount);
-            sentCount = 0;
-            continue;
-        }
-
-        int batchCount = 1;
-        while (batchCount < kUplinkSendBatchMax) {
-            CaptureChunk next;
-            if (xQueueReceive(s_uplinkQueue, &next, 0) != pdTRUE) {
-                break;
-            }
-            if (next.len == 0) {
-                sentCount += sendBinaryBatch(batch, batchCount);
-                finishUplinkTurn(sentCount);
-                sentCount = 0;
-                batchCount = 0;
-                break;
-            }
-            batch[batchCount++] = next;
-        }
-
-        if (batchCount > 0) {
-            sentCount += sendBinaryBatch(batch, batchCount);
-        }
+  (void)arg;
+  static CaptureChunk batch[kUplinkSendBatchMax];
+  int sentCount = 0;
+  while (true) {
+    if (s_uplinkQueue == nullptr) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
     }
+    if (xQueueReceive(s_uplinkQueue, &batch[0], portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+    if (batch[0].len == 0) {
+      finishUplinkTurn(sentCount);
+      sentCount = 0;
+      continue;
+    }
+
+    int batchCount = 1;
+    while (batchCount < kUplinkSendBatchMax) {
+      CaptureChunk next;
+      if (xQueueReceive(s_uplinkQueue, &next, 0) != pdTRUE) {
+        break;
+      }
+      if (next.len == 0) {
+        sentCount += sendBinaryBatch(batch, batchCount);
+        finishUplinkTurn(sentCount);
+        sentCount = 0;
+        batchCount = 0;
+        break;
+      }
+      batch[batchCount++] = next;
+    }
+
+    if (batchCount > 0) {
+      sentCount += sendBinaryBatch(batch, batchCount);
+    }
+  }
 }
 
 // MARK: - Playback (downlink)
 
 static void playbackTask(void *arg) {
-    (void)arg;
-    PlaybackChunk chunk;
-    static int16_t samples[COMPANION_DOWNLINK_FRAME_BYTES / sizeof(int16_t)];
-    static int16_t silence[COMPANION_DOWNLINK_FRAME_BYTES / sizeof(int16_t)] = {};
-    TickType_t nextWake = 0;
-    int starvationFrames = 0;
+  (void)arg;
+  PlaybackChunk chunk;
+  static int16_t samples[COMPANION_DOWNLINK_FRAME_BYTES / sizeof(int16_t)];
+  static int16_t silence[COMPANION_DOWNLINK_FRAME_BYTES / sizeof(int16_t)] = {};
+  TickType_t nextWake = 0;
+  int starvationFrames = 0;
 
-    while (true) {
-        if (s_playbackQueue == nullptr) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-        if (s_playbackNeedPrefill) {
-            if (uxQueueMessagesWaiting(s_playbackQueue) < s_prefillTarget) {
-                vTaskDelay(pdMS_TO_TICKS(5));
-                continue;
-            }
-            s_playbackNeedPrefill = false;
-            starvationFrames = 0;
-            nextWake = xTaskGetTickCount();
-            Serial.printf("[AUDIO] prefill complete — playback starting (target=%u)\n",
-                          static_cast<unsigned>(s_prefillTarget));
-        }
-
-        TickType_t now = xTaskGetTickCount();
-        if (now < nextWake) {
-            vTaskDelay(nextWake - now);
-        }
-
-        bool gotFrame =
-            xQueueReceive(s_playbackQueue, &chunk, pdMS_TO_TICKS(kQueueWaitMs)) == pdTRUE;
-        if (!gotFrame) {
-            if (getState() != SESSION_SPEAKING) {
-                audioIoSpeakerMute();
-                continue;
-            }
-            audioIoWriteDownlink(silence, sizeof(silence) / sizeof(silence[0]));
-            starvationFrames++;
-            nextWake += pdMS_TO_TICKS(kDownlinkFrameMs);
-            now = xTaskGetTickCount();
-            if (nextWake < now) {
-                nextWake = now;
-            }
-            if (starvationFrames >= kStarvationFramesBeforeRebuffer) {
-                s_playbackNeedPrefill = true;
-                if (s_prefillTarget < kMaxPrefillFrames) {
-                    s_prefillTarget += 2;
-                }
-                Serial.printf("[AUDIO] underrun — re-buffering (next target=%u)\n",
-                              static_cast<unsigned>(s_prefillTarget));
-                starvationFrames = 0;
-            }
-            continue;
-        }
-
-        starvationFrames = 0;
-        size_t sampleCount = pcmCodecDecodeDownlinkFrame(
-            chunk.data, chunk.len, samples, sizeof(samples) / sizeof(samples[0]));
-        audioIoWriteDownlink(samples, sampleCount);
-
-        int frameMs = static_cast<int>(sampleCount * 1000 / COMPANION_DOWNLINK_SAMPLE_RATE);
-        if (frameMs < 1) {
-            frameMs = kDownlinkFrameMs;
-        }
-        nextWake += pdMS_TO_TICKS(frameMs);
-        now = xTaskGetTickCount();
-        if (nextWake < now) {
-            nextWake = now;
-        }
+  while (true) {
+    if (s_playbackQueue == nullptr) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
     }
+    if (s_playbackNeedPrefill) {
+      if (uxQueueMessagesWaiting(s_playbackQueue) < s_prefillTarget) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        continue;
+      }
+      s_playbackNeedPrefill = false;
+      starvationFrames = 0;
+      nextWake = xTaskGetTickCount();
+      Serial.printf(
+          "[AUDIO] prefill complete — playback starting (target=%u)\n",
+          static_cast<unsigned>(s_prefillTarget));
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    if (now < nextWake) {
+      vTaskDelay(nextWake - now);
+    }
+
+    bool gotFrame = xQueueReceive(s_playbackQueue, &chunk,
+                                  pdMS_TO_TICKS(kQueueWaitMs)) == pdTRUE;
+    if (!gotFrame) {
+      if (getState() != SESSION_SPEAKING) {
+        audioIoSpeakerMute();
+        continue;
+      }
+      audioIoWriteDownlink(silence, sizeof(silence) / sizeof(silence[0]));
+      starvationFrames++;
+      nextWake += pdMS_TO_TICKS(kDownlinkFrameMs);
+      now = xTaskGetTickCount();
+      if (nextWake < now) {
+        nextWake = now;
+      }
+      if (starvationFrames >= kStarvationFramesBeforeRebuffer) {
+        s_playbackNeedPrefill = true;
+        if (s_prefillTarget < kMaxPrefillFrames) {
+          s_prefillTarget += 2;
+        }
+        Serial.printf("[AUDIO] underrun — re-buffering (next target=%u)\n",
+                      static_cast<unsigned>(s_prefillTarget));
+        starvationFrames = 0;
+      }
+      continue;
+    }
+
+    starvationFrames = 0;
+    size_t sampleCount = pcmCodecDecodeDownlinkFrame(
+        chunk.data, chunk.len, samples, sizeof(samples) / sizeof(samples[0]));
+    audioIoWriteDownlink(samples, sampleCount);
+
+    int frameMs =
+        static_cast<int>(sampleCount * 1000 / COMPANION_DOWNLINK_SAMPLE_RATE);
+    if (frameMs < 1) {
+      frameMs = kDownlinkFrameMs;
+    }
+    nextWake += pdMS_TO_TICKS(frameMs);
+    now = xTaskGetTickCount();
+    if (nextWake < now) {
+      nextWake = now;
+    }
+  }
 }
 
 // MARK: - Button -> session transitions
+//
+// One tap starts a conversation from IDLE. A tap at any other point
+// (CAPTURING/PROCESSING/SPEAKING) ends the conversation immediately —
+// including barging in mid AI-reply. RELEASED is unused: this is tap
+// semantics, not hold-to-talk.
 
 static void onButtonEvent(ButtonEvent event, void *ctx) {
-    (void)ctx;
-    SessionState s = getState();
-    if (!s_sessionReady) {
-        Serial.println("[BUTTON] ignored — session not ready yet");
-        return;
-    }
+  (void)ctx;
+  if (event != BUTTON_EVENT_PRESSED) {
+    return;
+  }
+  SessionState s = getState();
+  if (!s_sessionReady) {
+    Serial.println("[BUTTON] ignored — session not ready yet");
+    return;
+  }
 
-    if (event != BUTTON_EVENT_PRESSED) {
-        return;
-    }
-
-    switch (s) {
-    case SESSION_IDLE:
-        startListening("[BUTTON] tap");
-        break;
-    case SESSION_CAPTURING:
-        setState(SESSION_PROCESSING);
-        Serial.println("[BUTTON] tap: CAPTURING → PROCESSING (mic OFF)");
-        break;
-    case SESSION_SPEAKING:
-        Serial.println("[BUTTON] tap: IGNORED — AI speaking (half-duplex)");
-        break;
-    case SESSION_PROCESSING:
-        break;
-    }
+  switch (s) {
+  case SESSION_IDLE:
+    startListening("[BUTTON] tap");
+    break;
+  case SESSION_CAPTURING:
+  case SESSION_PROCESSING:
+  case SESSION_SPEAKING:
+    endConversation("user_tap");
+    break;
+  }
 }
 
 // MARK: - WebSocket event handling
 
 static void handleTextFrame(uint8_t *payload, size_t len) {
-    ProtoMsg msg;
-    protocolParse(payload, len, msg);
+  ProtoMsg msg;
+  protocolParse(payload, len, msg);
 
-    switch (msg.type) {
-    case PROTO_MSG_SESSION_READY:
-        s_sessionId = msg.sessionId;
-        drainPlaybackQueue();
-        drainUplinkQueue();
-        setState(SESSION_IDLE);
-        s_sessionReady = true;
-        Serial.printf("session ready: %s\n", s_sessionId.c_str());
-        Serial.println(">>> READY — say \"hey botchill\" or tap the touch sensor <<<");
-        break;
-    case PROTO_MSG_TRANSCRIPT_FINAL:
-        Serial.printf("transcript: %s\n", msg.text.c_str());
-        break;
-    case PROTO_MSG_DEVICE_COMMAND:
-        Serial.printf("device_command ignored (no actuator wired): action=%s\n",
-                      msg.action.c_str());
-        break;
-    case PROTO_MSG_TTS_START:
-        drainPlaybackQueue();
-        s_prefillTarget = kInitialPrefillFrames;
-        s_playbackNeedPrefill = true;
-        setState(SESSION_SPEAKING);
-        Serial.println("[TTS] START — AI speaking");
-        break;
-    case PROTO_MSG_TTS_END:
-        setState(SESSION_IDLE);
-        audioIoSpeakerMute();
-        Serial.println("[TTS] END — back to idle");
-        break;
-    case PROTO_MSG_ERROR:
-        Serial.printf("server error: code=%s message=%s\n", msg.errorCode.c_str(),
-                      msg.errorMessage.c_str());
-        drainPlaybackQueue();
-        drainUplinkQueue();
-        setState(SESSION_IDLE);
-        break;
-    case PROTO_MSG_LATENCY_REPORT:
-        Serial.println("latency.report received");
-        break;
-    case PROTO_MSG_UNKNOWN:
-    default:
-        break;
+  switch (msg.type) {
+  case PROTO_MSG_SESSION_READY:
+    s_sessionId = msg.sessionId;
+    drainPlaybackQueue();
+    drainUplinkQueue();
+    setState(SESSION_IDLE);
+    s_sessionReady = true;
+    Serial.printf("session ready: %s\n", s_sessionId.c_str());
+    Serial.println(
+        ">>> READY — connecting mic / server OK; wait for LISTENING <<<");
+    break;
+  case PROTO_MSG_TRANSCRIPT_FINAL:
+    Serial.printf("transcript: %s\n", msg.text.c_str());
+    break;
+  case PROTO_MSG_DEVICE_COMMAND:
+    Serial.printf("device_command ignored (no actuator wired): action=%s\n",
+                  msg.action.c_str());
+    break;
+  case PROTO_MSG_TTS_START:
+    drainPlaybackQueue();
+    s_prefillTarget = kInitialPrefillFrames;
+    s_playbackNeedPrefill = true;
+    setState(SESSION_SPEAKING);
+    Serial.println("[TTS] START — AI speaking");
+    break;
+  case PROTO_MSG_TTS_END: {
+    // The server also sends tts.end as part of cleaning up after an
+    // `abort` (e.g. our own no-speech timeout, or a tap-to-end) even
+    // though nothing was ever spoken — SESSION_SPEAKING only happens
+    // after a real tts.start. Auto-relistening on that non-playback
+    // tts.end would loop forever: abort -> tts.end -> capture -> ...
+    bool wasSpeaking = (getState() == SESSION_SPEAKING);
+    drainUplinkQueue();
+    audioIoSpeakerMute();
+    if (wasSpeaking) {
+      Serial.println("[TTS] END — listening for reply");
+      kickoffCaptureAsync("[AUTO] AI finished speaking");
+    } else {
+      setState(SESSION_IDLE);
+      Serial.println("[TTS] END (no active playback) — back to idle");
     }
+    break;
+  }
+  case PROTO_MSG_ERROR:
+    Serial.printf("server error: code=%s message=%s\n", msg.errorCode.c_str(),
+                  msg.errorMessage.c_str());
+    drainPlaybackQueue();
+    drainUplinkQueue();
+    setState(SESSION_IDLE);
+    break;
+  case PROTO_MSG_LATENCY_REPORT:
+    Serial.println("latency.report received");
+    break;
+  case PROTO_MSG_UNKNOWN:
+  default:
+    break;
+  }
 }
 
 static void handleBinaryFrame(uint8_t *payload, size_t len) {
-    if (getState() != SESSION_SPEAKING) {
-        Serial.printf("[AUDIO] ignored %u bytes — not in SESSION_SPEAKING\n",
-                      static_cast<unsigned>(len));
-        return;
-    }
-    if (len > COMPANION_DOWNLINK_FRAME_BYTES) {
-        Serial.printf("[AUDIO] truncating oversized frame %u -> %u bytes\n",
-                      static_cast<unsigned>(len),
-                      static_cast<unsigned>(COMPANION_DOWNLINK_FRAME_BYTES));
-        len = COMPANION_DOWNLINK_FRAME_BYTES;
-    }
-    if (s_playbackQueue == nullptr) {
-        Serial.printf("[AUDIO] no playback queue — dropping %u bytes\n",
-                      static_cast<unsigned>(len));
-        return;
-    }
-    PlaybackChunk chunk = {};
-    chunk.len = len;
-    memcpy(chunk.data, payload, len);
-    if (xQueueSend(s_playbackQueue, &chunk, pdMS_TO_TICKS(kDownlinkEnqueueMs)) != pdTRUE) {
-        Serial.printf("[AUDIO] queue full, dropping %u bytes\n", static_cast<unsigned>(len));
-    }
+  if (getState() != SESSION_SPEAKING) {
+    Serial.printf("[AUDIO] ignored %u bytes — not in SESSION_SPEAKING\n",
+                  static_cast<unsigned>(len));
+    return;
+  }
+  if (len > COMPANION_DOWNLINK_FRAME_BYTES) {
+    Serial.printf("[AUDIO] truncating oversized frame %u -> %u bytes\n",
+                  static_cast<unsigned>(len),
+                  static_cast<unsigned>(COMPANION_DOWNLINK_FRAME_BYTES));
+    len = COMPANION_DOWNLINK_FRAME_BYTES;
+  }
+  if (s_playbackQueue == nullptr) {
+    Serial.printf("[AUDIO] no playback queue — dropping %u bytes\n",
+                  static_cast<unsigned>(len));
+    return;
+  }
+  PlaybackChunk chunk = {};
+  chunk.len = len;
+  memcpy(chunk.data, payload, len);
+  if (xQueueSend(s_playbackQueue, &chunk, pdMS_TO_TICKS(kDownlinkEnqueueMs)) !=
+      pdTRUE) {
+    Serial.printf("[AUDIO] queue full, dropping %u bytes\n",
+                  static_cast<unsigned>(len));
+  }
 }
 
 static void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
-    switch (type) {
-    case WStype_CONNECTED:
-        Serial.println("ws connected");
-        sendText(protocolBuildSessionStart());
-        break;
-    case WStype_DISCONNECTED:
-        Serial.printf("[WS] DISCONNECTED (was in state %d) — resetting\n", (int)getState());
-        s_sessionReady = false;
-        drainPlaybackQueue();
-        drainUplinkQueue();
-        setState(SESSION_IDLE);
-        break;
-    case WStype_TEXT:
-        Serial.printf("[WS] text (%u bytes)\n", static_cast<unsigned>(length));
-        handleTextFrame(payload, length);
-        break;
-    case WStype_BIN:
-        handleBinaryFrame(payload, length);
-        break;
-    case WStype_ERROR:
-        Serial.println("ws error");
-        break;
-    default:
-        break;
-    }
+  switch (type) {
+  case WStype_CONNECTED:
+    Serial.println("ws connected");
+    sendText(protocolBuildSessionStart());
+    break;
+  case WStype_DISCONNECTED:
+    Serial.printf("[WS] DISCONNECTED (was in state %d) — resetting\n",
+                  (int)getState());
+    s_sessionReady = false;
+    drainPlaybackQueue();
+    drainUplinkQueue();
+    setState(SESSION_IDLE);
+    break;
+  case WStype_TEXT:
+    Serial.printf("[WS] text (%u bytes)\n", static_cast<unsigned>(length));
+    handleTextFrame(payload, length);
+    break;
+  case WStype_BIN:
+    handleBinaryFrame(payload, length);
+    break;
+  case WStype_ERROR:
+    Serial.println("ws error");
+    break;
+  default:
+    break;
+  }
 }
 
 void wsSessionBegin() {
-    Serial.printf("[BOOT] wsSessionBegin heap=%u\n",
+  Serial.printf("[BOOT] wsSessionBegin heap=%u psram=%u\n",
+                static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(ESP.getFreePsram()));
+
+  s_stateMutex = xSemaphoreCreateMutex();
+  s_wsSendMutex = xSemaphoreCreateRecursiveMutex();
+  s_micReadySem = xSemaphoreCreateBinary(); // starts empty; captureTask gives it
+
+  s_playbackQueue = xQueueCreate(kPlaybackQueueDepth, sizeof(PlaybackChunk));
+  if (s_playbackQueue == nullptr) {
+    Serial.printf(
+        "[AUDIO] WARNING: playback queue alloc failed (need %u bytes)\n",
+        static_cast<unsigned>(kPlaybackQueueDepth * sizeof(PlaybackChunk)));
+  } else {
+    Serial.printf("[AUDIO] playback queue ok depth=%u\n",
+                  static_cast<unsigned>(kPlaybackQueueDepth));
+  }
+  Serial.println(
+      "[AUDIO] uplink queue deferred until first capture (saves RAM at boot)");
+
+  BaseType_t captureOk =
+      xTaskCreate(captureTask, "audio_capture", 8192, NULL, 12, NULL);
+  BaseType_t uplinkOk =
+      xTaskCreate(uplinkSendTask, "audio_uplink_send", 8192, NULL, 13, NULL);
+  BaseType_t playbackOk =
+      xTaskCreate(playbackTask, "audio_playback", 8192, NULL, 14, NULL);
+  if (captureOk != pdPASS || uplinkOk != pdPASS || playbackOk != pdPASS) {
+    Serial.printf("[AUDIO] FATAL: task create failed capture=%d uplink=%d "
+                  "playback=%d heap=%u\n",
+                  static_cast<int>(captureOk), static_cast<int>(uplinkOk),
+                  static_cast<int>(playbackOk),
                   static_cast<unsigned>(ESP.getFreeHeap()));
+  }
 
-    s_stateMutex = xSemaphoreCreateMutex();
-    s_wsSendMutex = xSemaphoreCreateRecursiveMutex();
-    s_playbackQueue = xQueueCreate(kPlaybackQueueDepth, sizeof(PlaybackChunk));
-    if (s_playbackQueue == nullptr) {
-        Serial.printf("[AUDIO] WARNING: playback queue alloc failed (need %u bytes)\n",
-                      static_cast<unsigned>(kPlaybackQueueDepth * sizeof(PlaybackChunk)));
-    } else {
-        Serial.printf("[AUDIO] playback queue ok depth=%u\n",
-                      static_cast<unsigned>(kPlaybackQueueDepth));
-    }
-    if (!createUplinkQueue()) {
-        Serial.println("[MIC] will use inline uplink (no queue buffer)");
-    }
-
-    wakeWordInit();
-
-    // Bumped from 8192: this task also runs the Edge Impulse classifier
-    // (MFCC + TFLite invoke) while idle, not just I2S reads.
-    BaseType_t captureOk =
-        xTaskCreate(captureTask, "audio_capture", 16384, NULL, 12, NULL);
-    BaseType_t uplinkOk =
-        xTaskCreate(uplinkSendTask, "audio_uplink_send", 8192, NULL, 13, NULL);
-    BaseType_t playbackOk =
-        xTaskCreate(playbackTask, "audio_playback", 8192, NULL, 14, NULL);
-    if (captureOk != pdPASS || uplinkOk != pdPASS || playbackOk != pdPASS) {
-        Serial.printf("[AUDIO] FATAL: task create failed capture=%d uplink=%d playback=%d heap=%u\n",
-                      static_cast<int>(captureOk), static_cast<int>(uplinkOk),
-                      static_cast<int>(playbackOk),
-                      static_cast<unsigned>(ESP.getFreeHeap()));
-    }
-
-    static String authHeader = String("Authorization: Bearer ") + COMPANION_DEVICE_TOKEN;
-    s_webSocket.setExtraHeaders(authHeader.c_str());
-    s_webSocket.onEvent(webSocketEvent);
-    s_webSocket.setReconnectInterval(0);
+  static String authHeader =
+      String("Authorization: Bearer ") + COMPANION_DEVICE_TOKEN;
+  s_webSocket.setExtraHeaders(authHeader.c_str());
+  s_webSocket.onEvent(webSocketEvent);
+  s_webSocket.setReconnectInterval(0);
 
 #if COMPANION_USE_TLS
-    s_webSocket.beginSSL(COMPANION_SERVER_HOST, COMPANION_SERVER_PORT, COMPANION_SERVER_PATH);
+  s_webSocket.beginSSL(COMPANION_SERVER_HOST, COMPANION_SERVER_PORT,
+                       COMPANION_SERVER_PATH);
 #else
-    s_webSocket.begin(COMPANION_SERVER_HOST, COMPANION_SERVER_PORT, COMPANION_SERVER_PATH);
+  s_webSocket.begin(COMPANION_SERVER_HOST, COMPANION_SERVER_PORT,
+                    COMPANION_SERVER_PATH);
 #endif
 
-    buttonInit(onButtonEvent, NULL);
-    Serial.println("connecting to server, please wait...");
+  buttonInit(onButtonEvent, NULL);
+  Serial.println("connecting to server, please wait...");
 }
 
-void wsSessionLoop() {
-    flushWebSocket();
-}
+void wsSessionLoop() { flushWebSocket(); }

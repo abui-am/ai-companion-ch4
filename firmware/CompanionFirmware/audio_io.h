@@ -20,13 +20,32 @@ void audioIoWriteDownlink(const int16_t *monoSamples, size_t sampleCount);
 // Short confirmation beep on the speaker. Call after audioIoInit().
 void audioIoSpeakerBeep();
 
+// Per-frame metrics for the adaptive noise-floor VAD in ws_session.cpp.
+// Samples are high-pass filtered (~300 Hz) before measurement so HVAC
+// rumble doesn't dominate energy in noisy rooms. crestX100 is peak*100/mean
+// (speech is spikier than steady fan noise); zcrX1000 is zero-crossings per
+// 1000 samples on the filtered signal.
+struct AudioFrameVadMetrics {
+  uint32_t energy;
+  uint32_t peak;
+  uint32_t crestX100;
+  uint32_t zcrX1000;
+};
+
+void audioIoVadFilterReset();
+
+// Analyze one mono 16-bit PCM uplink frame for VAD. Uplink audio is unchanged.
+AudioFrameVadMetrics audioIoAnalyzeVadFrame(const uint8_t *frame, size_t len);
+
+// Mean absolute amplitude without filtering — legacy helper.
+uint32_t audioIoFrameEnergy(const uint8_t *frame, size_t len);
+
 // Flush silence and stop speaker I2S clocks so the amp stays quiet when idle.
 void audioIoSpeakerMute();
 
 #if HAS_MIC
-// Stop/start mic I2S clocks when not capturing — reduces crosstalk into speaker.
 void audioIoMicStart();
 void audioIoMicStop();
-// Discard stale I2S DMA data after mic start — call once before first capture frame.
+bool audioIoMicIsRunning();
 void audioIoPrimeMic();
 #endif
