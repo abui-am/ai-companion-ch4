@@ -21,10 +21,8 @@ void audioIoWriteDownlink(const int16_t *monoSamples, size_t sampleCount);
 void audioIoSpeakerBeep();
 
 // Per-frame metrics for the adaptive noise-floor VAD in ws_session.cpp.
-// Samples are high-pass filtered (~300 Hz) before measurement so HVAC
-// rumble doesn't dominate energy in noisy rooms. crestX100 is peak*100/mean
-// (speech is spikier than steady fan noise); zcrX1000 is zero-crossings per
-// 1000 samples on the filtered signal.
+// Frames are already HPF + noise-gated in audioIoReadUplinkFrame(); metrics
+// are taken on that conditioned uplink audio (same bytes sent to the server).
 struct AudioFrameVadMetrics {
   uint32_t energy;
   uint32_t peak;
@@ -34,7 +32,7 @@ struct AudioFrameVadMetrics {
 
 void audioIoVadFilterReset();
 
-// Analyze one mono 16-bit PCM uplink frame for VAD. Uplink audio is unchanged.
+// Peak-normalized before return — see MIC_UPLINK_TARGET_PEAK in config.h.
 AudioFrameVadMetrics audioIoAnalyzeVadFrame(const uint8_t *frame, size_t len);
 
 // Mean absolute amplitude without filtering — legacy helper.
@@ -43,9 +41,10 @@ uint32_t audioIoFrameEnergy(const uint8_t *frame, size_t len);
 // Flush silence and stop speaker I2S clocks so the amp stays quiet when idle.
 void audioIoSpeakerMute();
 
-#if HAS_MIC
 void audioIoMicStart();
 void audioIoMicStop();
 bool audioIoMicIsRunning();
 void audioIoPrimeMic();
-#endif
+// Lighter prime after mic was stopped for TTS/PROCESSING — avoids mic-ready
+// semaphore timeout on auto-relisten (full prime can exceed 2 s).
+void audioIoPrimeMicAfterPause();

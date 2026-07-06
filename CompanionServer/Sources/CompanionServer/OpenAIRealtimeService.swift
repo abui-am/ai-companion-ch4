@@ -15,7 +15,7 @@ enum RealtimeAudioEvent: Sendable {
 ///
 /// Turn flow:
 ///   1. `connect()` — called once on session start.
-///   2. `appendAudioFrame(_:)` — called per uplink frame while capturing.
+///   2. `appendAudioFrame(_:)` / `appendAudioFrames(_:)` — called while capturing.
 ///      Frames are upsampled 16 kHz → 24 kHz before being sent.
 ///   3. `commitAndCreateResponse()` — called on audio.stop; returns an
 ///      AsyncStream that emits audio chunks then `.done`.
@@ -29,6 +29,7 @@ actor OpenAIRealtimeService {
     private let model: String
     private let voice: String
     private let textOnlyOutput: Bool
+    private var responseLanguage: String
     private let subAgents: SubAgentRegistry
     private let logger: Logger
 
@@ -47,6 +48,7 @@ actor OpenAIRealtimeService {
         apiKey: String,
         model: String,
         voice: String,
+        responseLanguage: String = "English",
         textOnlyOutput: Bool = false,
         subAgents: SubAgentRegistry = SubAgentRegistry(agents: []),
         logger: Logger
@@ -54,6 +56,7 @@ actor OpenAIRealtimeService {
         self.apiKey = apiKey
         self.model = model
         self.voice = voice
+        self.responseLanguage = responseLanguage
         self.textOnlyOutput = textOnlyOutput
         self.subAgents = subAgents
         self.logger = logger
@@ -90,6 +93,20 @@ actor OpenAIRealtimeService {
         startEventLoop()
     }
 
+    func setResponseLanguage(_ language: String) async {
+        responseLanguage = language
+        guard let socket, socket.state == .running else { return }
+        do {
+            try await sendJSON(sessionUpdatePayload())
+            logger.info("realtime response language updated", metadata: ["language": .string(language)])
+        } catch {
+            logger.error(
+                "realtime response language update failed",
+                metadata: ["language": .string(language), "error": .string("\(error)")]
+            )
+        }
+    }
+
     func close() async {
         eventLoopTask?.cancel()
         eventLoopTask = nil
@@ -101,12 +118,21 @@ actor OpenAIRealtimeService {
     // MARK: - Turn control
 
     /// Appends one 60 ms uplink PCM frame (16 kHz, 16-bit mono).
-    /// The frame is upsampled to 24 kHz before being base64-encoded and sent.
     func appendAudioFrame(_ data: Data) async {
-        let resampled = upsample16kTo24k(data)
+        await appendAudioFrames([data])
+    }
+
+    /// Appends multiple consecutive uplink frames in one Realtime API message.
+    func appendAudioFrames(_ frames: [Data]) async {
+        guard !frames.isEmpty else { return }
+        var combined = Data()
+        combined.reserveCapacity(frames.count * frames[0].count * 3 / 2)
+        for frame in frames {
+            combined.append(upsample16kTo24k(frame))
+        }
         try? await sendJSON([
             "type": "input_audio_buffer.append",
-            "audio": resampled.base64EncodedString(),
+            "audio": combined.base64EncodedString(),
         ])
     }
 
@@ -295,7 +321,7 @@ actor OpenAIRealtimeService {
         let session: [String: Any] = {
             var s: [String: Any] = [
                 "type": "realtime",
-                "instructions": CompanionPrompt.system,
+                "instructions": CompanionPrompt.system(responseLanguage: responseLanguage),
                 "output_modalities": textOnlyOutput ? ["text"] : ["audio"],
                 "audio": audio,
             ]

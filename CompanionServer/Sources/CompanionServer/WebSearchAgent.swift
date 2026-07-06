@@ -15,6 +15,9 @@ struct WebSearchAgent: SubAgent, Sendable {
             releases, or any fact that may have changed since your training data. Use when the \
             user asks about recent or time-sensitive topics.
 
+            After you call this tool and receive results, deliver a full spoken answer with no length cap — \
+            see system instructions "Mode: web_search". The preamble before the call stays one short sentence.
+
             Before calling this tool, speak one short preamble in the same turn (friend tone, \
             reference what they asked). Then call the tool immediately. Vary the wording. \
             Do not imply whether the lookup will succeed.
@@ -91,8 +94,8 @@ struct WebSearchAgent: SubAgent, Sendable {
             "model": model,
             "input": trimmed,
             "instructions": """
-            You are a research assistant for a voice companion. Search the web and return a \
-            concise factual summary (2–4 sentences) suitable to be spoken aloud. Include \
+            You are a research assistant for a voice companion. Search the web and return a thorough \
+            factual summary suitable to be spoken aloud — as much detail as the query warrants. Include \
             specific numbers, dates, or names when relevant. No bullet lists.
             """,
             "tools": [

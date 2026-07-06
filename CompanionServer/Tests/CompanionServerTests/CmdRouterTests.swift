@@ -35,15 +35,24 @@ final class CmdRouterTests: XCTestCase {
     }
 
     func testCompanionPromptProvidesSystemAndUserMessages() {
-        XCTAssertFalse(CompanionPrompt.system.isEmpty)
+        XCTAssertFalse(CompanionPrompt.system(responseLanguage: "English").isEmpty)
         XCTAssertEqual(CompanionPrompt.userMessage(for: "tes suara"), "tes suara")
     }
 
     func testCompanionPromptIncludesPreambleGuidance() {
-        let prompt = CompanionPrompt.system.lowercased()
+        let prompt = CompanionPrompt.system(responseLanguage: "English").lowercased()
         XCTAssertTrue(prompt.contains("preamble"))
         XCTAssertTrue(prompt.contains("web_search"))
-        XCTAssertTrue(prompt.contains("vary"))
+        XCTAssertTrue(prompt.contains("casual"))
+        XCTAssertTrue(prompt.contains("serious"))
+    }
+
+    func testCompanionPromptLanguageInstruction() {
+        let english = CompanionPrompt.system(responseLanguage: "English").lowercased()
+        XCTAssertTrue(english.contains("always respond in english"))
+
+        let auto = CompanionPrompt.system(responseLanguage: "auto").lowercased()
+        XCTAssertTrue(auto.contains("same language as the user's transcript"))
     }
 
     func testTalkToSpeechMetricsComputesDurations() {

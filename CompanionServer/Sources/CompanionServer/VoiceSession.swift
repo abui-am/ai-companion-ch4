@@ -39,6 +39,9 @@ actor VoiceSession {
     private var uplinkFrameCounter = 0
     private var uplinkPCMDump = Data()
     private var uplinkCaptureStartedAt: Date?
+    /// Decouples ESP WS reads from OpenAI forwarding — see `forwardUplink`.
+    private var uplinkStreamContinuation: AsyncStream<Data>.Continuation?
+    private var uplinkForwardTask: Task<Void, Never>?
     private var downlinkPCMDump = Data()
     private var downlinkTurnId: String?
     private var dumpOnlyMode = false
@@ -73,7 +76,7 @@ actor VoiceSession {
         try await send(ready)
     }
 
-    func handleSessionStart(_ start: SessionStart) {
+    func handleSessionStart(_ start: SessionStart) async {
         dumpOnlyMode = start.mode == "dump_only"
         if dumpOnlyMode {
             logger.info(
@@ -82,6 +85,13 @@ actor VoiceSession {
             )
             print("[session] dump-only mode — AI pipeline disabled")
         }
+        if let language = start.language?.trimmingCharacters(in: .whitespacesAndNewlines), !language.isEmpty {
+            logger.info(
+                "session response language override",
+                metadata: ["session_id": .string(sessionId), "language": .string(language)]
+            )
+            await realtime.setResponseLanguage(language)
+        }
     }
 
     func handleAudioStart() {
@@ -89,10 +99,14 @@ actor VoiceSession {
         uplinkFrameCounter = 0
         uplinkPCMDump.removeAll(keepingCapacity: true)
         uplinkCaptureStartedAt = Date()
+        stopUplinkForwarder()
+        if !dumpOnlyMode {
+            startUplinkForwarder()
+        }
         logger.info("audio.start", metadata: ["session_id": .string(sessionId), "phase": .string("\(phase)")])
     }
 
-    func handleOpusFrame(_ data: Data) async {
+    func handleOpusFrame(_ data: Data) {
         guard phase == .capturing else {
             logger.debug(
                 "ignored uplink frame — not capturing",
@@ -121,7 +135,76 @@ actor VoiceSession {
         if dumpOnlyMode {
             return
         }
-        await realtime.appendAudioFrame(data)
+        uplinkStreamContinuation?.yield(data)
+    }
+
+    private static let uplinkForwardBatchFrames = 4
+
+    private func startUplinkForwarder() {
+        let (stream, continuation) = AsyncStream<Data>.makeStream()
+        uplinkStreamContinuation = continuation
+        uplinkForwardTask = Task { [realtime, logger, sessionId] in
+            await Self.forwardUplink(
+                stream,
+                realtime: realtime,
+                batchFrames: Self.uplinkForwardBatchFrames,
+                logger: logger,
+                sessionId: sessionId
+            )
+        }
+    }
+
+    private func stopUplinkForwarder() {
+        uplinkStreamContinuation?.finish()
+        uplinkStreamContinuation = nil
+        uplinkForwardTask?.cancel()
+        uplinkForwardTask = nil
+    }
+
+    /// Drains the uplink stream on a background task so the device WS read loop
+    /// is not blocked on OpenAI JSON/base64 round-trips.
+    private static func forwardUplink(
+        _ stream: AsyncStream<Data>,
+        realtime: OpenAIRealtimeService,
+        batchFrames: Int,
+        logger: Logger,
+        sessionId: String
+    ) async {
+        var batch: [Data] = []
+        batch.reserveCapacity(batchFrames)
+        var forwarded = 0
+
+        func flush() async {
+            guard !batch.isEmpty else { return }
+            let count = batch.count
+            await realtime.appendAudioFrames(batch)
+            forwarded += count
+            logger.debug(
+                "uplink forwarded batch",
+                metadata: [
+                    "session_id": .string(sessionId),
+                    "batch_frames": "\(count)",
+                    "forwarded_total": "\(forwarded)",
+                ]
+            )
+            batch.removeAll(keepingCapacity: true)
+        }
+
+        for await frame in stream {
+            if Task.isCancelled { break }
+            batch.append(frame)
+            if batch.count >= batchFrames {
+                await flush()
+            }
+        }
+        await flush()
+    }
+
+    private func waitForUplinkDrain() async {
+        uplinkStreamContinuation?.finish()
+        uplinkStreamContinuation = nil
+        await uplinkForwardTask?.value
+        uplinkForwardTask = nil
     }
 
     func handleAudioStop() {
@@ -168,6 +251,7 @@ actor VoiceSession {
             phase = .connected
             uplinkFrameCounter = 0
             uplinkPCMDump.removeAll(keepingCapacity: true)
+            stopUplinkForwarder()
             logger.info(
                 "dump-only turn complete",
                 metadata: ["session_id": .string(sessionId), "turn_id": .string(turnId)]
@@ -183,6 +267,7 @@ actor VoiceSession {
             phase = .connected
             uplinkFrameCounter = 0
             uplinkPCMDump.removeAll(keepingCapacity: true)
+            stopUplinkForwarder()
             Task {
                 try? await send(ErrorMessage(code: "no_uplink_audio", message: "No mic audio received — hold longer and try again"))
             }
@@ -191,6 +276,7 @@ actor VoiceSession {
 
         phase = .processing
         pipelineTask = Task { [weak self] in
+            await self?.waitForUplinkDrain()
             await self?.runRealtimeTurn(turnId: turnId)
         }
     }
@@ -207,6 +293,7 @@ actor VoiceSession {
         )
         pipelineTask?.cancel()
         pipelineTask = nil
+        stopUplinkForwarder()
         await realtime.cancelResponse()
         if let contextId = activeContextId, let tts {
             await tts.cancelTurn(contextId: contextId)
@@ -224,6 +311,7 @@ actor VoiceSession {
     func handleDisconnect() {
         pipelineTask?.cancel()
         pipelineTask = nil
+        stopUplinkForwarder()
         Task { await realtime.close() }
         Task { await downlinkPacer.cancel() }
         logger.info("session disconnected", metadata: ["session_id": .string(sessionId)])

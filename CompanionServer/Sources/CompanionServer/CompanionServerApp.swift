@@ -31,6 +31,7 @@ struct CompanionServerApp {
                 "tts_provider": .string(config.ttsProvider.rawValue),
                 "cartesia_model": .string(config.cartesiaModelId),
                 "web_search": .string(config.webSearchEnabled ? "enabled" : "disabled"),
+                "response_language": .string(config.responseLanguage),
             ]
         )
         if let root = PackagePaths.packageRoot() {
@@ -68,6 +69,7 @@ struct CompanionServerApp {
                 apiKey: config.openAIAPIKey,
                 model: config.openAIRealtimeModel,
                 voice: config.openAIRealtimeVoice,
+                responseLanguage: config.responseLanguage,
                 textOnlyOutput: config.usesCartesiaTTS,
                 subAgents: subAgents,
                 logger: serverLogger

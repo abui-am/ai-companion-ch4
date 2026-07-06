@@ -59,23 +59,23 @@ static constexpr int kDownlinkFrameMs = COMPANION_FRAME_MS;
 //   p50 ≈ 2.6 s (43 frames)   p90 ≈ 8.2 s (136 frames)   max ≈ 19 s (316
 //   frames)
 //
+// Queue depth should cover worst-case recording (316) plus TCP stall budget
+// (~84 frames @ 5 s) when the sender blocks — cap below available PSRAM.
+//
 // Observed stall (queue=24, 115 captured / 86 sent / 29 dropped):
 //   sender averaged ~75% of capture rate → backlog ≈ 29 frames minimum depth.
 //
 // Worst-case single send stall: WEBSOCKETS_TCP_TIMEOUT ≈ 5 s → 5000/60 ≈ 84
-// frames. Target depth = stall_budget + margin, capped below p90 recording when
-// sender is fully blocked (full-session buffering would need 136+ frames / 260
-// KB+).
+// frames. Target depth = stall_budget + margin for logging; alloc tries max first.
 //
 // No wake-word classifier anymore, so there's no internal-RAM DSP scratch to
-// protect — the queue can use whatever internal RAM is actually free, and the
-// cap is raised well past the old wake-word-constrained ceiling.
+// protect — the queue can use PSRAM (lazy alloc at first capture).
 static constexpr int kUplinkFrameMs = COMPANION_FRAME_MS;
 static constexpr int kUplinkTcpStallMs = 5000;
 static constexpr int kUplinkQueueStallMarginFrames = 12;
 static constexpr int kUplinkQueueTargetDepth =
     (kUplinkTcpStallMs / kUplinkFrameMs) + kUplinkQueueStallMarginFrames; // 96
-static constexpr int kUplinkQueueMaxDepth = 256; // ~15.4 s @ zero send
+static constexpr int kUplinkQueueMaxDepth = 512; // ~30.7 s @ zero send (~985 KB)
 static constexpr int kUplinkQueueMinDepth =
     16; // ~1 s; used when memory is tight
 
@@ -92,13 +92,8 @@ static String s_sessionId;
 static volatile bool s_sessionReady = false;
 static volatile bool s_playbackNeedPrefill = true;
 
-// Given by captureTask once the mic is actually running (started + primed
-// if it was cold) and the uplink queue/turn state are reset for a new
-// capture — see the CAPTURING-entry block below. postAudioStartAndBeep()
-// waits on this before cueing the user with the beep, so the beep can't
-// fire while the mic is still cold-starting (e.g. right after the AI
-// finishes speaking, when the mic has to restart from OFF).
-static SemaphoreHandle_t s_micReadySem = nullptr;
+// Trigger label for the active capture turn (tap, auto-relisten, etc.).
+// captureTask runs audio.start + beep on CAPTURING entry once mic I2S is live.
 
 // Recursive: flushWebSocket() holds this across s_webSocket.loop(), which can
 // synchronously invoke webSocketEvent() (e.g. on CONNECTED/TEXT) — and that
@@ -321,11 +316,12 @@ static void flushWebSocketRepeated(int count, int delayMs) {
 // canonical; update docs/STABLE_V1.md § Client VAD if you change them.
 //
 // One tap starts a conversation; from then on it runs hands-free — talk,
-// pause, the AI answers, talk again — until another tap ends it (or, as a
-// safety net, the user never says anything at all). No wake word.
+// pause, the AI answers, talk again — until a long press ends it (or, as a
+// safety net, the user never says anything at all). Short tap during capture
+// forces end-of-turn when noisy-room VAD is stuck. No wake word.
 //
-//   tap -> talk -> silence ~1s -> AI answers -> talk -> silence ~1s -> AI
-//   answers -> ... -> tap (ends it any time, including mid AI-reply)
+//   short tap -> talk -> silence ~1s -> AI answers -> ... (or short tap if
+//   VAD stuck) -> long press (ends conversation any time)
 static constexpr uint32_t kEndOfSpeechSilenceMs =
     1000; // pause after speech -> send turn to AI
 static constexpr uint32_t kNoSpeechTimeoutMs =
@@ -357,6 +353,8 @@ static constexpr uint32_t kMinCrestX100 =
     220; // peak/mean >= 2.2 — speech is spikier than steady fan hum
 static constexpr uint32_t kMinOffsetCrestX100 =
     140; // looser crest gate while latched — still rejects flat HVAC hum
+static constexpr uint32_t kMinOffsetZcrX1000 =
+    85; // offset path also needs speech-like crossings — rejects steady hiss
 static constexpr uint32_t kMinZcrX1000 =
     55; // ~5.5% crossings — rejects low-frequency rumble
 
@@ -409,8 +407,9 @@ static bool vadUpdate(const AudioFrameVadMetrics &metrics, float &noiseFloor,
       static_cast<uint32_t>(noiseFloor) + kVoiceOffsetMargin;
   const bool meetsOnset = energy >= onsetThreshold &&
                           vadFrameLooksLikeSpeech(metrics);
-  const bool meetsOffset =
-      energy >= offsetThreshold && metrics.crestX100 >= kMinOffsetCrestX100;
+  const bool meetsOffset = energy >= offsetThreshold &&
+                           metrics.crestX100 >= kMinOffsetCrestX100 &&
+                           metrics.zcrX1000 >= kMinOffsetZcrX1000;
 
   bool isVoiceFrame = false;
   if (speechLatched) {
@@ -429,37 +428,20 @@ static bool vadUpdate(const AudioFrameVadMetrics &metrics, float &noiseFloor,
   return isVoiceFrame;
 }
 
-// MARK: - IDLE -> CAPTURING transition
+// captureTask owns the full turn open sequence on CAPTURING entry: mic is
+// already running/primed above, then audio.start, beep, then frame capture.
+// The beep is the user's "start speaking" cue — it only fires after mic I2S
+// is live, so there is no cross-task semaphore race.
+static const char *s_captureTrigger = "capture";
 
-static constexpr int kMicReadyWaitMs = 2000;
-
-static void postAudioStartAndBeep(const char *trigger) {
-  sendTextAndFlush(protocolBuildAudioStart());
-  // Clear any stale signal (e.g. left over if a previous wait here timed
-  // out) before waiting for this turn's actual "mic ready" give.
-  xSemaphoreTake(s_micReadySem, 0);
-  if (xSemaphoreTake(s_micReadySem, pdMS_TO_TICKS(kMicReadyWaitMs)) != pdTRUE) {
-    Serial.println("[MIC] WARNING: mic-ready wait timed out — beeping anyway");
-  }
-  audioIoSpeakerBeep();
-  Serial.printf("%s: IDLE → CAPTURING (mic ON)\n", trigger);
-}
-
-static void captureKickoffTask(void *arg) {
-  postAudioStartAndBeep(static_cast<const char *>(arg));
-  vTaskDelete(nullptr);
-}
-
-static void kickoffCaptureAsync(const char *trigger) {
+static void beginCapture(const char *trigger) {
+  s_captureTrigger = trigger;
   setState(SESSION_CAPTURING);
-  xTaskCreate(captureKickoffTask, "capture_kick", 4096,
-              const_cast<char *>(trigger), 10, nullptr);
 }
 
-static void startListening(const char *trigger) {
-  setState(SESSION_CAPTURING);
-  postAudioStartAndBeep(trigger);
-}
+static void startListening(const char *trigger) { beginCapture(trigger); }
+
+static void kickoffCaptureAsync(const char *trigger) { beginCapture(trigger); }
 
 // Ends the whole conversation right now: tells the server (so it cancels
 // any in-flight response instead of being left waiting on a turn that's
@@ -476,9 +458,7 @@ static void endConversation(const char *reason) {
 }
 
 static void finishCaptureSession(int frameCount, int droppedCount) {
-#if HAS_MIC
   audioIoMicStop();
-#endif
   Serial.printf("[MIC] capture stopped, captured %d frames from mic",
                 frameCount);
   if (droppedCount > 0) {
@@ -544,9 +524,7 @@ static void captureTask(void *arg) {
 
     if (s == SESSION_PROCESSING || s == SESSION_SPEAKING) {
       if (micActive) {
-#if HAS_MIC
         audioIoMicStop();
-#endif
         micActive = false;
       }
       lastState = s;
@@ -555,10 +533,12 @@ static void captureTask(void *arg) {
     }
 
     if (!micActive) {
-#if HAS_MIC
       audioIoMicStart();
-      audioIoPrimeMic();
-#endif
+      if (lastState == SESSION_PROCESSING || lastState == SESSION_SPEAKING) {
+        audioIoPrimeMicAfterPause();
+      } else {
+        audioIoPrimeMic();
+      }
       micActive = true;
     }
 
@@ -567,25 +547,18 @@ static void captureTask(void *arg) {
       drainUplinkQueue();
       frameCount = 0;
       droppedCount = 0;
-      // No re-prime here: the mic has been running continuously since IDLE
-      // (see the !micActive prime above, which only fires on a cold
-      // start/restart). Re-priming on every CAPTURING entry used to also
-      // reset the wake-word classifier's MFCC window — now that wake word
-      // is gone, it did nothing but discard ~0.5-0.8s of real audio right
-      // after the beep (up to 8 rounds x 12 blocking 60ms frame reads),
-      // eating the start of whatever the user said first.
-      // Start the no-speech timeout right away, since there's no priming
-      // delay to wait out anymore.
-      turnStartMs = millis();
       lastVoiceMs = 0;
       heardVoiceThisTurn = false;
       onsetStreak = 0;
       audioIoVadFilterReset();
-      Serial.println("[MIC] capture session started");
+      Serial.println("[MIC] capture session starting");
       Serial.printf("[MIC] queue=%p heap=%u\n", s_uplinkQueue,
                     static_cast<unsigned>(ESP.getFreeHeap()));
-      // Mic + queue are ready for real frames now — let the beep fire.
-      xSemaphoreGive(s_micReadySem);
+      sendTextAndFlush(protocolBuildAudioStart());
+      audioIoSpeakerBeep();
+      turnStartMs = millis();
+      Serial.printf("%s: → CAPTURING (mic ON, beep done — speak now)\n",
+                    s_captureTrigger);
     }
 
     lastState = s;
@@ -819,30 +792,68 @@ static void playbackTask(void *arg) {
 
 // MARK: - Button -> session transitions
 //
-// One tap starts a conversation from IDLE. A tap at any other point
-// (CAPTURING/PROCESSING/SPEAKING) ends the conversation immediately —
-// including barging in mid AI-reply. RELEASED is unused: this is tap
-// semantics, not hold-to-talk.
+// Failsafe when noisy-room VAD never sees 1 s of silence (stuck in CAPTURING):
+//   short tap  -> force end-of-turn (same as VAD pause-after-speech)
+//   long press -> end whole conversation → IDLE
+//
+// From IDLE: short tap starts a conversation; long press is a no-op.
+// During TTS: short tap barges in (abort playback, auto-relisten on tts.end);
+// long press ends the conversation.
+
+static void forceEndCaptureTurn(const char *reason) {
+  if (getState() != SESSION_CAPTURING) {
+    return;
+  }
+  Serial.printf("[BUTTON] force end turn (%s) → PROCESSING\n", reason);
+  setState(SESSION_PROCESSING);
+}
+
+static void bargeInDuringTts() {
+  sendTextAndFlush(protocolBuildAbort(s_sessionId, "user_barge_in"));
+  drainPlaybackQueue();
+  audioIoSpeakerMute();
+  // Stay out of IDLE — server's abort-cleanup tts.end will kick off capture.
+  Serial.println("[BUTTON] barge-in — waiting for TTS cleanup");
+}
+
+static void onButtonShortTap() {
+  SessionState s = getState();
+  switch (s) {
+  case SESSION_IDLE:
+    startListening("[BUTTON] short tap");
+    break;
+  case SESSION_CAPTURING:
+    forceEndCaptureTurn("user_short_tap");
+    break;
+  case SESSION_SPEAKING:
+    bargeInDuringTts();
+    break;
+  case SESSION_PROCESSING:
+    break;
+  }
+}
+
+static void onButtonLongPress() {
+  SessionState s = getState();
+  if (s == SESSION_IDLE) {
+    return;
+  }
+  endConversation("user_long_press");
+}
 
 static void onButtonEvent(ButtonEvent event, void *ctx) {
   (void)ctx;
-  if (event != BUTTON_EVENT_PRESSED) {
-    return;
-  }
-  SessionState s = getState();
   if (!s_sessionReady) {
     Serial.println("[BUTTON] ignored — session not ready yet");
     return;
   }
 
-  switch (s) {
-  case SESSION_IDLE:
-    startListening("[BUTTON] tap");
+  switch (event) {
+  case BUTTON_EVENT_SHORT_TAP:
+    onButtonShortTap();
     break;
-  case SESSION_CAPTURING:
-  case SESSION_PROCESSING:
-  case SESSION_SPEAKING:
-    endConversation("user_tap");
+  case BUTTON_EVENT_LONG_PRESS:
+    onButtonLongPress();
     break;
   }
 }
@@ -975,7 +986,6 @@ void wsSessionBegin() {
 
   s_stateMutex = xSemaphoreCreateMutex();
   s_wsSendMutex = xSemaphoreCreateRecursiveMutex();
-  s_micReadySem = xSemaphoreCreateBinary(); // starts empty; captureTask gives it
 
   s_playbackQueue = xQueueCreate(kPlaybackQueueDepth, sizeof(PlaybackChunk));
   if (s_playbackQueue == nullptr) {

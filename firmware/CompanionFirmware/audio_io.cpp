@@ -13,16 +13,80 @@ static const i2s_port_t SPK_PORT = I2S_NUM_1;
 
 static bool s_audioInitialized = false;
 static bool s_speakerActive = false;
-#if HAS_MIC
 static bool s_micRunning = false;
-#endif
+// Q15 smoothed gain for uplink peak normalization (1.0 == 32768).
+static int32_t s_uplinkGainQ15 = 32768;
+
+static int16_t audioIoSaturateI16(int32_t sample) {
+  if (sample > 32767) {
+    return 32767;
+  }
+  if (sample < -32768) {
+    return -32768;
+  }
+  return static_cast<int16_t>(sample);
+}
+
+static int16_t audioIoConvertMicSample(int32_t raw) {
+  return audioIoSaturateI16(raw >> MIC_DATA_SHIFT);
+}
+
+static void audioIoUplinkGainReset() { s_uplinkGainQ15 = 32768; }
+
+// Slow peak targeting (WebRTC adaptive-digital style): cut gain quickly when
+// a frame would clip, raise slowly so quiet speech isn't drowned by noise.
+static void audioIoNormalizeUplinkFrame(int16_t *samples, size_t count) {
+  if (count == 0) {
+    return;
+  }
+
+  int32_t peak = 0;
+  for (size_t i = 0; i < count; i++) {
+    int32_t absSample = samples[i];
+    if (absSample < 0) {
+      absSample = -absSample;
+    }
+    if (absSample > peak) {
+      peak = absSample;
+    }
+  }
+  // Ignore near-silence so we don't crank up idle noise between words.
+  if (peak < 768) {
+    return;
+  }
+
+  int32_t desiredGainQ15 =
+      (static_cast<int32_t>(MIC_UPLINK_TARGET_PEAK) << 15) / peak;
+  if (desiredGainQ15 > 40960) { // max +25% boost
+    desiredGainQ15 = 40960;
+  }
+  if (desiredGainQ15 < 8192) { // max -75% cut for very hot input
+    desiredGainQ15 = 8192;
+  }
+
+  int32_t smoothedGainQ15 = s_uplinkGainQ15;
+  if (desiredGainQ15 < smoothedGainQ15) {
+    // Instant attack — limiter-style; no smoothing on cut.
+    smoothedGainQ15 = desiredGainQ15;
+  } else {
+    // Slow release — avoid pumping between syllables.
+    smoothedGainQ15 =
+        (smoothedGainQ15 * 15 + desiredGainQ15) / 16;
+  }
+  s_uplinkGainQ15 = smoothedGainQ15;
+
+  for (size_t i = 0; i < count; i++) {
+    int32_t scaled =
+        (static_cast<int32_t>(samples[i]) * smoothedGainQ15) >> 15;
+    samples[i] = audioIoSaturateI16(scaled);
+  }
+}
 
 void audioIoInit() {
   if (s_audioInitialized) {
     return;
   }
 
-#if HAS_MIC
   i2s_config_t micConfig = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
       .sample_rate = COMPANION_UPLINK_SAMPLE_RATE,
@@ -58,9 +122,6 @@ void audioIoInit() {
       i2s_stop(MIC_PORT);
     }
   }
-#else
-  Serial.println("HAS_MIC=0, skipping mic I2S init");
-#endif
 
   i2s_config_t spkConfig = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
@@ -104,8 +165,8 @@ void audioIoInit() {
   s_audioInitialized = true;
 }
 
-#if HAS_MIC
 void audioIoMicStart() {
+  audioIoUplinkGainReset();
   i2s_start(MIC_PORT);
   s_micRunning = true;
 }
@@ -117,13 +178,14 @@ void audioIoMicStop() {
 
 bool audioIoMicIsRunning() { return s_micRunning; }
 
-void audioIoPrimeMic() {
+static void audioIoPrimeMicInternal(int maxRounds, const char *label) {
   audioIoVadFilterReset();
+  audioIoUplinkGainReset();
   i2s_zero_dma_buffer(MIC_PORT);
   vTaskDelay(pdMS_TO_TICKS(50));
   static uint8_t trash[COMPANION_UPLINK_FRAME_BYTES];
   int32_t peak = 5000;
-  for (int round = 0; round < 8 && peak > 4000; round++) {
+  for (int round = 0; round < maxRounds && peak > 4000; round++) {
     for (int i = 0; i < 8; i++) {
       audioIoReadUplinkFrame(trash, sizeof(trash));
     }
@@ -147,13 +209,17 @@ void audioIoPrimeMic() {
     }
   }
   if (peak > 4000) {
-    Serial.printf("audio: mic primed (peak=%ld — I2S still settling)\n",
-                  static_cast<long>(peak));
+    Serial.printf("audio: mic primed %s (peak=%ld — I2S still settling)\n",
+                  label, static_cast<long>(peak));
   } else {
-    Serial.printf("audio: mic primed (peak=%ld)\n", static_cast<long>(peak));
+    Serial.printf("audio: mic primed %s (peak=%ld)\n", label,
+                  static_cast<long>(peak));
   }
 }
-#endif
+
+void audioIoPrimeMic() { audioIoPrimeMicInternal(8, "full"); }
+
+void audioIoPrimeMicAfterPause() { audioIoPrimeMicInternal(2, "after-pause"); }
 
 void audioIoSpeakerMute() {
   if (!s_speakerActive) {
@@ -175,8 +241,58 @@ static void audioIoSpeakerEnsureStarted() {
   s_speakerActive = true;
 }
 
+// High-pass ~300 Hz @ 16 kHz — shared by uplink conditioning and VAD metrics.
+static constexpr float kUplinkHpfAlpha = 0.889f;
+static float s_uplinkHpfPrevIn = 0.0f;
+static float s_uplinkHpfPrevOut = 0.0f;
+
+// Frames below this mean |sample| after HPF are strongly attenuated before
+// peak normalization so HVAC/room hiss isn't boosted toward MIC_UPLINK_TARGET_PEAK.
+static constexpr uint32_t kUplinkNoiseGateEnergy = 450;
+static constexpr int kUplinkNoiseAttenuateShift = 3; // ÷8
+
+static int16_t audioIoUplinkHighPassSample(int16_t sample) {
+  const float x = static_cast<float>(sample);
+  const float y =
+      kUplinkHpfAlpha * (s_uplinkHpfPrevOut + x - s_uplinkHpfPrevIn);
+  s_uplinkHpfPrevIn = x;
+  s_uplinkHpfPrevOut = y;
+  if (y > 32767.0f) {
+    return 32767;
+  }
+  if (y < -32768.0f) {
+    return -32768;
+  }
+  return static_cast<int16_t>(y);
+}
+
+static void audioIoConditionUplinkFrame(int16_t *samples, size_t count) {
+  if (count == 0) {
+    return;
+  }
+
+  int64_t sumAbs = 0;
+  for (size_t i = 0; i < count; i++) {
+    samples[i] = audioIoUplinkHighPassSample(samples[i]);
+    int32_t absSample = samples[i];
+    if (absSample < 0) {
+      absSample = -absSample;
+    }
+    sumAbs += absSample;
+  }
+
+  const uint32_t energy =
+      static_cast<uint32_t>(sumAbs / static_cast<int64_t>(count));
+  if (energy < kUplinkNoiseGateEnergy) {
+    for (size_t i = 0; i < count; i++) {
+      samples[i] = static_cast<int16_t>(samples[i] >> kUplinkNoiseAttenuateShift);
+    }
+  }
+
+  audioIoNormalizeUplinkFrame(samples, count);
+}
+
 size_t audioIoReadUplinkFrame(uint8_t *out, size_t outCapacity) {
-#if HAS_MIC
   if (outCapacity < COMPANION_UPLINK_FRAME_BYTES) {
     return 0;
   }
@@ -204,13 +320,11 @@ size_t audioIoReadUplinkFrame(uint8_t *out, size_t outCapacity) {
     }
     size_t samplesRead = bytesRead / sizeof(int32_t);
     for (size_t i = 0; i < samplesRead && outSamples < targetSamples; i++) {
-      dst[outSamples++] = static_cast<int16_t>(rawBuf[i] >> MIC_DATA_SHIFT);
+      dst[outSamples++] = audioIoConvertMicSample(rawBuf[i]);
     }
   }
+  audioIoConditionUplinkFrame(dst, outSamples);
   return outSamples * sizeof(int16_t);
-#else
-  return 0;
-#endif
 }
 
 static void audioIoPlayTone(int frequencyHz, int durationMs, int amplitude) {
@@ -246,29 +360,9 @@ static void audioIoPlayTone(int frequencyHz, int durationMs, int amplitude) {
 
 void audioIoSpeakerBeep() { audioIoPlayTone(880, 120, SPEAKER_BEEP_AMPLITUDE); }
 
-// One-pole HPF ~300 Hz @ 16 kHz — attenuates fan/AC rumble for VAD only.
-static constexpr float kVadHpfAlpha = 0.889f;
-static float s_vadHpfPrevIn = 0.0f;
-static float s_vadHpfPrevOut = 0.0f;
-
 void audioIoVadFilterReset() {
-  s_vadHpfPrevIn = 0.0f;
-  s_vadHpfPrevOut = 0.0f;
-}
-
-static int16_t audioIoVadHighPassSample(int16_t sample) {
-  const float x = static_cast<float>(sample);
-  const float y =
-      kVadHpfAlpha * (s_vadHpfPrevOut + x - s_vadHpfPrevIn);
-  s_vadHpfPrevIn = x;
-  s_vadHpfPrevOut = y;
-  if (y > 32767.0f) {
-    return 32767;
-  }
-  if (y < -32768.0f) {
-    return -32768;
-  }
-  return static_cast<int16_t>(y);
+  s_uplinkHpfPrevIn = 0.0f;
+  s_uplinkHpfPrevOut = 0.0f;
 }
 
 AudioFrameVadMetrics audioIoAnalyzeVadFrame(const uint8_t *frame, size_t len) {
@@ -285,14 +379,14 @@ AudioFrameVadMetrics audioIoAnalyzeVadFrame(const uint8_t *frame, size_t len) {
   int32_t prevSign = 0;
 
   for (size_t i = 0; i < count; i++) {
-    const int16_t filtered = audioIoVadHighPassSample(samples[i]);
-    const int32_t absFiltered = (filtered < 0) ? -filtered : filtered;
-    sumAbs += absFiltered;
-    if (static_cast<uint32_t>(absFiltered) > peak) {
-      peak = static_cast<uint32_t>(absFiltered);
+    const int16_t sample = samples[i];
+    const int32_t absSample = (sample < 0) ? -sample : sample;
+    sumAbs += absSample;
+    if (static_cast<uint32_t>(absSample) > peak) {
+      peak = static_cast<uint32_t>(absSample);
     }
     const int32_t sign =
-        (filtered > 0) ? 1 : ((filtered < 0) ? -1 : 0);
+        (sample > 0) ? 1 : ((sample < 0) ? -1 : 0);
     if (sign != 0 && prevSign != 0 && sign != prevSign) {
       zeroCrossings++;
     }

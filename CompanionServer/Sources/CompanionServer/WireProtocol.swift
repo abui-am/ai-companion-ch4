@@ -42,11 +42,13 @@ struct SessionStart: Codable {
     let type: MessageType
     let audio: AudioParams
     let mode: String?
+    let language: String?
 
     enum CodingKeys: String, CodingKey {
         case type
         case audio
         case mode
+        case language
     }
 }
 
