@@ -1,3 +1,4 @@
+import CompanionDatabase
 import CompanionEnv
 import Foundation
 import Logging
@@ -18,11 +19,6 @@ enum SessionPhase: CustomStringConvertible {
     }
 }
 
-private struct ChatMessage: Sendable {
-    let role: String
-    let content: String
-}
-
 actor VoiceSession {
     private let sessionId = UUID().uuidString
     private let outbound: SessionOutboundWriter
@@ -30,6 +26,9 @@ actor VoiceSession {
     private let tts: (any TTSStreamingService)?
     private let speakers: SpeakerRegistry
     private let downlinkPacer: DownlinkPacer
+    private let config: ConfigRepository
+    private let conversations: ConversationRepository
+    private let conversationAudio: ConversationAudioStore
     private let logger: Logger
 
     private var phase: SessionPhase = .connected
@@ -45,20 +44,28 @@ actor VoiceSession {
     private var downlinkPCMDump = Data()
     private var downlinkTurnId: String?
     private var dumpOnlyMode = false
-    private var conversationHistory: [ChatMessage] = []
-    private let maxHistoryMessages = 20
+    /// Set from `ConfigRecord.personalizationData` in `applyUserConfig()` — gates whether
+    /// turns are persisted via `conversations`/`conversationAudio`.
+    private var saveConversationHistory = false
+    private var conversationSessionStarted = false
 
     init(
         outbound: SessionOutboundWriter,
         realtime: OpenAIRealtimeService,
         tts: (any TTSStreamingService)? = nil,
         speakers: SpeakerRegistry,
+        config: ConfigRepository,
+        conversations: ConversationRepository,
+        conversationAudio: ConversationAudioStore,
         logger: Logger
     ) {
         self.outbound = outbound
         self.realtime = realtime
         self.tts = tts
         self.speakers = speakers
+        self.config = config
+        self.conversations = conversations
+        self.conversationAudio = conversationAudio
         self.downlinkPacer = DownlinkPacer(
             outbound: outbound,
             speakers: speakers,
@@ -85,12 +92,40 @@ actor VoiceSession {
             )
             print("[session] dump-only mode — AI pipeline disabled")
         }
+
+        await applyUserConfig()
+
         if let language = start.language?.trimmingCharacters(in: .whitespacesAndNewlines), !language.isEmpty {
             logger.info(
                 "session response language override",
                 metadata: ["session_id": .string(sessionId), "language": .string(language)]
             )
             await realtime.setResponseLanguage(language)
+        }
+    }
+
+    /// Applies the Settings page's personality and language to the voice pipeline.
+    /// An explicit `session.start.language` (checked by the caller) overrides this.
+    private func applyUserConfig() async {
+        do {
+            let record = try await config.get()
+            await realtime.setPersonality(record.personality)
+            await realtime.setResponseLanguage(record.language.promptLabel)
+            saveConversationHistory = record.personalizationData
+            logger.info(
+                "session config applied",
+                metadata: [
+                    "session_id": .string(sessionId),
+                    "personality": .string(record.personality.rawValue),
+                    "language": .string(record.language.rawValue),
+                    "save_conversation_history": .string("\(record.personalizationData)"),
+                ]
+            )
+        } catch {
+            logger.warning(
+                "failed to load user config — using defaults",
+                metadata: ["session_id": .string(sessionId), "error": "\(error)"]
+            )
         }
     }
 
@@ -314,6 +349,18 @@ actor VoiceSession {
         stopUplinkForwarder()
         Task { await realtime.close() }
         Task { await downlinkPacer.cancel() }
+        if conversationSessionStarted {
+            Task { [conversations, sessionId, logger] in
+                do {
+                    try await conversations.endSession(id: sessionId)
+                } catch {
+                    logger.warning(
+                        "failed to end conversation session",
+                        metadata: ["session_id": .string(sessionId), "error": "\(error)"]
+                    )
+                }
+            }
+        }
         logger.info("session disconnected", metadata: ["session_id": .string(sessionId)])
     }
 
@@ -400,15 +447,7 @@ actor VoiceSession {
             downlinkFrames = await downlinkTask.value
             activeContextId = nil
 
-            if !inputText.isEmpty {
-                conversationHistory.append(ChatMessage(role: "user", content: inputText))
-            }
-            if !assistantText.isEmpty {
-                conversationHistory.append(ChatMessage(role: "assistant", content: assistantText))
-                if conversationHistory.count > maxHistoryMessages {
-                    conversationHistory.removeFirst(conversationHistory.count - maxHistoryMessages)
-                }
-            }
+            await persistConversationTurn(turnId: turnId, inputText: inputText, assistantText: assistantText)
 
             guard phase == .streamingTTS else { return }
             await downlinkPacer.endTurn()
@@ -498,15 +537,7 @@ actor VoiceSession {
             }
             logger.info("realtime event loop finished", metadata: ["session_id": .string(sessionId), "downlink_frames": "\(downlinkFrames)"])
 
-            if !inputText.isEmpty {
-                conversationHistory.append(ChatMessage(role: "user", content: inputText))
-            }
-            if !assistantText.isEmpty {
-                conversationHistory.append(ChatMessage(role: "assistant", content: assistantText))
-                if conversationHistory.count > maxHistoryMessages {
-                    conversationHistory.removeFirst(conversationHistory.count - maxHistoryMessages)
-                }
-            }
+            await persistConversationTurn(turnId: turnId, inputText: inputText, assistantText: assistantText)
 
             guard phase == .streamingTTS else { return }
             await downlinkPacer.endTurn()
@@ -554,6 +585,44 @@ actor VoiceSession {
         downlinkTurnId = nil
     }
 
+    /// Persists the transcript and WAV audio for one turn when the user has opted in via
+    /// `privacy.personalizationData`. Never throws — a storage failure must not fail the
+    /// voice turn itself, so errors are only logged.
+    private func persistConversationTurn(turnId: String, inputText: String, assistantText: String) async {
+        guard saveConversationHistory else { return }
+        let hasContent = !inputText.isEmpty || !assistantText.isEmpty || !uplinkPCMDump.isEmpty || !downlinkPCMDump.isEmpty
+        guard hasContent else { return }
+        do {
+            try await conversations.ensureSession(id: sessionId)
+            conversationSessionStarted = true
+            let uplinkPath = conversationAudio.saveUplink(sessionId: sessionId, turnId: turnId, pcm: uplinkPCMDump)
+            let downlinkPath = conversationAudio.saveDownlink(sessionId: sessionId, turnId: turnId, pcm: downlinkPCMDump)
+            if !inputText.isEmpty || uplinkPath != nil {
+                try await conversations.appendMessage(
+                    sessionId: sessionId,
+                    turnId: turnId,
+                    role: "user",
+                    content: inputText,
+                    audioPath: uplinkPath
+                )
+            }
+            if !assistantText.isEmpty || downlinkPath != nil {
+                try await conversations.appendMessage(
+                    sessionId: sessionId,
+                    turnId: turnId,
+                    role: "assistant",
+                    content: assistantText,
+                    audioPath: downlinkPath
+                )
+            }
+        } catch {
+            logger.warning(
+                "failed to persist conversation turn",
+                metadata: ["session_id": .string(sessionId), "turn_id": .string(turnId), "error": "\(error)"]
+            )
+        }
+    }
+
     private func dumpDebugUplinkAudio(_ pcm: Data, turnId: String) {
         guard !pcm.isEmpty else { return }
         do {
@@ -561,7 +630,7 @@ actor VoiceSession {
             let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
             let filename = "\(timestamp)-\(sessionId)-\(turnId)-uplink.wav"
             let fileURL = directory.appendingPathComponent(filename)
-            try Self.wrapWAV(pcm: pcm, sampleRate: AudioParams.uplink.sampleRate).write(to: fileURL)
+            try WAVWriter.wrap(pcm: pcm, sampleRate: AudioParams.uplink.sampleRate).write(to: fileURL)
             print("[debug-audio] uplink → \(fileURL.path) (\(pcm.count) bytes PCM)")
             logger.info(
                 "uplink debug audio saved",
@@ -587,7 +656,7 @@ actor VoiceSession {
             let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
             let filename = "\(timestamp)-\(sessionId)-\(turnId)-downlink.wav"
             let fileURL = directory.appendingPathComponent(filename)
-            try Self.wrapWAV(pcm: pcm, sampleRate: AudioParams.downlink.sampleRate).write(to: fileURL)
+            try WAVWriter.wrap(pcm: pcm, sampleRate: AudioParams.downlink.sampleRate).write(to: fileURL)
             print("[debug-audio] downlink → \(fileURL.path) (\(pcm.count) bytes PCM)")
             logger.info(
                 "downlink debug audio saved",
@@ -621,30 +690,6 @@ actor VoiceSession {
         return fallback
     }
 
-    private static func wrapWAV(pcm: Data, sampleRate: Int) -> Data {
-        var header = Data()
-        let byteRate = sampleRate * 2
-        let blockAlign: UInt16 = 2
-        let dataSize = UInt32(pcm.count)
-        let chunkSize = 36 + dataSize
-
-        header.append(contentsOf: "RIFF".utf8)
-        header.append(littleEndian: chunkSize)
-        header.append(contentsOf: "WAVE".utf8)
-        header.append(contentsOf: "fmt ".utf8)
-        header.append(littleEndian: UInt32(16))
-        header.append(littleEndian: UInt16(1))
-        header.append(littleEndian: UInt16(1))
-        header.append(littleEndian: UInt32(sampleRate))
-        header.append(littleEndian: UInt32(byteRate))
-        header.append(littleEndian: blockAlign)
-        header.append(littleEndian: UInt16(16))
-        header.append(contentsOf: "data".utf8)
-        header.append(littleEndian: dataSize)
-        header.append(pcm)
-        return header
-    }
-
     private func send<T: Encodable>(_ value: T) async throws {
         let data = try JSONEncoder().encode(value)
         let text = String(decoding: data, as: UTF8.self)
@@ -662,17 +707,5 @@ actor VoiceSession {
         let data = try? JSONEncoder().encode(TTSEnd(sessionId: sessionId))
         guard let data, let text = String(data: data, encoding: .utf8) else { return }
         await speakers.broadcastText(text)
-    }
-}
-
-private extension Data {
-    mutating func append(littleEndian value: UInt32) {
-        var v = value.littleEndian
-        Swift.withUnsafeBytes(of: &v) { append(contentsOf: $0) }
-    }
-
-    mutating func append(littleEndian value: UInt16) {
-        var v = value.littleEndian
-        Swift.withUnsafeBytes(of: &v) { append(contentsOf: $0) }
     }
 }

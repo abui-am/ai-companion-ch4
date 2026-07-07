@@ -53,6 +53,7 @@ dependencies.lock
 
 # ── CompanionServer local artifacts ────────────────────────────────────────────
 CompanionServer/debug-audio/
+CompanionServer/conversation-audio/
 CompanionServer/.kokoro-models/
 CompanionServer/benchmark*
 CompanionServer/realtime-output*

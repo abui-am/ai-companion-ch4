@@ -1,3 +1,4 @@
+import CompanionDatabase
 import CompanionEnv
 import Foundation
 import Hummingbird
@@ -34,12 +35,85 @@ struct CompanionServerApp {
                 "response_language": .string(config.responseLanguage),
             ]
         )
+
+        let databaseSettings: DatabaseSettings
+        do {
+            databaseSettings = try DatabaseSettings(urlString: config.databaseURL)
+        } catch {
+            logger.critical("invalid DATABASE_URL: \(error)")
+            exit(1)
+        }
+        let database = DatabaseService(settings: databaseSettings, logger: logger)
+        await database.start()
+        do {
+            try await database.ping()
+        } catch {
+            logger.critical("postgres connection failed: \(error)")
+            await database.shutdown()
+            exit(1)
+        }
+        logger.info(
+            "postgres connected",
+            metadata: [
+                "host": .string(databaseSettings.host),
+                "port": .string("\(databaseSettings.port)"),
+                "database": .string(databaseSettings.database),
+            ]
+        )
+
+        let calendar = CalendarRepository(database: database, logger: logger)
+        do {
+            try await calendar.migrate()
+        } catch {
+            logger.critical("calendar migration failed: \(error)")
+            await database.shutdown()
+            exit(1)
+        }
+
+        let userConfig = ConfigRepository(database: database, logger: logger)
+        do {
+            try await userConfig.migrate()
+        } catch {
+            logger.critical("config migration failed: \(error)")
+            await database.shutdown()
+            exit(1)
+        }
+
+        let tasks = TaskRepository(database: database, logger: logger)
+        do {
+            try await tasks.migrate()
+        } catch {
+            logger.critical("task migration failed: \(error)")
+            await database.shutdown()
+            exit(1)
+        }
+
+        let conversations = ConversationRepository(database: database, logger: logger)
+        do {
+            try await conversations.migrate()
+        } catch {
+            logger.critical("conversation migration failed: \(error)")
+            await database.shutdown()
+            exit(1)
+        }
+
         if let root = PackagePaths.packageRoot() {
             let debugDir = URL(fileURLWithPath: root, isDirectory: true)
                 .appendingPathComponent("debug-audio", isDirectory: true)
             try? FileManager.default.createDirectory(at: debugDir, withIntermediateDirectories: true)
             logger.info("debug audio dumps enabled", metadata: ["dir": .string(debugDir.path)])
             print("Debug audio WAV dumps → \(debugDir.path)/")
+        }
+
+        let conversationAudio: ConversationAudioStore
+        do {
+            let root = try ConversationAudioStore.defaultRootDirectory()
+            conversationAudio = ConversationAudioStore(rootDirectory: root, logger: logger)
+            logger.info("conversation audio enabled", metadata: ["dir": .string(root.path)])
+        } catch {
+            logger.critical("failed to create conversation-audio directory: \(error)")
+            await database.shutdown()
+            exit(1)
         }
 
         let speakers = SpeakerRegistry(logger: serverLogger)
@@ -89,6 +163,9 @@ struct CompanionServerApp {
                 realtime: realtime,
                 tts: cartesiaTTS,
                 speakers: speakers,
+                config: userConfig,
+                conversations: conversations,
+                conversationAudio: conversationAudio,
                 logger: serverLogger
             )
             try await session.start()
@@ -134,12 +211,43 @@ struct CompanionServerApp {
         let router = Router()
         router.get("/health") { _, _ in
             serverLogger.debug("GET /health")
-            return "ok"
+            do {
+                try await database.ping()
+                return "ok"
+            } catch {
+                serverLogger.warning("health check failed", metadata: ["error": "\(error)"])
+                throw HTTPError(.serviceUnavailable, message: "database unavailable")
+            }
         }
         router.get("/ping") { _, _ in
             serverLogger.debug("GET /ping")
             return "pong"
         }
+        CalendarRoutes.register(
+            on: router,
+            calendar: calendar,
+            deviceToken: config.deviceToken,
+            logger: serverLogger
+        )
+        ConfigRoutes.register(
+            on: router,
+            config: userConfig,
+            deviceToken: config.deviceToken,
+            logger: serverLogger
+        )
+        TaskRoutes.register(
+            on: router,
+            tasks: tasks,
+            deviceToken: config.deviceToken,
+            logger: serverLogger
+        )
+        ConversationRoutes.register(
+            on: router,
+            conversations: conversations,
+            audioStore: conversationAudio,
+            deviceToken: config.deviceToken,
+            logger: serverLogger
+        )
 
         let app = Application(
             router: router,
@@ -147,6 +255,7 @@ struct CompanionServerApp {
             configuration: .init(address: .hostname("0.0.0.0", port: 8080))
         )
         try await app.runService()
+        await database.shutdown()
     }
 
     static func bearerToken(from request: Request) -> String? {

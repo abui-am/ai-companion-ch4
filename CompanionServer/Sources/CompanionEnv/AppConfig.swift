@@ -37,11 +37,14 @@ public struct AppConfig: Sendable {
   public let webSearchEnabled: Bool
   public let openAISearchModel: String
   public let responseLanguage: String
+  public let databaseURL: String
 
   public var usesCartesiaTTS: Bool { ttsProvider == .cartesia }
 
   public static func load() async throws -> AppConfig {
-    let secrets: SecretsSpecifier<String, String> = .specific(["DEVICE_TOKEN", "OPENAI_API_KEY", "CARTESIA_API_KEY"])
+    let secrets: SecretsSpecifier<String, String> = .specific([
+      "DEVICE_TOKEN", "OPENAI_API_KEY", "CARTESIA_API_KEY", "DATABASE_URL",
+    ])
     var providers: [any ConfigProvider] = [
       EnvironmentVariablesProvider(secretsSpecifier: secrets),
     ]
@@ -73,6 +76,11 @@ public struct AppConfig: Sendable {
     let webSearchEnabled = reader.bool(forKey: "web.search.enabled", default: true)
     let openAISearchModel = reader.string(forKey: "openai.search.model", default: "gpt-4o-mini")
     let responseLanguage = reader.string(forKey: "companion.response.language", default: "English")
+    let databaseURL = reader.string(
+      forKey: "database.url",
+      isSecret: true,
+      default: "postgres://postgres:postgres@localhost:5432/companion"
+    )
 
     if ttsProvider == .cartesia, cartesiaAPIKey?.isEmpty != false {
       throw AppConfigError.missingCartesiaAPIKey
@@ -90,7 +98,8 @@ public struct AppConfig: Sendable {
       companionHost: companionHost,
       webSearchEnabled: webSearchEnabled,
       openAISearchModel: openAISearchModel,
-      responseLanguage: responseLanguage
+      responseLanguage: responseLanguage,
+      databaseURL: databaseURL
     )
   }
 }

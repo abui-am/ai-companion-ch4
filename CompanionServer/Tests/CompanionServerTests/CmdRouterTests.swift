@@ -1,6 +1,7 @@
 import XCTest
 @testable import CompanionServer
 @testable import TestClient
+import CompanionDatabase
 import Logging
 
 final class CmdRouterTests: XCTestCase {
@@ -53,6 +54,32 @@ final class CmdRouterTests: XCTestCase {
 
         let auto = CompanionPrompt.system(responseLanguage: "auto").lowercased()
         XCTAssertTrue(auto.contains("same language as the user's transcript"))
+    }
+
+    func testCompanionPromptPersonalityInstruction() {
+        let calm = CompanionPrompt.system(responseLanguage: "English", personality: .calm).lowercased()
+        XCTAssertTrue(calm.contains("calm"))
+        XCTAssertTrue(calm.contains("gentle"))
+
+        let energetic = CompanionPrompt.system(responseLanguage: "English", personality: .energetic).lowercased()
+        XCTAssertTrue(energetic.contains("energetic"))
+        XCTAssertTrue(energetic.contains("uplifting"))
+
+        let professional = CompanionPrompt.system(responseLanguage: "English", personality: .professional).lowercased()
+        XCTAssertTrue(professional.contains("professional"))
+        XCTAssertTrue(professional.contains("direct"))
+    }
+
+    func testCompanionPromptDefaultsToCalmPersonality() {
+        let withDefault = CompanionPrompt.system(responseLanguage: "English")
+        let withExplicitCalm = CompanionPrompt.system(responseLanguage: "English", personality: .calm)
+        XCTAssertEqual(withDefault, withExplicitCalm)
+    }
+
+    func testConfigLanguagePromptLabels() {
+        XCTAssertEqual(ConfigLanguage.english.promptLabel, "English")
+        XCTAssertEqual(ConfigLanguage.spanish.promptLabel, "Spanish")
+        XCTAssertEqual(ConfigLanguage.french.promptLabel, "French")
     }
 
     func testTalkToSpeechMetricsComputesDurations() {

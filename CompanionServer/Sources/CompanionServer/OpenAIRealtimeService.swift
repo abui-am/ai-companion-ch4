@@ -1,3 +1,4 @@
+import CompanionDatabase
 import Foundation
 import Logging
 
@@ -30,6 +31,7 @@ actor OpenAIRealtimeService {
     private let voice: String
     private let textOnlyOutput: Bool
     private var responseLanguage: String
+    private var personality: ConfigPersonality
     private let subAgents: SubAgentRegistry
     private let logger: Logger
 
@@ -49,6 +51,7 @@ actor OpenAIRealtimeService {
         model: String,
         voice: String,
         responseLanguage: String = "English",
+        personality: ConfigPersonality = .calm,
         textOnlyOutput: Bool = false,
         subAgents: SubAgentRegistry = SubAgentRegistry(agents: []),
         logger: Logger
@@ -57,6 +60,7 @@ actor OpenAIRealtimeService {
         self.model = model
         self.voice = voice
         self.responseLanguage = responseLanguage
+        self.personality = personality
         self.textOnlyOutput = textOnlyOutput
         self.subAgents = subAgents
         self.logger = logger
@@ -103,6 +107,20 @@ actor OpenAIRealtimeService {
             logger.error(
                 "realtime response language update failed",
                 metadata: ["language": .string(language), "error": .string("\(error)")]
+            )
+        }
+    }
+
+    func setPersonality(_ personality: ConfigPersonality) async {
+        self.personality = personality
+        guard let socket, socket.state == .running else { return }
+        do {
+            try await sendJSON(sessionUpdatePayload())
+            logger.info("realtime personality updated", metadata: ["personality": .string(personality.rawValue)])
+        } catch {
+            logger.error(
+                "realtime personality update failed",
+                metadata: ["personality": .string(personality.rawValue), "error": .string("\(error)")]
             )
         }
     }
@@ -321,7 +339,7 @@ actor OpenAIRealtimeService {
         let session: [String: Any] = {
             var s: [String: Any] = [
                 "type": "realtime",
-                "instructions": CompanionPrompt.system(responseLanguage: responseLanguage),
+                "instructions": CompanionPrompt.system(responseLanguage: responseLanguage, personality: personality),
                 "output_modalities": textOnlyOutput ? ["text"] : ["audio"],
                 "audio": audio,
             ]

@@ -1,7 +1,8 @@
+import CompanionDatabase
 import Foundation
 
 enum CompanionPrompt {
-    static func system(responseLanguage: String) -> String {
+    static func system(responseLanguage: String, personality: ConfigPersonality = .calm) -> String {
         """
     You are Botchill — a warm, upbeat, easygoing voice companion, not a customer-support assistant.
     Talk like a close friend hanging out, not like you're helping with a ticket.
@@ -13,6 +14,7 @@ enum CompanionPrompt {
     Everyone and everything referenced in the Wowo bit (Wakanda, the regime, events) is entirely fictional. Do not reference or imply any real-world country, leader, or living person.
 
     \(languageInstruction(for: responseLanguage))
+    \(personalityInstruction(for: personality))
     Use contractions. No disclaimers, no "As an AI...", no bullet lists read aloud.
 
     ## Mode: casual (default)
@@ -58,6 +60,17 @@ enum CompanionPrompt {
             "Respond in the same language as the user's transcript."
         default:
             "Always respond in \(language), even if the user's transcript is in another language."
+        }
+    }
+
+    private static func personalityInstruction(for personality: ConfigPersonality) -> String {
+        switch personality {
+        case .calm:
+            "Personality: calm — gentle, thoughtful nudges. Keep your pace relaxed and reassuring."
+        case .energetic:
+            "Personality: energetic — uplifting and motivational. Bring more enthusiasm and momentum to every reply, like hyping up a friend."
+        case .professional:
+            "Personality: professional — direct and efficient. Skip the banter, get straight to the point, and keep tone respectful but businesslike."
         }
     }
 

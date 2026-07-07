@@ -182,6 +182,9 @@ Functional test checklist (single turn, follow-up, no-speech timeout, barge-in, 
 | Doc | Contents |
 |-----|----------|
 | [docs/STABLE_V1.md](docs/STABLE_V1.md) | Wire protocol, pipeline, VAD constants, quick start |
+| [docs/CALENDAR_API.md](docs/CALENDAR_API.md) | Calendar REST API for frontend (`CalendarView`) |
+| [docs/CONFIG_API.md](docs/CONFIG_API.md) | Settings REST API for frontend (`SettingsView`) |
+| [docs/CONVERSATION_API.md](docs/CONVERSATION_API.md) | Read-only conversation history + audio playback API |
 | [docs/PROJECT_SUMMARY.md](docs/PROJECT_SUMMARY.md) | Full architecture and wake-word debug history |
 | [firmware/TESTING.md](firmware/TESTING.md) | CompanionFirmware test sequence |
 | [docs/ARCHIVED_LEGACY_PIPELINE.md](docs/ARCHIVED_LEGACY_PIPELINE.md) | Removed Cartesia/Kokoro multi-stage pipeline |

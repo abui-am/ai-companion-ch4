@@ -13,6 +13,7 @@ let package = Package(
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", from: "2.0.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-configuration", from: "1.0.0"),
+        .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.21.0"),
     ],
     targets: [
         .target(
@@ -22,10 +23,18 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
             ]
         ),
+        .target(
+            name: "CompanionDatabase",
+            dependencies: [
+                .product(name: "PostgresNIO", package: "postgres-nio"),
+                .product(name: "Logging", package: "swift-log"),
+            ]
+        ),
         .executableTarget(
             name: "CompanionServer",
             dependencies: [
                 "CompanionEnv",
+                "CompanionDatabase",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),
                 .product(name: "Logging", package: "swift-log"),
@@ -47,7 +56,13 @@ let package = Package(
         ),
         .testTarget(
             name: "CompanionServerTests",
-            dependencies: ["CompanionServer", "TestClient"]
+            dependencies: [
+                "CompanionServer",
+                "CompanionDatabase",
+                "TestClient",
+                .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HummingbirdTesting", package: "hummingbird"),
+            ]
         ),
     ]
 )
