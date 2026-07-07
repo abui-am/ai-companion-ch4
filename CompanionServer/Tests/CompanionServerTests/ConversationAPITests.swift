@@ -112,12 +112,28 @@ private final class ConversationAPITestHarness {
     }
 
     func trackCreatedSession(id: String) {
+        guard !createdSessionIDs.contains(id) else { return }
         createdSessionIDs.append(id)
     }
 
-    /// Creates a session with one turn (user + assistant message) and returns the session ID.
-    /// Pass `withAudio: true` to also write a fixture WAV via `audioStore`.
-    func seedTurn(sessionId: String = UUID().uuidString, turnId: String = "turn-1", withAudio: Bool = false) async throws -> String {
+    /// Creates a bare session row (no messages) and tracks it for cleanup.
+    @discardableResult
+    func createSession(id: String = UUID().uuidString) async throws -> String {
+        try await conversations.ensureSession(id: id)
+        trackCreatedSession(id: id)
+        return id
+    }
+
+    /// Appends one turn (user + assistant message) to `sessionId`, creating the session row
+    /// first if it doesn't already exist. Returns the (userMessageId, assistantMessageId) pair.
+    @discardableResult
+    func seedTurn(
+        sessionId: String,
+        turnId: String = "turn-1",
+        userContent: String = "Hello there",
+        assistantContent: String = "Hi! How can I help?",
+        withAudio: Bool = false
+    ) async throws -> (userMessageId: String, assistantMessageId: String) {
         try await conversations.ensureSession(id: sessionId)
         trackCreatedSession(id: sessionId)
         let uplinkPath = withAudio
@@ -126,20 +142,28 @@ private final class ConversationAPITestHarness {
         let downlinkPath = withAudio
             ? audioStore.saveDownlink(sessionId: sessionId, turnId: turnId, pcm: Data([4, 5, 6, 7]))
             : nil
-        try await conversations.appendMessage(
+        let userMessage = try await conversations.appendMessage(
             sessionId: sessionId,
             turnId: turnId,
             role: "user",
-            content: "Hello there",
+            content: userContent,
             audioPath: uplinkPath
         )
-        try await conversations.appendMessage(
+        let assistantMessage = try await conversations.appendMessage(
             sessionId: sessionId,
             turnId: turnId,
             role: "assistant",
-            content: "Hi! How can I help?",
+            content: assistantContent,
             audioPath: downlinkPath
         )
+        return (userMessage.id, assistantMessage.id)
+    }
+
+    /// Convenience for the common single-turn case; returns just the session ID.
+    @discardableResult
+    func seedSessionWithOneTurn(withAudio: Bool = false) async throws -> String {
+        let sessionId = UUID().uuidString
+        _ = try await seedTurn(sessionId: sessionId, withAudio: withAudio)
         return sessionId
     }
 
@@ -157,6 +181,10 @@ private final class ConversationAPITestHarness {
         decoder.dateDecodingStrategy = .iso8601
         return decoder
     }
+
+    static func iso(_ date: Date) -> String {
+        ISO8601DateFormatter().string(from: date)
+    }
 }
 
 final class ConversationAPITests: XCTestCase {
@@ -173,6 +201,8 @@ final class ConversationAPITests: XCTestCase {
         await harness?.cleanup()
         harness = nil
     }
+
+    // MARK: - Auth
 
     func testListConversationsRequiresAuth() async throws {
         let app = harness.makeApp()
@@ -197,8 +227,88 @@ final class ConversationAPITests: XCTestCase {
         }
     }
 
+    func testGetSessionRequiresAuth() async throws {
+        let sessionId = try await harness.createSession()
+        let app = harness.makeApp()
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/api/v1/conversations/\(sessionId)", method: .get) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+    }
+
+    func testGetSessionRejectsInvalidToken() async throws {
+        let sessionId = try await harness.createSession()
+        let app = harness.makeApp()
+        let headers = harness.wrongAuthHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+    }
+
+    func testListMessagesRequiresAuth() async throws {
+        let sessionId = try await harness.createSession()
+        let app = harness.makeApp()
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/api/v1/conversations/\(sessionId)/messages", method: .get) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+    }
+
+    func testListMessagesRejectsInvalidToken() async throws {
+        let sessionId = try await harness.createSession()
+        let app = harness.makeApp()
+        let headers = harness.wrongAuthHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/messages",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+    }
+
+    func testAudioEndpointRequiresAuth() async throws {
+        let sessionId = try await harness.seedSessionWithOneTurn(withAudio: true)
+        let app = harness.makeApp()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/messages/does-not-matter/audio",
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+    }
+
+    func testAudioEndpointRejectsInvalidToken() async throws {
+        let sessionId = try await harness.seedSessionWithOneTurn(withAudio: true)
+        let app = harness.makeApp()
+        let headers = harness.wrongAuthHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/messages/does-not-matter/audio",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+    }
+
+    // MARK: - List sessions
+
     func testListConversationsReturnsSeededSession() async throws {
-        let sessionId = try await harness.seedTurn()
+        let sessionId = try await harness.seedSessionWithOneTurn()
 
         let app = harness.makeApp()
         let headers = harness.authHeaders()
@@ -218,6 +328,148 @@ final class ConversationAPITests: XCTestCase {
         }
     }
 
+    func testListConversationsOrderedByStartedAtDescending() async throws {
+        let now = Date()
+        let older = try await harness.createSession()
+        let newer = try await harness.createSession()
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        let uri = "/api/v1/conversations"
+            + "?from=\(ConversationAPITestHarness.iso(now.addingTimeInterval(-30)))"
+            + "&to=\(ConversationAPITestHarness.iso(now.addingTimeInterval(30)))"
+            + "&limit=1000"
+        try await app.test(.router) { client in
+            try await client.execute(uri: uri, method: .get, headers: headers) { response in
+                XCTAssertEqual(response.status, .ok)
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationSessionsResponse.self,
+                    from: response.body
+                )
+                let ids = body.sessions.map(\.id)
+                let olderIndex = try XCTUnwrap(ids.firstIndex(of: older))
+                let newerIndex = try XCTUnwrap(ids.firstIndex(of: newer))
+                XCTAssertLessThan(newerIndex, olderIndex, "more recently started session should be listed first")
+            }
+        }
+    }
+
+    func testListConversationsFiltersByDateRange() async throws {
+        let sessionId = try await harness.createSession()
+        let now = Date()
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+
+        // In range — from/to bracketing "now" should include the seeded session.
+        let inRangeURI = "/api/v1/conversations"
+            + "?from=\(ConversationAPITestHarness.iso(now.addingTimeInterval(-3_600)))"
+            + "&to=\(ConversationAPITestHarness.iso(now.addingTimeInterval(3_600)))"
+        try await app.test(.router) { client in
+            try await client.execute(uri: inRangeURI, method: .get, headers: headers) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationSessionsResponse.self,
+                    from: response.body
+                )
+                XCTAssertTrue(body.sessions.contains(where: { $0.id == sessionId }))
+            }
+        }
+
+        // `to` entirely in the past excludes the seeded session.
+        let beforeURI = "/api/v1/conversations?to=\(ConversationAPITestHarness.iso(now.addingTimeInterval(-3_600)))"
+        try await app.test(.router) { client in
+            try await client.execute(uri: beforeURI, method: .get, headers: headers) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationSessionsResponse.self,
+                    from: response.body
+                )
+                XCTAssertFalse(body.sessions.contains(where: { $0.id == sessionId }))
+            }
+        }
+
+        // `from` entirely in the future excludes the seeded session.
+        let afterURI = "/api/v1/conversations?from=\(ConversationAPITestHarness.iso(now.addingTimeInterval(3_600)))"
+        try await app.test(.router) { client in
+            try await client.execute(uri: afterURI, method: .get, headers: headers) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationSessionsResponse.self,
+                    from: response.body
+                )
+                XCTAssertFalse(body.sessions.contains(where: { $0.id == sessionId }))
+            }
+        }
+    }
+
+    func testListConversationsRespectsLimit() async throws {
+        let now = Date()
+        try await harness.createSession()
+        try await harness.createSession()
+        try await harness.createSession()
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        let uri = "/api/v1/conversations"
+            + "?from=\(ConversationAPITestHarness.iso(now.addingTimeInterval(-30)))"
+            + "&to=\(ConversationAPITestHarness.iso(now.addingTimeInterval(30)))"
+            + "&limit=2"
+        try await app.test(.router) { client in
+            try await client.execute(uri: uri, method: .get, headers: headers) { response in
+                XCTAssertEqual(response.status, .ok)
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationSessionsResponse.self,
+                    from: response.body
+                )
+                XCTAssertEqual(body.sessions.count, 2)
+            }
+        }
+    }
+
+    // MARK: - Get session
+
+    func testGetSessionReturnsSeededSessionWithNullEndedAt() async throws {
+        let sessionId = try await harness.createSession()
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                let session = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationSession.self,
+                    from: response.body
+                )
+                XCTAssertEqual(session.id, sessionId)
+                XCTAssertNil(session.endedAt)
+            }
+        }
+    }
+
+    func testGetSessionReflectsEndedAtAfterEndSession() async throws {
+        let sessionId = try await harness.createSession()
+        try await harness.conversations.endSession(id: sessionId)
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                let session = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationSession.self,
+                    from: response.body
+                )
+                XCTAssertNotNil(session.endedAt)
+            }
+        }
+    }
+
     func testGetSessionNotFound() async throws {
         let app = harness.makeApp()
         let headers = harness.authHeaders()
@@ -232,8 +484,10 @@ final class ConversationAPITests: XCTestCase {
         }
     }
 
+    // MARK: - List messages
+
     func testListMessagesReturnsTranscriptWithoutAudioUrlWhenNoAudio() async throws {
-        let sessionId = try await harness.seedTurn(withAudio: false)
+        let sessionId = try await harness.seedSessionWithOneTurn(withAudio: false)
 
         let app = harness.makeApp()
         let headers = harness.authHeaders()
@@ -271,8 +525,103 @@ final class ConversationAPITests: XCTestCase {
         }
     }
 
-    func testMessageWithAudioExposesAudioUrlAndDownloadReturnsWavBytes() async throws {
-        let sessionId = try await harness.seedTurn(withAudio: true)
+    func testListMessagesOrderedChronologicallyAcrossTurns() async throws {
+        let sessionId = try await harness.createSession()
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-1", userContent: "First turn")
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-2", userContent: "Second turn")
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/messages",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationMessagesResponse.self,
+                    from: response.body
+                )
+                XCTAssertEqual(body.messages.map(\.turnId), ["turn-1", "turn-1", "turn-2", "turn-2"])
+                XCTAssertEqual(body.messages.map(\.role), ["user", "assistant", "user", "assistant"])
+                XCTAssertEqual(body.messages.first?.content, "First turn")
+                XCTAssertEqual(body.messages.last?.content, "Hi! How can I help?")
+            }
+        }
+    }
+
+    func testListMessagesRespectsLimitAndOffset() async throws {
+        let sessionId = try await harness.createSession()
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-1")
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-2")
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/messages?limit=2",
+                method: .get,
+                headers: headers
+            ) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationMessagesResponse.self,
+                    from: response.body
+                )
+                XCTAssertEqual(body.messages.map(\.turnId), ["turn-1", "turn-1"])
+            }
+        }
+
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/messages?limit=2&offset=2",
+                method: .get,
+                headers: headers
+            ) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationMessagesResponse.self,
+                    from: response.body
+                )
+                XCTAssertEqual(body.messages.map(\.turnId), ["turn-2", "turn-2"])
+            }
+        }
+    }
+
+    func testMessageWithAudioOnlyHasEmptyContentButStillExposesAudioUrl() async throws {
+        let sessionId = try await harness.createSession()
+        let uplinkPath = harness.audioStore.saveUplink(sessionId: sessionId, turnId: "turn-1", pcm: Data([9, 9, 9, 9]))
+        try await harness.conversations.appendMessage(
+            sessionId: sessionId,
+            turnId: "turn-1",
+            role: "user",
+            content: "",
+            audioPath: uplinkPath
+        )
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/messages",
+                method: .get,
+                headers: headers
+            ) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationMessagesResponse.self,
+                    from: response.body
+                )
+                let message = try XCTUnwrap(body.messages.first)
+                XCTAssertEqual(message.content, "")
+                XCTAssertNotNil(message.audioUrl)
+            }
+        }
+    }
+
+    // MARK: - Audio download
+
+    func testMessageWithAudioExposesAudioUrlAndDownloadReturnsUplinkWavBytes() async throws {
+        let sessionId = try await harness.seedSessionWithOneTurn(withAudio: true)
 
         let app = harness.makeApp()
         let headers = harness.authHeaders()
@@ -295,14 +644,48 @@ final class ConversationAPITests: XCTestCase {
             try await client.execute(uri: audioUrl, method: .get, headers: headers) { response in
                 XCTAssertEqual(response.status, .ok)
                 XCTAssertEqual(response.headers[.contentType], "audio/wav")
-                // WAV = 44-byte header + 4 bytes of fixture PCM.
+                XCTAssertEqual(response.headers[.contentLength], "48")
+                // WAV = 44-byte header + 4 bytes of fixture PCM; the last 4 bytes are the raw
+                // uplink PCM samples written by `seedTurn`.
                 XCTAssertEqual(response.body.readableBytes, 48)
+                let bytes = [UInt8](response.body.readableBytesView)
+                XCTAssertEqual(Array(bytes.suffix(4)), [0, 1, 2, 3])
+            }
+        }
+    }
+
+    func testMessageWithAudioDownloadReturnsDownlinkWavBytes() async throws {
+        let sessionId = try await harness.seedSessionWithOneTurn(withAudio: true)
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        let audioUrl = try await app.test(.router) { client -> String in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/messages",
+                method: .get,
+                headers: headers
+            ) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationMessagesResponse.self,
+                    from: response.body
+                )
+                let assistantMessage = try XCTUnwrap(body.messages.first(where: { $0.role == "assistant" }))
+                return try XCTUnwrap(assistantMessage.audioUrl)
+            }
+        }
+
+        try await app.test(.router) { client in
+            try await client.execute(uri: audioUrl, method: .get, headers: headers) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertEqual(response.headers[.contentType], "audio/wav")
+                let bytes = [UInt8](response.body.readableBytesView)
+                XCTAssertEqual(Array(bytes.suffix(4)), [4, 5, 6, 7])
             }
         }
     }
 
     func testAudioEndpointReturnsNotFoundWhenMessageHasNoAudio() async throws {
-        let sessionId = try await harness.seedTurn(withAudio: false)
+        let sessionId = try await harness.seedSessionWithOneTurn(withAudio: false)
 
         let app = harness.makeApp()
         let headers = harness.authHeaders()
@@ -332,15 +715,50 @@ final class ConversationAPITests: XCTestCase {
         }
     }
 
-    func testAudioEndpointRequiresAuth() async throws {
-        let sessionId = try await harness.seedTurn(withAudio: true)
+    func testAudioEndpointReturnsNotFoundForUnknownMessageId() async throws {
+        let sessionId = try await harness.createSession()
+
         let app = harness.makeApp()
+        let headers = harness.authHeaders()
         try await app.test(.router) { client in
             try await client.execute(
-                uri: "/api/v1/conversations/\(sessionId)/messages/does-not-matter/audio",
-                method: .get
+                uri: "/api/v1/conversations/\(sessionId)/messages/cmsg_does_not_exist/audio",
+                method: .get,
+                headers: headers
             ) { response in
-                XCTAssertEqual(response.status, .unauthorized)
+                XCTAssertEqual(response.status, .notFound)
+            }
+        }
+    }
+
+    func testAudioEndpointReturnsNotFoundWhenMessageBelongsToDifferentSession() async throws {
+        let sessionA = try await harness.seedSessionWithOneTurn(withAudio: true)
+        let sessionB = try await harness.createSession()
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        let messageIdFromA = try await app.test(.router) { client -> String in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionA)/messages",
+                method: .get,
+                headers: headers
+            ) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationMessagesResponse.self,
+                    from: response.body
+                )
+                let userMessage = try XCTUnwrap(body.messages.first(where: { $0.role == "user" }))
+                return userMessage.id
+            }
+        }
+
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionB)/messages/\(messageIdFromA)/audio",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
             }
         }
     }
