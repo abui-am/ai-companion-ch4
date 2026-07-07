@@ -2,6 +2,7 @@
 
 #include "audio_io.h"
 #include "config.h"
+#include "face_display.h"
 #include "ws_session.h"
 
 static void connectWiFi() {
@@ -24,12 +25,18 @@ void setup() {
                   static_cast<unsigned>(ESP.getFreeHeap()),
                   static_cast<unsigned>(ESP.getFreePsram()),
                   psramFound());
+    faceDisplayInit();
+    faceDisplaySetMode(FACE_BOOT);
+    faceDisplaySetStatusLine("Booting...");
     audioIoInit();
     audioIoSpeakerBeep();
     connectWiFi();
+    faceDisplaySetMode(FACE_CONNECTING);
+    faceDisplaySetStatusLine("Connecting...");
     wsSessionBegin();
 }
 
 void loop() {
     wsSessionLoop();
+    faceDisplayLoop();
 }

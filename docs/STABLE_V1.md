@@ -156,6 +156,10 @@ Implementation: `ws_session.cpp` (session state machine + VAD), `audio_io.cpp` (
 | Speaker WS | 7 |
 | Speaker DOUT | 5 |
 | Touch button | 11 |
+| OLED SDA | 8 |
+| OLED SCL | 9 |
+
+Face display: 1.3" SH1106 @ `0x3C` — `face_display.cpp` (FluxGarage RoboEyes + status bar). Install **Adafruit SH110X** and **FluxGarage RoboEyes** from Arduino Library Manager.
 
 `MIC_DATA_SHIFT=14`, PSRAM required for uplink queue.
 

@@ -45,3 +45,10 @@
 // Speaker output boost (max amplitude ~32767). Lower if you hear clipping.
 #define SPEAKER_BEEP_AMPLITUDE 8000
 #define SPEAKER_PLAYBACK_GAIN 1.5
+
+// Face OLED — 1.3" SH1106 (128x64), I2C @ 0x3C. Uses Adafruit SH110X +
+// FluxGarage RoboEyes (install both from Arduino Library Manager).
+#define PIN_OLED_SDA 8
+#define PIN_OLED_SCL 9
+#define OLED_I2C_ADDRESS 0x3C
+#define OLED_RESET -1

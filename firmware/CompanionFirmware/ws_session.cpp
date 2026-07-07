@@ -11,6 +11,7 @@
 #include "audio_io.h"
 #include "button.h"
 #include "config.h"
+#include "face_display.h"
 #include "pcm_codec.h"
 #include "protocol.h"
 
@@ -119,10 +120,32 @@ static SessionState getState() {
   return s;
 }
 
+static void syncFaceDisplay(SessionState s) {
+  switch (s) {
+  case SESSION_IDLE:
+    faceDisplaySetMode(FACE_IDLE);
+    faceDisplaySetStatusLine("Tap to talk");
+    break;
+  case SESSION_CAPTURING:
+    faceDisplaySetMode(FACE_LISTENING);
+    faceDisplaySetStatusLine("Listening...");
+    break;
+  case SESSION_PROCESSING:
+    faceDisplaySetMode(FACE_THINKING);
+    faceDisplaySetStatusLine("Thinking...");
+    break;
+  case SESSION_SPEAKING:
+    faceDisplaySetMode(FACE_SPEAKING);
+    faceDisplaySetStatusLine("Speaking...");
+    break;
+  }
+}
+
 static void setState(SessionState s) {
   xSemaphoreTake(s_stateMutex, portMAX_DELAY);
   s_state = s;
   xSemaphoreGive(s_stateMutex);
+  syncFaceDisplay(s);
 }
 
 static void drainPlaybackQueue() {
@@ -871,12 +894,14 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
     drainUplinkQueue();
     setState(SESSION_IDLE);
     s_sessionReady = true;
+    faceDisplaySetStatusLine("Tap to talk");
     Serial.printf("session ready: %s\n", s_sessionId.c_str());
     Serial.println(
         ">>> READY — connecting mic / server OK; wait for LISTENING <<<");
     break;
   case PROTO_MSG_TRANSCRIPT_FINAL:
     Serial.printf("transcript: %s\n", msg.text.c_str());
+    faceDisplayShowTranscript(msg.text.c_str());
     break;
   case PROTO_MSG_DEVICE_COMMAND:
     Serial.printf("device_command ignored (no actuator wired): action=%s\n",
@@ -887,6 +912,7 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
     s_prefillTarget = kInitialPrefillFrames;
     s_playbackNeedPrefill = true;
     setState(SESSION_SPEAKING);
+    faceDisplaySetStatusLine("Speaking...");
     Serial.println("[TTS] START — AI speaking");
     break;
   case PROTO_MSG_TTS_END: {
@@ -913,6 +939,8 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
     drainPlaybackQueue();
     drainUplinkQueue();
     setState(SESSION_IDLE);
+    faceDisplaySetMode(FACE_ERROR);
+    faceDisplaySetStatusLine("Error");
     break;
   case PROTO_MSG_LATENCY_REPORT:
     Serial.println("latency.report received");
@@ -963,6 +991,8 @@ static void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
     drainPlaybackQueue();
     drainUplinkQueue();
     setState(SESSION_IDLE);
+    faceDisplaySetMode(FACE_CONNECTING);
+    faceDisplaySetStatusLine("Reconnecting...");
     break;
   case WStype_TEXT:
     Serial.printf("[WS] text (%u bytes)\n", static_cast<unsigned>(length));
