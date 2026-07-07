@@ -38,6 +38,7 @@ public struct AppConfig: Sendable {
   public let openAISearchModel: String
   public let responseLanguage: String
   public let databaseURL: String
+  public let companionTimezone: String
 
   public var usesCartesiaTTS: Bool { ttsProvider == .cartesia }
 
@@ -81,6 +82,7 @@ public struct AppConfig: Sendable {
       isSecret: true,
       default: "postgres://postgres:postgres@localhost:5432/companion"
     )
+    let companionTimezone = reader.string(forKey: "companion.timezone", default: TimeZone.current.identifier)
 
     if ttsProvider == .cartesia, cartesiaAPIKey?.isEmpty != false {
       throw AppConfigError.missingCartesiaAPIKey
@@ -99,7 +101,8 @@ public struct AppConfig: Sendable {
       webSearchEnabled: webSearchEnabled,
       openAISearchModel: openAISearchModel,
       responseLanguage: responseLanguage,
-      databaseURL: databaseURL
+      databaseURL: databaseURL,
+      companionTimezone: companionTimezone
     )
   }
 }

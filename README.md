@@ -48,6 +48,12 @@ DEVICE_TOKEN=your-shared-secret
 OPENAI_API_KEY=sk-...
 ```
 
+Start Postgres (creates the `companion` database; tables are created on first server boot):
+
+```bash
+docker compose up -d
+```
+
 ```bash
 swift run CompanionServer
 ```
@@ -57,6 +63,14 @@ Verify:
 ```bash
 curl http://localhost:8080/health   # → ok
 ```
+
+**Database:** There is no SQLite file in the repo. Data lives in Postgres via Docker (`companion-postgres` container, database name `companion`). Tables (`tasks`, `calendar_events`, etc.) are created automatically when the server starts and runs migrations. To inspect:
+
+```bash
+docker exec -it companion-postgres psql -U postgres -d companion -c '\dt'
+```
+
+Connection string (default): `postgres://postgres:postgres@localhost:5432/companion`
 
 The server logs `stack_version=protocol=v1 pipeline=v1` on boot.
 
@@ -156,7 +170,9 @@ swift test
 | `OPENAI_REALTIME_MODEL` | `gpt-realtime-mini` | Realtime model |
 | `OPENAI_REALTIME_VOICE` | `verse` | Output voice |
 | `COMPANION_RESPONSE_LANGUAGE` | `English` | Reply language (`auto` = match user) |
+| `COMPANION_TIMEZONE` | server local TZ | IANA timezone for task/calendar times (e.g. `Asia/Jakarta`) |
 | `WEB_SEARCH_ENABLED` | `true` | Enable web search tool for current facts |
+| `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/companion` | Postgres connection (requires `docker compose up -d`) |
 
 Full list: `CompanionServer/.env.example`.
 
@@ -182,6 +198,7 @@ Functional test checklist (single turn, follow-up, no-speech timeout, barge-in, 
 | Doc | Contents |
 |-----|----------|
 | [docs/STABLE_V1.md](docs/STABLE_V1.md) | Wire protocol, pipeline, VAD constants, quick start |
+| [docs/TASK_API.md](docs/TASK_API.md) | Task list REST API for frontend (`TaskView`) |
 | [docs/CALENDAR_API.md](docs/CALENDAR_API.md) | Calendar REST API for frontend (`CalendarView`) |
 | [docs/CONFIG_API.md](docs/CONFIG_API.md) | Settings REST API for frontend (`SettingsView`) |
 | [docs/CONVERSATION_API.md](docs/CONVERSATION_API.md) | Read-only conversation history + audio playback API |

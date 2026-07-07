@@ -33,6 +33,7 @@ struct CompanionServerApp {
                 "cartesia_model": .string(config.cartesiaModelId),
                 "web_search": .string(config.webSearchEnabled ? "enabled" : "disabled"),
                 "response_language": .string(config.responseLanguage),
+                "companion_timezone": .string(config.companionTimezone),
             ]
         )
 
@@ -128,7 +129,10 @@ struct CompanionServerApp {
             return .dontUpgrade
         } onUpgrade: { inbound, outbound, _ in
             serverLogger.info("ws connection upgraded")
-            var subAgentList: [any SubAgent] = []
+            var subAgentList: [any SubAgent] = [
+                TaskAgent(tasks: tasks, timeZoneIdentifier: config.companionTimezone, logger: serverLogger),
+                CalendarAgent(calendar: calendar, timeZoneIdentifier: config.companionTimezone, logger: serverLogger),
+            ]
             if config.webSearchEnabled {
                 subAgentList.append(
                     WebSearchAgent(
@@ -144,6 +148,7 @@ struct CompanionServerApp {
                 model: config.openAIRealtimeModel,
                 voice: config.openAIRealtimeVoice,
                 responseLanguage: config.responseLanguage,
+                timeZoneIdentifier: config.companionTimezone,
                 textOnlyOutput: config.usesCartesiaTTS,
                 subAgents: subAgents,
                 logger: serverLogger

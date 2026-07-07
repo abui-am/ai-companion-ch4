@@ -32,6 +32,7 @@ actor OpenAIRealtimeService {
     private let textOnlyOutput: Bool
     private var responseLanguage: String
     private var personality: ConfigPersonality
+    private var timeZone: TimeZone
     private let subAgents: SubAgentRegistry
     private let logger: Logger
 
@@ -52,6 +53,7 @@ actor OpenAIRealtimeService {
         voice: String,
         responseLanguage: String = "English",
         personality: ConfigPersonality = .calm,
+        timeZoneIdentifier: String = TimeZone.current.identifier,
         textOnlyOutput: Bool = false,
         subAgents: SubAgentRegistry = SubAgentRegistry(agents: []),
         logger: Logger
@@ -61,6 +63,7 @@ actor OpenAIRealtimeService {
         self.voice = voice
         self.responseLanguage = responseLanguage
         self.personality = personality
+        self.timeZone = CompanionTimezone.resolve(identifier: timeZoneIdentifier)
         self.textOnlyOutput = textOnlyOutput
         self.subAgents = subAgents
         self.logger = logger
@@ -121,6 +124,36 @@ actor OpenAIRealtimeService {
             logger.error(
                 "realtime personality update failed",
                 metadata: ["personality": .string(personality.rawValue), "error": .string("\(error)")]
+            )
+        }
+    }
+
+    func refreshTimeContext() async {
+        guard let socket, socket.state == .running else { return }
+        do {
+            try await sendJSON(sessionUpdatePayload())
+            logger.info(
+                "realtime time context refreshed",
+                metadata: ["timezone": .string(timeZone.identifier)]
+            )
+        } catch {
+            logger.error(
+                "realtime time context refresh failed",
+                metadata: ["timezone": .string(timeZone.identifier), "error": .string("\(error)")]
+            )
+        }
+    }
+
+    func setTimeZone(_ identifier: String) async {
+        timeZone = CompanionTimezone.resolve(identifier: identifier)
+        guard let socket, socket.state == .running else { return }
+        do {
+            try await sendJSON(sessionUpdatePayload())
+            logger.info("realtime timezone updated", metadata: ["timezone": .string(timeZone.identifier)])
+        } catch {
+            logger.error(
+                "realtime timezone update failed",
+                metadata: ["timezone": .string(timeZone.identifier), "error": .string("\(error)")]
             )
         }
     }
@@ -339,7 +372,11 @@ actor OpenAIRealtimeService {
         let session: [String: Any] = {
             var s: [String: Any] = [
                 "type": "realtime",
-                "instructions": CompanionPrompt.system(responseLanguage: responseLanguage, personality: personality),
+                "instructions": CompanionPrompt.system(
+                    responseLanguage: responseLanguage,
+                    personality: personality,
+                    timeZone: timeZone
+                ),
                 "output_modalities": textOnlyOutput ? ["text"] : ["audio"],
                 "audio": audio,
             ]
@@ -451,12 +488,24 @@ actor OpenAIRealtimeService {
     }
 
     private static func toolCallDetail(name: String, argumentsJSON: String) -> String {
-        guard name == "web_search",
-              let data = argumentsJSON.data(using: .utf8),
-              let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let query = args["query"] as? String
-        else { return argumentsJSON }
-        return query
+        guard let args = SubAgentJSON.parseArguments(argumentsJSON) else { return argumentsJSON }
+
+        if name == "web_search", let query = args["query"] as? String {
+            return query
+        }
+
+        if name == "tasks" || name == "calendar" {
+            let action = args["action"] as? String ?? name
+            if let title = args["title"] as? String, !title.isEmpty {
+                return "\(action): \(title)"
+            }
+            if let id = args["id"] as? String, !id.isEmpty {
+                return "\(action): \(id)"
+            }
+            return action
+        }
+
+        return argumentsJSON
     }
 
     private static func encodeJSON(_ payload: [String: String]) -> String {

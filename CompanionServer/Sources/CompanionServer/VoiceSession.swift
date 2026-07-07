@@ -94,6 +94,7 @@ actor VoiceSession {
         }
 
         await applyUserConfig()
+        await realtime.refreshTimeContext()
 
         if let language = start.language?.trimmingCharacters(in: .whitespacesAndNewlines), !language.isEmpty {
             logger.info(

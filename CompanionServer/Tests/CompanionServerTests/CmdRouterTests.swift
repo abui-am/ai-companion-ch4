@@ -44,6 +44,10 @@ final class CmdRouterTests: XCTestCase {
         let prompt = CompanionPrompt.system(responseLanguage: "English").lowercased()
         XCTAssertTrue(prompt.contains("preamble"))
         XCTAssertTrue(prompt.contains("web_search"))
+        XCTAssertTrue(prompt.contains("tasks"))
+        XCTAssertTrue(prompt.contains("calendar"))
+        XCTAssertTrue(prompt.contains("8pm"))
+        XCTAssertTrue(prompt.contains("never"))
         XCTAssertTrue(prompt.contains("casual"))
         XCTAssertTrue(prompt.contains("serious"))
     }
@@ -71,9 +75,32 @@ final class CmdRouterTests: XCTestCase {
     }
 
     func testCompanionPromptDefaultsToCalmPersonality() {
-        let withDefault = CompanionPrompt.system(responseLanguage: "English")
-        let withExplicitCalm = CompanionPrompt.system(responseLanguage: "English", personality: .calm)
+        let fixedNow = Date(timeIntervalSince1970: 1_780_000_000)
+        let jakarta = TimeZone(identifier: "Asia/Jakarta")!
+        let withDefault = CompanionPrompt.system(
+            responseLanguage: "English",
+            timeZone: jakarta,
+            now: fixedNow
+        )
+        let withExplicitCalm = CompanionPrompt.system(
+            responseLanguage: "English",
+            personality: .calm,
+            timeZone: jakarta,
+            now: fixedNow
+        )
         XCTAssertEqual(withDefault, withExplicitCalm)
+    }
+
+    func testCompanionPromptIncludesTimezoneContext() {
+        let fixedNow = Date(timeIntervalSince1970: 1_780_000_000)
+        let jakarta = TimeZone(identifier: "Asia/Jakarta")!
+        let prompt = CompanionPrompt.system(
+            responseLanguage: "English",
+            timeZone: jakarta,
+            now: fixedNow
+        )
+        XCTAssertTrue(prompt.contains("Asia/Jakarta"))
+        XCTAssertTrue(prompt.contains("Current local time:"))
     }
 
     func testConfigLanguagePromptLabels() {
