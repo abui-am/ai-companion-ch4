@@ -49,7 +49,7 @@ final class CalendarAgentTests: XCTestCase {
         let properties = parameters?["properties"] as? [String: Any]
         let action = properties?["action"] as? [String: Any]
         let enumValues = action?["enum"] as? [String]
-        XCTAssertEqual(enumValues, ["list", "create", "delete"])
+        XCTAssertEqual(enumValues, ["list", "create", "update", "delete"])
     }
 
     func testExecuteRejectsMissingAction() async throws {

@@ -1,6 +1,7 @@
 import CompanionDatabase
 import Foundation
 import Hummingbird
+import HTTPTypes
 import Logging
 
 struct CalendarEvent: ResponseCodable, Sendable {
@@ -55,6 +56,52 @@ struct CreateCalendarEventRequest: Decodable, Sendable {
   let notes: String?
 }
 
+private struct PatchCalendarEventRequest: Decodable, Sendable {
+  let title: String?
+  let startsAt: Date?
+  let endsAt: Date?
+  let location: String?
+  let isImportant: Bool?
+  let notes: String?
+  let updateNotes: Bool
+
+  enum CodingKeys: String, CodingKey {
+    case title, startsAt, endsAt, location, isImportant, notes
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    title = try container.decodeIfPresent(String.self, forKey: .title)
+    startsAt = try container.decodeIfPresent(Date.self, forKey: .startsAt)
+    endsAt = try container.decodeIfPresent(Date.self, forKey: .endsAt)
+    location = try container.decodeIfPresent(String.self, forKey: .location)
+    isImportant = try container.decodeIfPresent(Bool.self, forKey: .isImportant)
+    if container.contains(.notes) {
+      updateNotes = true
+      if try container.decodeNil(forKey: .notes) {
+        notes = nil
+      } else {
+        notes = try container.decode(String.self, forKey: .notes)
+      }
+    } else {
+      updateNotes = false
+      notes = nil
+    }
+  }
+
+  var patch: CalendarPatch {
+    CalendarPatch(
+      title: title,
+      startsAt: startsAt,
+      endsAt: endsAt,
+      location: location,
+      isImportant: isImportant,
+      notes: notes,
+      updateNotes: updateNotes
+    )
+  }
+}
+
 enum CalendarRoutes {
   static func register(
     on router: Router<BasicRequestContext>,
@@ -89,6 +136,8 @@ enum CalendarRoutes {
           throw HTTPError(.notFound, message: error.description)
         case .invalidRange:
           throw HTTPError(.badRequest, message: error.description)
+        case .invalidInput:
+          throw HTTPError(.badRequest, message: error.description)
         }
       }
     }
@@ -112,6 +161,47 @@ enum CalendarRoutes {
         case .notFound:
           throw HTTPError(.internalServerError, message: error.description)
         case .invalidRange:
+          throw HTTPError(.badRequest, message: error.description)
+        case .invalidInput:
+          throw HTTPError(.badRequest, message: error.description)
+        }
+      }
+    }
+
+    calendarRouter.patch("/events/{id}") { request, context in
+      try requireDeviceToken(from: request, expected: deviceToken)
+      let id = try context.parameters.require("id")
+      let body = try await request.decode(as: PatchCalendarEventRequest.self, context: context)
+      do {
+        let record = try await calendar.updateEvent(id: id, patch: body.patch)
+        logger.info("PATCH /api/v1/calendar/events/{id}", metadata: ["id": .string(id)])
+        return CalendarEvent(record: record)
+      } catch let error as CalendarRepositoryError {
+        switch error {
+        case .notFound:
+          throw HTTPError(.notFound, message: error.description)
+        case .invalidRange:
+          throw HTTPError(.badRequest, message: error.description)
+        case .invalidInput:
+          throw HTTPError(.badRequest, message: error.description)
+        }
+      }
+    }
+
+    calendarRouter.delete("/events/{id}") { request, context -> HTTPResponse.Status in
+      try requireDeviceToken(from: request, expected: deviceToken)
+      let id = try context.parameters.require("id")
+      do {
+        try await calendar.deleteEvent(id: id)
+        logger.info("DELETE /api/v1/calendar/events/{id}", metadata: ["id": .string(id)])
+        return .noContent
+      } catch let error as CalendarRepositoryError {
+        switch error {
+        case .notFound:
+          throw HTTPError(.notFound, message: error.description)
+        case .invalidRange:
+          throw HTTPError(.badRequest, message: error.description)
+        case .invalidInput:
           throw HTTPError(.badRequest, message: error.description)
         }
       }

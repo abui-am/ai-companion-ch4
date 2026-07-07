@@ -5,6 +5,7 @@ import PostgresNIO
 public enum CalendarRepositoryError: Error, CustomStringConvertible, Sendable {
   case notFound(String)
   case invalidRange
+  case invalidInput(String)
 
   public var description: String {
     switch self {
@@ -12,6 +13,8 @@ public enum CalendarRepositoryError: Error, CustomStringConvertible, Sendable {
       "Calendar event not found: \(id)"
     case .invalidRange:
       "endsAt must be after startsAt"
+    case .invalidInput(let message):
+      message
     }
   }
 }
@@ -196,12 +199,54 @@ public actor CalendarRepository {
     }
   }
 
-  public func deleteEvent(id: String) async throws {
-    try await database.withConnection { connection in
-      _ = try await connection.query(
-        "DELETE FROM calendar_events WHERE id = \(id)",
+  public func updateEvent(id: String, patch: CalendarPatch) async throws -> CalendarEventRecord {
+    let current = try await event(id: id)
+    let merged = try patch.applied(to: current)
+    return try await database.withConnection { connection in
+      let rows = try await connection.query(
+        """
+        UPDATE calendar_events
+        SET title = \(merged.title),
+            starts_at = \(merged.startsAt),
+            ends_at = \(merged.endsAt),
+            location = \(merged.location),
+            is_important = \(merged.isImportant),
+            notes = \(merged.notes)
+        WHERE id = \(id)
+        RETURNING id, title, starts_at, ends_at, location, is_important, notes
+        """,
         logger: logger
       )
+      for try await record in rows.decode((String, String, Date, Date, String, Bool, String?).self) {
+        let (id, title, startsAt, endsAt, location, isImportant, notes) = record
+        return CalendarEventRecord(
+          id: id,
+          title: title,
+          startsAt: startsAt,
+          endsAt: endsAt,
+          location: location,
+          isImportant: isImportant,
+          notes: notes
+        )
+      }
+      throw CalendarRepositoryError.notFound(id)
+    }
+  }
+
+  public func deleteEvent(id: String) async throws {
+    try await database.withConnection { connection in
+      let rows = try await connection.query(
+        """
+        DELETE FROM calendar_events
+        WHERE id = \(id)
+        RETURNING id
+        """,
+        logger: logger
+      )
+      for try await _ in rows.decode((String,).self) {
+        return
+      }
+      throw CalendarRepositoryError.notFound(id)
     }
   }
 

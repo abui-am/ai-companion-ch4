@@ -329,6 +329,42 @@ final class TaskAPITests: XCTestCase {
     }
   }
 
+  func testPatchTaskUpdatesTitleAndClearsDueAt() async throws {
+    let created = try await harness.tasks.createTask(
+      title: "Original",
+      dueAt: ISO8601DateFormatter().date(from: "2026-07-10T12:00:00Z"),
+      notes: "Keep"
+    )
+    harness.trackCreatedTask(id: created.id)
+
+    let body = """
+    {
+      "title": "Renamed",
+      "dueAt": null,
+      "notes": "Updated"
+    }
+    """
+    let app = harness.makeApp()
+    let headers = harness.jsonHeaders()
+    try await app.test(.router) { client in
+      try await client.execute(
+        uri: "/api/v1/tasks/\(created.id)",
+        method: .patch,
+        headers: headers,
+        body: ByteBufferAllocator().buffer(string: body)
+      ) { response in
+        XCTAssertEqual(response.status, .ok)
+        let task = try TaskAPITestHarness.makeDecoder().decode(
+          APITask.self,
+          from: response.body
+        )
+        XCTAssertEqual(task.title, "Renamed")
+        XCTAssertNil(task.dueAt)
+        XCTAssertEqual(task.notes, "Updated")
+      }
+    }
+  }
+
   func testPatchTaskMarksCompleted() async throws {
     let created = try await harness.tasks.createTask(
       title: "Toggle me",

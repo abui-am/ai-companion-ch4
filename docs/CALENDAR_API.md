@@ -110,6 +110,44 @@ Content-Type: application/json
 
 **Response `400`:** `endsAt` is not after `startsAt`.
 
+### Update event
+
+```
+PATCH /api/v1/calendar/events/{id}
+Content-Type: application/json
+```
+
+**Request body** (all fields optional — only provided fields are updated):
+
+```json
+{
+  "title": "Team Standup (moved)",
+  "startsAt": "2026-07-07T10:00:00Z",
+  "endsAt": "2026-07-07T10:30:00Z",
+  "location": "Room 3",
+  "isImportant": true,
+  "notes": null
+}
+```
+
+Send `"notes": null` to clear notes.
+
+**Response `200`:** updated Event object.
+
+**Response `404`:** event not found.
+
+**Response `400`:** empty title or `endsAt` is not after `startsAt`.
+
+### Delete event
+
+```
+DELETE /api/v1/calendar/events/{id}
+```
+
+**Response `204`:** event deleted.
+
+**Response `404`:** event not found.
+
 ---
 
 ## Frontend examples
@@ -153,6 +191,30 @@ export async function fetchCalendarEvents(from: Date, to: Date): Promise<Calenda
 
   const data: CalendarEventsResponse = await res.json();
   return data.events;
+}
+```
+
+### Reschedule an event
+
+```typescript
+export async function updateCalendarEvent(
+  id: string,
+  patch: Partial<Pick<CalendarEvent, "title" | "startsAt" | "endsAt" | "location" | "isImportant" | "notes">>
+): Promise<CalendarEvent> {
+  const res = await fetch(`http://localhost:8080/api/v1/calendar/events/${id}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(patch),
+  });
+
+  if (!res.ok) {
+    throw new Error(`calendar update failed: ${res.status}`);
+  }
+
+  return res.json();
 }
 ```
 

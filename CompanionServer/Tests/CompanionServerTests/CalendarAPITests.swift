@@ -292,4 +292,129 @@ final class CalendarAPITests: XCTestCase {
             }
         }
     }
+
+    func testPatchEventUpdatesFields() async throws {
+        let created = try await harness.calendar.createEvent(
+            title: "Patch me",
+            startsAt: ISO8601DateFormatter().date(from: "2026-07-20T09:00:00Z")!,
+            endsAt: ISO8601DateFormatter().date(from: "2026-07-20T10:00:00Z")!,
+            location: "Office",
+            isImportant: false,
+            notes: "Original"
+        )
+        harness.trackCreatedEvent(id: created.id)
+
+        let body = """
+        {
+          "title": "Patched title",
+          "location": "Zoom",
+          "isImportant": true,
+          "notes": null
+        }
+        """
+        let app = harness.makeApp()
+        let headers = harness.jsonHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/calendar/events/\(created.id)",
+                method: .patch,
+                headers: headers,
+                body: ByteBufferAllocator().buffer(string: body)
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                let event = try CalendarAPITestHarness.makeDecoder().decode(
+                    APICalendarEvent.self,
+                    from: response.body
+                )
+                XCTAssertEqual(event.id, created.id)
+                XCTAssertEqual(event.title, "Patched title")
+                XCTAssertEqual(event.location, "Zoom")
+                XCTAssertEqual(event.isImportant, true)
+                XCTAssertNil(event.notes)
+            }
+        }
+    }
+
+    func testPatchEventRejectsInvalidRange() async throws {
+        let body = """
+        {
+          "startsAt": "2026-07-08T15:00:00Z",
+          "endsAt": "2026-07-08T14:00:00Z"
+        }
+        """
+        let app = harness.makeApp()
+        let headers = harness.jsonHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/calendar/events/evt_abc123",
+                method: .patch,
+                headers: headers,
+                body: ByteBufferAllocator().buffer(string: body)
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+            }
+        }
+    }
+
+    func testPatchEventNotFound() async throws {
+        let body = #"{"title": "Nope"}"#
+        let app = harness.makeApp()
+        let headers = harness.jsonHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/calendar/events/evt_missing",
+                method: .patch,
+                headers: headers,
+                body: ByteBufferAllocator().buffer(string: body)
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
+            }
+        }
+    }
+
+    func testDeleteEvent() async throws {
+        let created = try await harness.calendar.createEvent(
+            title: "Delete me",
+            startsAt: ISO8601DateFormatter().date(from: "2026-07-21T09:00:00Z")!,
+            endsAt: ISO8601DateFormatter().date(from: "2026-07-21T10:00:00Z")!,
+            location: "",
+            isImportant: false,
+            notes: nil
+        )
+        let createdID = created.id
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/calendar/events/\(createdID)",
+                method: .delete,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .noContent)
+            }
+
+            try await client.execute(
+                uri: "/api/v1/calendar/events/\(createdID)",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
+            }
+        }
+    }
+
+    func testDeleteEventNotFound() async throws {
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/calendar/events/evt_missing",
+                method: .delete,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
+            }
+        }
+    }
 }

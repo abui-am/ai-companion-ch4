@@ -57,7 +57,11 @@ public actor TaskRepository {
           TIMESTAMPTZ '2026-07-08 17:00:00+00',
           NULL
         )
-        ON CONFLICT (id) DO NOTHING
+        ON CONFLICT (id) DO UPDATE SET
+          title = EXCLUDED.title,
+          completed = EXCLUDED.completed,
+          due_at = EXCLUDED.due_at,
+          notes = EXCLUDED.notes
         """,
         logger: logger
       )

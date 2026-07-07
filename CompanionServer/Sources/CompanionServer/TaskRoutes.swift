@@ -51,33 +51,54 @@ struct CreateTaskRequest: Decodable, Sendable {
   let notes: String?
 }
 
-private struct NullablePatchField<Value: Decodable & Sendable>: Decodable, Sendable {
-  let value: Value?
-
-  init(from decoder: Decoder) throws {
-    let container = try decoder.singleValueContainer()
-    if container.decodeNil() {
-      value = nil
-    } else {
-      value = try container.decode(Value.self)
-    }
-  }
-}
-
 private struct PatchTaskRequest: Decodable, Sendable {
   let title: String?
-  let dueAt: NullablePatchField<Date>?
-  let notes: NullablePatchField<String>?
+  let dueAt: Date?
+  let notes: String?
   let completed: Bool?
+  let updateDueAt: Bool
+  let updateNotes: Bool
+
+  enum CodingKeys: String, CodingKey {
+    case title, dueAt, notes, completed
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    title = try container.decodeIfPresent(String.self, forKey: .title)
+    completed = try container.decodeIfPresent(Bool.self, forKey: .completed)
+    if container.contains(.dueAt) {
+      updateDueAt = true
+      if try container.decodeNil(forKey: .dueAt) {
+        dueAt = nil
+      } else {
+        dueAt = try container.decode(Date.self, forKey: .dueAt)
+      }
+    } else {
+      updateDueAt = false
+      dueAt = nil
+    }
+    if container.contains(.notes) {
+      updateNotes = true
+      if try container.decodeNil(forKey: .notes) {
+        notes = nil
+      } else {
+        notes = try container.decode(String.self, forKey: .notes)
+      }
+    } else {
+      updateNotes = false
+      notes = nil
+    }
+  }
 
   var patch: TaskPatch {
     TaskPatch(
       title: title,
-      dueAt: dueAt?.value,
-      notes: notes?.value,
+      dueAt: dueAt,
+      notes: notes,
       completed: completed,
-      updateDueAt: dueAt != nil,
-      updateNotes: notes != nil
+      updateDueAt: updateDueAt,
+      updateNotes: updateNotes
     )
   }
 }

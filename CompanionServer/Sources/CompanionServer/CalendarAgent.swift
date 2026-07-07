@@ -23,9 +23,9 @@ struct CalendarAgent: SubAgent, Sendable {
             "type": "function",
             "name": name,
             "description": """
-            Manage the user's calendar: list, add, or delete events.
+            Manage the user's calendar: list, add, update, or delete events.
 
-            Use when the user asks what's on their schedule, wants to book something, or cancel an event.
+            Use when the user asks what's on their schedule, wants to book something, reschedule, or cancel an event.
             Confirm what you changed in a short spoken reply after the tool returns.
 
             Times are in the user's local timezone (\(timeZone.identifier), offset \(offset)).
@@ -35,6 +35,7 @@ struct CalendarAgent: SubAgent, Sendable {
             Actions:
             - list: optional from and to (ISO 8601 with offset) to filter overlapping events
             - create: title, startsAt, endsAt required; optional location, isImportant, notes
+            - update: id required; optional title, startsAt, endsAt, location, isImportant, notes (string or null to clear)
             - delete: id required
             """,
             "parameters": [
@@ -42,12 +43,12 @@ struct CalendarAgent: SubAgent, Sendable {
                 "properties": [
                     "action": [
                         "type": "string",
-                        "enum": ["list", "create", "delete"],
+                        "enum": ["list", "create", "update", "delete"],
                         "description": "What to do with calendar events.",
                     ] as [String: Any],
                     "id": [
                         "type": "string",
-                        "description": "Event ID (evt_...) for delete.",
+                        "description": "Event ID (evt_...) for update or delete.",
                     ] as [String: Any],
                     "title": [
                         "type": "string",
@@ -164,6 +165,53 @@ struct CalendarAgent: SubAgent, Sendable {
                 )
                 return SubAgentJSON.encode([
                     "summary": "Created event \"\(record.title)\".",
+                    "event": eventJSON(record),
+                ])
+            case "update":
+                guard let id = args["id"] as? String else {
+                    return SubAgentJSON.encodeError("update requires id")
+                }
+                var patch = CalendarPatch()
+                if let title = args["title"] as? String {
+                    patch.title = title
+                }
+                if let startsAtString = args["startsAt"] as? String {
+                    switch SubAgentJSON.parseZonedDate(
+                        startsAtString,
+                        defaultTimeZone: timeZone,
+                        field: "startsAt"
+                    ) {
+                    case .success(let date):
+                        patch.startsAt = date
+                    case .failure(let error):
+                        return SubAgentJSON.encodeError(error.description)
+                    }
+                }
+                if let endsAtString = args["endsAt"] as? String {
+                    switch SubAgentJSON.parseZonedDate(
+                        endsAtString,
+                        defaultTimeZone: timeZone,
+                        field: "endsAt"
+                    ) {
+                    case .success(let date):
+                        patch.endsAt = date
+                    case .failure(let error):
+                        return SubAgentJSON.encodeError(error.description)
+                    }
+                }
+                if let location = args["location"] as? String {
+                    patch.location = location
+                }
+                if let isImportant = args["isImportant"] as? Bool {
+                    patch.isImportant = isImportant
+                }
+                if args.keys.contains("notes") {
+                    patch.updateNotes = true
+                    patch.notes = args["notes"] as? String
+                }
+                let record = try await calendar.updateEvent(id: id, patch: patch)
+                return SubAgentJSON.encode([
+                    "summary": "Updated event \"\(record.title)\".",
                     "event": eventJSON(record),
                 ])
             case "delete":
