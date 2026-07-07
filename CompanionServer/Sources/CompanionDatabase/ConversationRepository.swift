@@ -5,6 +5,7 @@ import PostgresNIO
 public enum ConversationRepositoryError: Error, CustomStringConvertible, Sendable {
   case sessionNotFound(String)
   case messageNotFound(String)
+  case toolCallNotFound(String)
 
   public var description: String {
     switch self {
@@ -12,6 +13,8 @@ public enum ConversationRepositoryError: Error, CustomStringConvertible, Sendabl
       "Conversation session not found: \(id)"
     case .messageNotFound(let id):
       "Conversation message not found: \(id)"
+    case .toolCallNotFound(let id):
+      "Conversation tool call not found: \(id)"
     }
   }
 }
@@ -65,6 +68,28 @@ public actor ConversationRepository {
         """
         CREATE INDEX IF NOT EXISTS conversation_sessions_started_at_idx
           ON conversation_sessions (started_at DESC)
+        """,
+        logger: logger
+      )
+      try await connection.query(
+        """
+        CREATE TABLE IF NOT EXISTS conversation_tool_calls (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL REFERENCES conversation_sessions(id) ON DELETE CASCADE,
+          turn_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          detail TEXT NOT NULL DEFAULT '',
+          arguments TEXT NOT NULL DEFAULT '{}',
+          output TEXT NOT NULL DEFAULT '',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        logger: logger
+      )
+      try await connection.query(
+        """
+        CREATE INDEX IF NOT EXISTS conversation_tool_calls_session_created_idx
+          ON conversation_tool_calls (session_id, created_at)
         """,
         logger: logger
       )
@@ -283,5 +308,77 @@ public actor ConversationRepository {
       .lowercased()
       .prefix(12)
     return "cmsg_\(suffix)"
+  }
+
+  /// Persists one completed tool call. `id` and `createdAt` are passed in (rather than
+  /// generated here) so the same values used for the live `tool.done` WebSocket event —
+  /// see `VoiceSession` — are the ones written to disk.
+  @discardableResult
+  public func appendToolCall(
+    id: String,
+    sessionId: String,
+    turnId: String,
+    name: String,
+    detail: String,
+    arguments: String,
+    output: String,
+    createdAt: Date
+  ) async throws -> ConversationToolCallRecord {
+    try await database.withConnection { connection in
+      let rows = try await connection.query(
+        """
+        INSERT INTO conversation_tool_calls (id, session_id, turn_id, name, detail, arguments, output, created_at)
+        VALUES (\(id), \(sessionId), \(turnId), \(name), \(detail), \(arguments), \(output), \(createdAt))
+        RETURNING id, session_id, turn_id, name, detail, arguments, output, created_at
+        """,
+        logger: logger
+      )
+      for try await record in rows.decode((String, String, String, String, String, String, String, Date).self) {
+        let (id, sessionId, turnId, name, detail, arguments, output, createdAt) = record
+        return ConversationToolCallRecord(
+          id: id,
+          sessionId: sessionId,
+          turnId: turnId,
+          name: name,
+          detail: detail,
+          arguments: arguments,
+          output: output,
+          createdAt: createdAt
+        )
+      }
+      throw ConversationRepositoryError.toolCallNotFound(id)
+    }
+  }
+
+  public func listToolCalls(sessionId: String, limit: Int, offset: Int) async throws -> [ConversationToolCallRecord] {
+    try await database.withConnection { connection in
+      let rows = try await connection.query(
+        """
+        SELECT id, session_id, turn_id, name, detail, arguments, output, created_at
+        FROM conversation_tool_calls
+        WHERE session_id = \(sessionId)
+        ORDER BY created_at ASC
+        LIMIT \(limit) OFFSET \(offset)
+        """,
+        logger: logger
+      )
+      var toolCalls: [ConversationToolCallRecord] = []
+      for try await record in rows.decode((String, String, String, String, String, String, String, Date).self) {
+        let (id, sessionId, turnId, name, detail, arguments, output, createdAt) = record
+        toolCalls.append(
+          ConversationToolCallRecord(
+            id: id,
+            sessionId: sessionId,
+            turnId: turnId,
+            name: name,
+            detail: detail,
+            arguments: arguments,
+            output: output,
+            createdAt: createdAt
+          )
+        )
+      }
+      return toolCalls
+    }
   }
 }

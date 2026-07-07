@@ -13,6 +13,8 @@ enum MessageType: String, Codable {
     case deviceCommand = "device_command"
     case ttsStart = "tts.start"
     case ttsEnd = "tts.end"
+    case toolStart = "tool.start"
+    case toolDone = "tool.done"
     case error
     case latencyReport = "latency.report"
 }
@@ -128,6 +130,41 @@ struct TTSEnd: Codable {
     enum CodingKeys: String, CodingKey {
         case type
         case sessionId = "session_id"
+    }
+}
+
+/// Sent when a sub-agent lookup begins, so a companion app can show "Checking your
+/// calendar…" while the model waits on `tasks`/`calendar`/`web_search`. See `ToolDone`
+/// for the completed result, and `ConversationToolCallBuilder.label` for `label` text.
+struct ToolStart: Codable {
+    var type: MessageType = .toolStart
+    let sessionId: String
+    let turnId: String
+    let tool: String
+    let label: String
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case sessionId = "session_id"
+        case turnId = "turn_id"
+        case tool
+        case label
+    }
+}
+
+/// Sent when a sub-agent lookup completes. `call` is the same structured object returned by
+/// `GET /conversations/{id}/history`, so clients can share one rendering path for both.
+struct ToolDone: Codable {
+    var type: MessageType = .toolDone
+    let sessionId: String
+    let turnId: String
+    let call: StructuredToolCall
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case sessionId = "session_id"
+        case turnId = "turn_id"
+        case call
     }
 }
 

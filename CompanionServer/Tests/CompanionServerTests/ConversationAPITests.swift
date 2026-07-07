@@ -34,6 +34,37 @@ private struct APIConversationMessagesResponse: Decodable {
     let messages: [APIConversationMessage]
 }
 
+private struct APIStructuredToolCall: Decodable {
+    let id: String
+    let tool: String
+    let action: String?
+    let label: String
+    let status: String
+    let input: [String: JSONValue]
+    let output: [String: JSONValue]
+    let summary: String?
+    let createdAt: Date
+}
+
+private struct APIConversationTurnMessage: Decodable {
+    let id: String
+    let content: String
+    let audioUrl: String?
+    let createdAt: Date
+}
+
+private struct APIConversationTurn: Decodable {
+    let turnId: String
+    let user: APIConversationTurnMessage?
+    let toolCalls: [APIStructuredToolCall]
+    let assistant: APIConversationTurnMessage?
+}
+
+private struct APIConversationHistoryResponse: Decodable {
+    let sessionId: String
+    let turns: [APIConversationTurn]
+}
+
 private final class ConversationAPITestHarness {
     let database: DatabaseService
     let conversations: ConversationRepository
@@ -165,6 +196,33 @@ private final class ConversationAPITestHarness {
         let sessionId = UUID().uuidString
         _ = try await seedTurn(sessionId: sessionId, withAudio: withAudio)
         return sessionId
+    }
+
+    /// Appends one tool call row to `sessionId`/`turnId`, creating the session row first if
+    /// needed. Mirrors `seedTurn` for tool-call coverage of `GET /{id}/history`.
+    @discardableResult
+    func seedToolCall(
+        sessionId: String,
+        turnId: String = "turn-1",
+        name: String = "calendar",
+        detail: String = "list",
+        arguments: String = #"{"action":"list"}"#,
+        output: String = #"{"summary":"Found 2 event(s).","events":[]}"#
+    ) async throws -> String {
+        try await conversations.ensureSession(id: sessionId)
+        trackCreatedSession(id: sessionId)
+        let id = "ctool_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(12))"
+        try await conversations.appendToolCall(
+            id: id,
+            sessionId: sessionId,
+            turnId: turnId,
+            name: name,
+            detail: detail,
+            arguments: arguments,
+            output: output,
+            createdAt: Date()
+        )
+        return id
     }
 
     func cleanup() async {
@@ -759,6 +817,212 @@ final class ConversationAPITests: XCTestCase {
                 headers: headers
             ) { response in
                 XCTAssertEqual(response.status, .notFound)
+            }
+        }
+    }
+
+    // MARK: - History
+
+    func testHistoryRequiresAuth() async throws {
+        let sessionId = try await harness.createSession()
+        let app = harness.makeApp()
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/api/v1/conversations/\(sessionId)/history", method: .get) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+    }
+
+    func testHistoryForUnknownSessionReturnsNotFound() async throws {
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/session-does-not-exist/history",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
+            }
+        }
+    }
+
+    func testHistoryGroupsUserAssistantAndToolCallsIntoOneTurn() async throws {
+        let sessionId = try await harness.createSession()
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-1")
+        try await harness.seedToolCall(sessionId: sessionId, turnId: "turn-1")
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/history",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationHistoryResponse.self,
+                    from: response.body
+                )
+                XCTAssertEqual(body.sessionId, sessionId)
+                let turn = try XCTUnwrap(body.turns.first)
+                XCTAssertEqual(body.turns.count, 1)
+                XCTAssertEqual(turn.turnId, "turn-1")
+                XCTAssertEqual(turn.user?.content, "Hello there")
+                XCTAssertEqual(turn.assistant?.content, "Hi! How can I help?")
+
+                let call = try XCTUnwrap(turn.toolCalls.first)
+                XCTAssertEqual(turn.toolCalls.count, 1)
+                XCTAssertEqual(call.tool, "calendar")
+                XCTAssertEqual(call.label, "list")
+                XCTAssertEqual(call.status, "success")
+                XCTAssertEqual(call.action, "list")
+                XCTAssertEqual(call.input["action"], .string("list"))
+                XCTAssertEqual(call.output["summary"], .string("Found 2 event(s)."))
+                XCTAssertEqual(call.summary, "Found 2 event(s).")
+            }
+        }
+    }
+
+    func testHistoryDerivesErrorStatusFromOutputError() async throws {
+        let sessionId = try await harness.createSession()
+        try await harness.seedToolCall(
+            sessionId: sessionId,
+            name: "tasks",
+            detail: "create",
+            arguments: #"{"action":"create"}"#,
+            output: #"{"error":"create requires title"}"#
+        )
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/history",
+                method: .get,
+                headers: headers
+            ) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationHistoryResponse.self,
+                    from: response.body
+                )
+                let call = try XCTUnwrap(body.turns.first?.toolCalls.first)
+                XCTAssertEqual(call.status, "error")
+                XCTAssertEqual(call.output["error"], .string("create requires title"))
+                XCTAssertNil(call.summary)
+            }
+        }
+    }
+
+    func testHistoryDerivesDuplicateStatusFromSummary() async throws {
+        let sessionId = try await harness.createSession()
+        try await harness.seedToolCall(
+            sessionId: sessionId,
+            name: "web_search",
+            detail: "weather in Jakarta",
+            arguments: #"{"query":"weather in Jakarta"}"#,
+            output: #"{"summary":"\#(ConversationToolCallBuilder.duplicateSummary)"}"#
+        )
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/history",
+                method: .get,
+                headers: headers
+            ) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationHistoryResponse.self,
+                    from: response.body
+                )
+                let call = try XCTUnwrap(body.turns.first?.toolCalls.first)
+                XCTAssertEqual(call.status, "duplicate")
+                XCTAssertNil(call.action)
+            }
+        }
+    }
+
+    func testHistoryOrdersTurnsNumericallyAcrossTenPlusTurns() async throws {
+        let sessionId = try await harness.createSession()
+        // "turn-10" sorts before "turn-2" lexicographically but must sort after it numerically.
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-2", userContent: "Second turn")
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-10", userContent: "Tenth turn")
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-1", userContent: "First turn")
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/history?limit=100",
+                method: .get,
+                headers: headers
+            ) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationHistoryResponse.self,
+                    from: response.body
+                )
+                XCTAssertEqual(body.turns.map(\.turnId), ["turn-1", "turn-2", "turn-10"])
+                XCTAssertEqual(body.turns.map { $0.user?.content }, ["First turn", "Second turn", "Tenth turn"])
+            }
+        }
+    }
+
+    func testHistoryRespectsLimitAndOffsetOnTurns() async throws {
+        let sessionId = try await harness.createSession()
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-1")
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-2")
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-3")
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/history?limit=2",
+                method: .get,
+                headers: headers
+            ) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationHistoryResponse.self,
+                    from: response.body
+                )
+                XCTAssertEqual(body.turns.map(\.turnId), ["turn-1", "turn-2"])
+            }
+        }
+
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/history?limit=2&offset=2",
+                method: .get,
+                headers: headers
+            ) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationHistoryResponse.self,
+                    from: response.body
+                )
+                XCTAssertEqual(body.turns.map(\.turnId), ["turn-3"])
+            }
+        }
+    }
+
+    func testHistoryReturnsEmptyToolCallsForTurnWithoutTools() async throws {
+        let sessionId = try await harness.seedSessionWithOneTurn()
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)/history",
+                method: .get,
+                headers: headers
+            ) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationHistoryResponse.self,
+                    from: response.body
+                )
+                XCTAssertEqual(body.turns.first?.toolCalls.count, 0)
             }
         }
     }

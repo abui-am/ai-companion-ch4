@@ -18,7 +18,7 @@ Persistence is gated by `privacy.personalizationData` (see [CONFIG_API.md](CONFI
 
 | `personalizationData` | Behavior |
 |------------------------|----------|
-| `true` | Every turn's transcript and audio is saved |
+| `true` | Every turn's transcript, audio, and tool calls are saved |
 | `false` | Nothing is saved — no DB rows, no WAV files |
 
 The flag is read once per session at `session.start` and cached for that session's duration, matching how `personality` and `language` are applied. Toggling it in Settings takes effect on the **next** voice session, not mid-call.
@@ -67,6 +67,42 @@ A **session** covers one WebSocket connection (from `session.start` to disconnec
 | `audioUrl` | string \| null | Present only when audio was captured for this message — see [Audio](#audio) |
 | `createdAt` | string (ISO 8601 UTC) | |
 
+A **tool call** records one sub-agent lookup (`tasks`, `calendar`, `web_search`) the model made while forming its reply to a turn:
+
+```json
+{
+  "id": "ctool_a1b2c3d4e5f6",
+  "tool": "calendar",
+  "action": "list",
+  "label": "list",
+  "status": "success",
+  "input": { "action": "list" },
+  "output": { "summary": "Found 2 event(s).", "events": [] },
+  "summary": "Found 2 event(s).",
+  "createdAt": "2026-07-07T09:00:03Z"
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | string | Stable ID, prefix `ctool_` |
+| `tool` | enum | `tasks` \| `calendar` \| `web_search` |
+| `action` | string \| null | From `input.action` (`tasks`/`calendar`); `null` for `web_search` |
+| `label` | string | Short UI text, e.g. `"list"`, `"create: Buy milk"`, or the search query |
+| `status` | enum | `success` \| `error` \| `duplicate` — see below |
+| `input` | object | Parsed arguments the model sent the tool |
+| `output` | object | Parsed result the tool returned |
+| `summary` | string \| null | Convenience copy of `output.summary`, for a collapsed row |
+| `createdAt` | string (ISO 8601 UTC) | |
+
+`status` is derived once, server-side, so every client agrees:
+
+| Condition | `status` |
+|-----------|----------|
+| `output.error` is present | `error` |
+| `output.summary` is `"Already looked that up this turn."` | `duplicate` — the model asked for the same thing twice in one turn |
+| otherwise | `success` |
+
 ---
 
 ## Endpoints
@@ -106,6 +142,54 @@ Ordered oldest-first. `limit` defaults to `100`, `offset` defaults to `0`. **Res
 ```json
 { "messages": [ { "id": "cmsg_abc123", "role": "user", "content": "Hello there", "audioUrl": "...", "createdAt": "..." } ] }
 ```
+
+### Get turn-grouped history (recommended for chat UIs)
+
+```
+GET /api/v1/conversations/{id}/history?limit=<n>&offset=<n>
+```
+
+The frontend-first alternative to `/messages`: groups each turn's user message, tool calls, and assistant reply into one object, so a client renders `turns.map(...)` with no merging or role-filtering of its own. `limit`/`offset` paginate on **turns**, not raw rows; `limit` defaults to `50`. **Response `404`** if `{id}` doesn't exist.
+
+**Response `200`:**
+
+```json
+{
+  "sessionId": "3F2A1B4C-...",
+  "turns": [
+    {
+      "turnId": "turn-1",
+      "user": {
+        "id": "cmsg_abc123",
+        "content": "What's on my calendar tomorrow?",
+        "audioUrl": "/api/v1/conversations/3F2A1B4C-.../messages/cmsg_abc123/audio",
+        "createdAt": "2026-07-07T09:00:02Z"
+      },
+      "toolCalls": [
+        {
+          "id": "ctool_a1b2c3d4e5f6",
+          "tool": "calendar",
+          "action": "list",
+          "label": "list",
+          "status": "success",
+          "input": { "action": "list" },
+          "output": { "summary": "Found 2 event(s).", "events": [] },
+          "summary": "Found 2 event(s).",
+          "createdAt": "2026-07-07T09:00:03Z"
+        }
+      ],
+      "assistant": {
+        "id": "cmsg_def456",
+        "content": "You have two things tomorrow — team standup at 9 and lunch with Alex at noon.",
+        "audioUrl": "/api/v1/conversations/3F2A1B4C-.../messages/cmsg_def456/audio",
+        "createdAt": "2026-07-07T09:00:08Z"
+      }
+    }
+  ]
+}
+```
+
+A turn with no tool calls returns `"toolCalls": []`; a turn missing one side (e.g. transcription failed) returns `null` for `user` or `assistant`.
 
 ### Download message audio
 
@@ -191,8 +275,38 @@ export type ConversationMessage = {
   createdAt: string;
 };
 
+export type ToolName = "tasks" | "calendar" | "web_search";
+export type ToolCallStatus = "success" | "error" | "duplicate";
+
+export type ConversationToolCall = {
+  id: string;
+  tool: ToolName;
+  action: string | null;
+  label: string;
+  status: ToolCallStatus;
+  input: Record<string, unknown>;
+  output: Record<string, unknown>;
+  summary: string | null;
+  createdAt: string;
+};
+
+export type ConversationTurnMessage = {
+  id: string;
+  content: string;
+  audioUrl: string | null;
+  createdAt: string;
+};
+
+export type ConversationTurn = {
+  turnId: string;
+  user: ConversationTurnMessage | null;
+  toolCalls: ConversationToolCall[];
+  assistant: ConversationTurnMessage | null;
+};
+
 export type ConversationSessionsResponse = { sessions: ConversationSession[] };
 export type ConversationMessagesResponse = { messages: ConversationMessage[] };
+export type ConversationHistoryResponse = { sessionId: string; turns: ConversationTurn[] };
 ```
 
 ### Fetch a session's transcript
@@ -215,6 +329,42 @@ export async function fetchMessages(sessionId: string): Promise<ConversationMess
 }
 ```
 
+### Fetch and render turn-grouped history
+
+```typescript
+export async function fetchHistory(sessionId: string): Promise<ConversationTurn[]> {
+  const res = await fetch(`${baseURL}/api/v1/conversations/${sessionId}/history`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!res.ok) {
+    throw new Error(`history fetch failed: ${res.status}`);
+  }
+
+  const data: ConversationHistoryResponse = await res.json();
+  return data.turns;
+}
+
+// Rendering needs no merging of separate lists — just walk each turn in order.
+for (const turn of await fetchHistory(sessionId)) {
+  renderUserBubble(turn.user);
+  for (const call of turn.toolCalls) {
+    renderToolChip(call.label, call.status, call.summary ?? call.output.error);
+  }
+  renderAssistantBubble(turn.assistant);
+}
+```
+
+---
+
+## Live tool-call events (WebSocket)
+
+During an active voice session, the server also emits `tool.start` and `tool.done` over the same `/ws` connection used for audio — see [STABLE_V1.md](STABLE_V1.md#tool-call-events). `tool.done`'s `call` field is the exact same `ConversationToolCall` shape shown above, so a companion app can share one rendering path between the live call and the persisted history it fetches afterward.
+
+```json
+{ "type": "tool.done", "session_id": "3F2A1B4C-...", "turn_id": "turn-1", "call": { "id": "ctool_...", "tool": "calendar", "status": "success", "...": "..." } }
+```
+
 ---
 
 ## Errors
@@ -222,7 +372,7 @@ export async function fetchMessages(sessionId: string): Promise<ConversationMess
 | Status | When |
 |--------|------|
 | `401` | Missing or invalid `Authorization` header |
-| `404` | Session, message, or audio not found |
+| `404` | Session, message, tool call, or audio not found |
 | `503` | Postgres unavailable (`GET /health` also fails) |
 
 ---
@@ -233,7 +383,7 @@ export async function fetchMessages(sessionId: string): Promise<ConversationMess
 2. Copy `.env.example` → `.env` and set `DEVICE_TOKEN`
 3. Set `privacy.personalizationData` to `true` via [CONFIG_API.md](CONFIG_API.md) (it defaults to `true`)
 4. Start server: `swift run CompanionServer`
-5. Complete a voice session — its transcript and audio are saved automatically on each turn
+5. Complete a voice session — its transcript, audio, and any tool calls are saved automatically on each turn
 
 ### Running API tests
 

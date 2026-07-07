@@ -78,11 +78,20 @@ Constants: `AudioParams` (Swift), `COMPANION_*` in `firmware/*/protocol.h`.
 
 **Inbound:** `session.start`, `audio.start`, `audio.stop`, `abort`
 
-**Outbound:** `session.ready`, `transcript.final`, `device_command`, `tts.start`, `tts.end`, `error`, `speaker.ready` (`/speaker` only)
+**Outbound:** `session.ready`, `transcript.final`, `device_command`, `tts.start`, `tts.end`, `tool.start`, `tool.done`, `error`, `speaker.ready` (`/speaker` only)
 
 `transcript.input` is rejected with `error` (`unsupported_event`) — use audio uplink.
 
 Full schemas: `WireProtocol.swift`, `firmware/*/protocol.h`, `.cursor/skills/hummingbird/reference.md`.
+
+#### Tool call events
+
+Sent when the model invokes a sub-agent (`tasks`, `calendar`, `web_search`) mid-turn. Firmware ignores unknown JSON types, so these are safe to add without a firmware update; companion apps can use them to show live tool activity (e.g. "Checking your calendar…").
+
+- `tool.start` — `{ session_id, turn_id, tool, label }`, sent when the lookup begins.
+- `tool.done` — `{ session_id, turn_id, call }`, sent when it completes. `call` is the same structured object (`id`, `tool`, `action`, `label`, `status`, `input`, `output`, `summary`, `createdAt`) returned by `GET /api/v1/conversations/{id}/history` — see [CONVERSATION_API.md](CONVERSATION_API.md).
+
+Persisted alongside transcripts when `privacy.personalizationData` is on. Implementation: `OpenAIRealtimeService.handleFunctionCalls` (executes the tool call), `VoiceSession` (emits the WebSocket events and persists), `ConversationToolCallBuilder` (shared label/status logic).
 
 ### Session lifecycle (v1 policy)
 

@@ -46,6 +46,40 @@ struct ConversationMessagesResponse: ResponseCodable, Sendable {
   let messages: [ConversationMessage]
 }
 
+/// One side of a turn (`user` or `assistant`) inside `ConversationTurn`. A slimmer sibling of
+/// `ConversationMessage` — omits `sessionId`/`turnId`/`role` since those are implied by nesting.
+struct ConversationTurnMessage: ResponseCodable, Sendable {
+  let id: String
+  let content: String
+  let audioUrl: String?
+  let createdAt: Date
+
+  init(record: ConversationMessageRecord) {
+    id = record.id
+    content = record.content
+    audioUrl = record.audioPath.map { _ in
+      "/api/v1/conversations/\(record.sessionId)/messages/\(record.id)/audio"
+    }
+    createdAt = record.createdAt
+  }
+}
+
+/// One turn of a conversation, grouping the user's speech, any tool calls the model made
+/// while forming its reply, and the assistant's response — the frontend-first shape for
+/// `GET /conversations/{id}/history`, so clients render `turns.map(...)` with no client-side
+/// merging of separate messages/tool-calls lists.
+struct ConversationTurn: ResponseCodable, Sendable {
+  let turnId: String
+  let user: ConversationTurnMessage?
+  let toolCalls: [StructuredToolCall]
+  let assistant: ConversationTurnMessage?
+}
+
+struct ConversationHistoryResponse: ResponseCodable, Sendable {
+  let sessionId: String
+  let turns: [ConversationTurn]
+}
+
 /// Read-only browsing of persisted conversation history — see `ConversationRepository`
 /// and `VoiceSession` (the only writer). Gated upstream by `privacy.personalizationData`.
 enum ConversationRoutes {
@@ -96,6 +130,26 @@ enum ConversationRoutes {
         metadata: ["id": .string(id), "count": "\(records.count)"]
       )
       return ConversationMessagesResponse(messages: records.map(ConversationMessage.init(record:)))
+    }
+
+    conversationRouter.get("/{id}/history") { request, context in
+      try requireDeviceToken(from: request, expected: deviceToken)
+      let id = try context.parameters.require("id")
+      do {
+        _ = try await conversations.session(id: id)
+      } catch let error as ConversationRepositoryError {
+        throw error.httpError
+      }
+      let limit = parseLimit(request.uri.queryParameters.get("limit"), default: 50)
+      let offset = request.uri.queryParameters.get("offset").flatMap(Int.init) ?? 0
+      let messages = try await conversations.listMessages(sessionId: id, limit: historyFetchLimit, offset: 0)
+      let toolCalls = try await conversations.listToolCalls(sessionId: id, limit: historyFetchLimit, offset: 0)
+      let turns = buildTurns(messages: messages, toolCalls: toolCalls, limit: limit, offset: offset)
+      logger.debug(
+        "GET /api/v1/conversations/{id}/history",
+        metadata: ["id": .string(id), "turns": "\(turns.count)"]
+      )
+      return ConversationHistoryResponse(sessionId: id, turns: turns)
     }
 
     conversationRouter.get("/{id}/messages/{messageId}/audio") { request, context in
@@ -157,12 +211,72 @@ enum ConversationRoutes {
     guard let value, let parsed = Int(value), parsed > 0 else { return defaultLimit }
     return parsed
   }
+
+  /// Upper bound when fetching a session's full message/tool-call history for grouping —
+  /// pagination for `/history` happens on the resulting turn list, not these queries.
+  private static let historyFetchLimit = 10_000
+
+  /// Groups messages and tool calls by `turnId`, sorts turns chronologically, and paginates
+  /// on the resulting turn list.
+  private static func buildTurns(
+    messages: [ConversationMessageRecord],
+    toolCalls: [ConversationToolCallRecord],
+    limit: Int,
+    offset: Int
+  ) -> [ConversationTurn] {
+    var userByTurn: [String: ConversationMessageRecord] = [:]
+    var assistantByTurn: [String: ConversationMessageRecord] = [:]
+    for message in messages {
+      if message.role == "user" {
+        userByTurn[message.turnId] = message
+      } else if message.role == "assistant" {
+        assistantByTurn[message.turnId] = message
+      }
+    }
+
+    var toolCallsByTurn: [String: [ConversationToolCallRecord]] = [:]
+    for call in toolCalls {
+      toolCallsByTurn[call.turnId, default: []].append(call)
+    }
+
+    let turnIds = Set(userByTurn.keys).union(assistantByTurn.keys).union(toolCallsByTurn.keys)
+    let sortedTurnIds = turnIds.sorted { turnOrder($0) < turnOrder($1) }
+    let page = sortedTurnIds.dropFirst(offset).prefix(limit)
+
+    return page.map { turnId in
+      ConversationTurn(
+        turnId: turnId,
+        user: userByTurn[turnId].map(ConversationTurnMessage.init(record:)),
+        toolCalls: (toolCallsByTurn[turnId] ?? []).map { record in
+          ConversationToolCallBuilder.build(
+            id: record.id,
+            name: record.name,
+            detail: record.detail,
+            argumentsJSON: record.arguments,
+            outputJSON: record.output,
+            createdAt: record.createdAt
+          )
+        },
+        assistant: assistantByTurn[turnId].map(ConversationTurnMessage.init(record:))
+      )
+    }
+  }
+
+  /// Extracts the numeric suffix from `"turn-<n>"` (see `VoiceSession.handleAudioStop`) for
+  /// chronological sorting; falls back to `Int.max` for unrecognized formats so they sort
+  /// last rather than crash.
+  private static func turnOrder(_ turnId: String) -> Int {
+    guard let dashIndex = turnId.lastIndex(of: "-"),
+      let number = Int(turnId[turnId.index(after: dashIndex)...])
+    else { return Int.max }
+    return number
+  }
 }
 
 extension ConversationRepositoryError {
   fileprivate var httpError: HTTPError {
     switch self {
-    case .sessionNotFound, .messageNotFound:
+    case .sessionNotFound, .messageNotFound, .toolCallNotFound:
       HTTPError(.notFound, message: description)
     }
   }

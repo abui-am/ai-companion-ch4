@@ -19,6 +19,15 @@ enum SessionPhase: CustomStringConvertible {
     }
 }
 
+/// A completed tool call captured mid-turn, kept alongside the raw JSON strings it was built
+/// from so `persistConversationTurn` can write them to Postgres without re-serializing the
+/// already-parsed `StructuredToolCall` sent over the WebSocket.
+private struct BufferedToolCall {
+    let call: StructuredToolCall
+    let argumentsJSON: String
+    let outputJSON: String
+}
+
 actor VoiceSession {
     private let sessionId = UUID().uuidString
     private let outbound: SessionOutboundWriter
@@ -43,6 +52,7 @@ actor VoiceSession {
     private var uplinkForwardTask: Task<Void, Never>?
     private var downlinkPCMDump = Data()
     private var downlinkTurnId: String?
+    private var toolCallsThisTurn: [BufferedToolCall] = []
     private var dumpOnlyMode = false
     /// Set from `ConfigRecord.personalizationData` in `applyUserConfig()` — gates whether
     /// turns are persisted via `conversations`/`conversationAudio`.
@@ -437,6 +447,11 @@ actor VoiceSession {
                         "tool call in progress",
                         metadata: ["session_id": .string(sessionId), "name": .string(name), "detail": .string(detail)]
                     )
+                    try? await send(ToolStart(sessionId: sessionId, turnId: turnId, tool: name, label: detail))
+                case .toolCallCompleted(let name, let detail, let argumentsJSON, let output):
+                    await recordToolCallCompleted(
+                        name: name, detail: detail, argumentsJSON: argumentsJSON, output: output, turnId: turnId
+                    )
                 case .done:
                     logger.info("realtime text stream done", metadata: ["session_id": .string(sessionId)])
                 case .error(let msg):
@@ -530,6 +545,11 @@ actor VoiceSession {
                         "tool call in progress",
                         metadata: ["session_id": .string(sessionId), "name": .string(name), "detail": .string(detail)]
                     )
+                    try? await send(ToolStart(sessionId: sessionId, turnId: turnId, tool: name, label: detail))
+                case .toolCallCompleted(let name, let detail, let argumentsJSON, let output):
+                    await recordToolCallCompleted(
+                        name: name, detail: detail, argumentsJSON: argumentsJSON, output: output, turnId: turnId
+                    )
                 case .done:
                     logger.info("realtime stream done", metadata: ["session_id": .string(sessionId)])
                 case .error(let msg):
@@ -572,7 +592,33 @@ actor VoiceSession {
     private func beginDownlinkCapture(turnId: String) async {
         downlinkTurnId = turnId
         downlinkPCMDump.removeAll(keepingCapacity: true)
+        toolCallsThisTurn.removeAll(keepingCapacity: true)
         await downlinkPacer.beginTurn()
+    }
+
+    /// Builds the structured tool call, buffers it for `persistConversationTurn`, and sends
+    /// `tool.done` over the WebSocket. Shared by both the Cartesia and OpenAI turn event loops.
+    private func recordToolCallCompleted(
+        name: String,
+        detail: String,
+        argumentsJSON: String,
+        output: String,
+        turnId: String
+    ) async {
+        let call = ConversationToolCallBuilder.build(
+            id: ConversationToolCallBuilder.makeId(),
+            name: name,
+            detail: detail,
+            argumentsJSON: argumentsJSON,
+            outputJSON: output,
+            createdAt: Date()
+        )
+        toolCallsThisTurn.append(BufferedToolCall(call: call, argumentsJSON: argumentsJSON, outputJSON: output))
+        logger.info(
+            "tool call completed",
+            metadata: ["session_id": .string(sessionId), "name": .string(name), "status": .string(call.status)]
+        )
+        try? await send(ToolDone(sessionId: sessionId, turnId: turnId, call: call))
     }
 
     private func sendDownlinkPCM(_ pcm: Data) async -> Int {
@@ -591,7 +637,8 @@ actor VoiceSession {
     /// voice turn itself, so errors are only logged.
     private func persistConversationTurn(turnId: String, inputText: String, assistantText: String) async {
         guard saveConversationHistory else { return }
-        let hasContent = !inputText.isEmpty || !assistantText.isEmpty || !uplinkPCMDump.isEmpty || !downlinkPCMDump.isEmpty
+        let hasContent = !inputText.isEmpty || !assistantText.isEmpty || !uplinkPCMDump.isEmpty
+            || !downlinkPCMDump.isEmpty || !toolCallsThisTurn.isEmpty
         guard hasContent else { return }
         do {
             try await conversations.ensureSession(id: sessionId)
@@ -614,6 +661,18 @@ actor VoiceSession {
                     role: "assistant",
                     content: assistantText,
                     audioPath: downlinkPath
+                )
+            }
+            for buffered in toolCallsThisTurn {
+                try await conversations.appendToolCall(
+                    id: buffered.call.id,
+                    sessionId: sessionId,
+                    turnId: turnId,
+                    name: buffered.call.tool,
+                    detail: buffered.call.label,
+                    arguments: buffered.argumentsJSON,
+                    output: buffered.outputJSON,
+                    createdAt: buffered.call.createdAt
                 )
             }
         } catch {

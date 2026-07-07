@@ -7,6 +7,7 @@ enum RealtimeAudioEvent: Sendable {
     case inputTranscript(String)   // completed user-speech transcript
     case assistantTranscript(String) // incremental assistant text delta
     case toolCallStarted(name: String, detail: String)
+    case toolCallCompleted(name: String, detail: String, argumentsJSON: String, output: String)
     case done
     case error(String)
 }
@@ -418,13 +419,15 @@ actor OpenAIRealtimeService {
         for call in calls {
             guard !Task.isCancelled, turnContinuation != nil else { return }
 
+            let detail = ConversationToolCallBuilder.label(name: call.name, argumentsJSON: call.argumentsJSON)
+
             let dedupeKey = Self.toolCallDedupeKey(name: call.name, argumentsJSON: call.argumentsJSON)
             if let dedupeKey, executedToolCallsThisTurn.contains(dedupeKey) {
                 logger.info(
                     "skipping duplicate tool call",
                     metadata: ["name": .string(call.name), "key": .string(dedupeKey)]
                 )
-                let outputString = Self.encodeJSON(["summary": "Already looked that up this turn."])
+                let outputString = Self.encodeJSON(["summary": ConversationToolCallBuilder.duplicateSummary])
                 try? await sendJSON([
                     "type": "conversation.item.create",
                     "item": [
@@ -433,6 +436,9 @@ actor OpenAIRealtimeService {
                         "output": outputString,
                     ],
                 ])
+                turnContinuation?.yield(
+                    .toolCallCompleted(name: call.name, detail: detail, argumentsJSON: call.argumentsJSON, output: outputString)
+                )
                 continue
             }
             if let dedupeKey {
@@ -450,10 +456,12 @@ actor OpenAIRealtimeService {
                         "output": outputString,
                     ],
                 ])
+                turnContinuation?.yield(
+                    .toolCallCompleted(name: call.name, detail: detail, argumentsJSON: call.argumentsJSON, output: outputString)
+                )
                 continue
             }
 
-            let detail = Self.toolCallDetail(name: call.name, argumentsJSON: call.argumentsJSON)
             turnContinuation?.yield(.toolCallStarted(name: call.name, detail: detail))
             logger.info("realtime tool call", metadata: ["name": .string(call.name), "detail": .string(detail)])
 
@@ -469,6 +477,9 @@ actor OpenAIRealtimeService {
                     "output": outputString,
                 ],
             ])
+            turnContinuation?.yield(
+                .toolCallCompleted(name: call.name, detail: detail, argumentsJSON: call.argumentsJSON, output: outputString)
+            )
         }
 
         guard !Task.isCancelled, turnContinuation != nil else { return }
@@ -485,27 +496,6 @@ actor OpenAIRealtimeService {
         let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !normalized.isEmpty else { return nil }
         return "\(name):\(normalized)"
-    }
-
-    private static func toolCallDetail(name: String, argumentsJSON: String) -> String {
-        guard let args = SubAgentJSON.parseArguments(argumentsJSON) else { return argumentsJSON }
-
-        if name == "web_search", let query = args["query"] as? String {
-            return query
-        }
-
-        if name == "tasks" || name == "calendar" {
-            let action = args["action"] as? String ?? name
-            if let title = args["title"] as? String, !title.isEmpty {
-                return "\(action): \(title)"
-            }
-            if let id = args["id"] as? String, !id.isEmpty {
-                return "\(action): \(id)"
-            }
-            return action
-        }
-
-        return argumentsJSON
     }
 
     private static func encodeJSON(_ payload: [String: String]) -> String {
