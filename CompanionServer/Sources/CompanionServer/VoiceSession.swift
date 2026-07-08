@@ -627,6 +627,10 @@ actor VoiceSession {
 
     /// Builds the structured tool call, buffers it for `persistConversationTurn`, and sends
     /// `tool.done` over the WebSocket. Shared by both the Cartesia and OpenAI turn event loops.
+    /// `handled_ms` tracks only this synchronous portion — the memory context refresh below is
+    /// fire-and-forget precisely so it does not inflate this number or delay the next event in
+    /// this turn's stream (audio/transcript deltas queued behind this await would otherwise
+    /// stall on a Postgres round trip + Realtime `session.update`).
     private func recordToolCallCompleted(
         name: String,
         detail: String,
@@ -634,6 +638,7 @@ actor VoiceSession {
         output: String,
         turnId: String
     ) async {
+        let handledStart = Date()
         let call = ConversationToolCallBuilder.build(
             id: ConversationToolCallBuilder.makeId(),
             name: name,
@@ -643,23 +648,32 @@ actor VoiceSession {
             createdAt: Date()
         )
         toolCallsThisTurn.append(BufferedToolCall(call: call, argumentsJSON: argumentsJSON, outputJSON: output))
+        try? await send(ToolDone(sessionId: sessionId, turnId: turnId, call: call))
         logger.info(
             "tool call completed",
-            metadata: ["session_id": .string(sessionId), "name": .string(name), "status": .string(call.status)]
+            metadata: [
+                "session_id": .string(sessionId),
+                "name": .string(name),
+                "status": .string(call.status),
+                "handled_ms": "\(Int(Date().timeIntervalSince(handledStart) * 1000))",
+            ]
         )
-        try? await send(ToolDone(sessionId: sessionId, turnId: turnId, call: call))
-        await refreshMemoryContextIfMutated(name: name, argumentsJSON: argumentsJSON, status: call.status)
+        scheduleMemoryContextRefreshIfMutated(name: name, argumentsJSON: argumentsJSON, status: call.status)
     }
 
     /// Re-inject saved facts into the Realtime system prompt after remember/forget so the
-    /// model can recall them in the same session without a reconnect.
-    private func refreshMemoryContextIfMutated(name: String, argumentsJSON: String, status: String) async {
+    /// model can recall them in the same session without a reconnect. Runs detached from the
+    /// turn's event loop — see `recordToolCallCompleted` — so a slow memory list or session
+    /// update never delays this turn's own audio/response streaming.
+    private func scheduleMemoryContextRefreshIfMutated(name: String, argumentsJSON: String, status: String) {
         guard name == "memory", status == "success", saveConversationHistory else { return }
         guard let args = SubAgentJSON.parseArguments(argumentsJSON),
               let action = args["action"] as? String
         else { return }
         guard action == "remember" || action == "forget" else { return }
-        await refreshMemoryContext()
+        Task { [weak self] in
+            await self?.refreshMemoryContext()
+        }
     }
 
     private func sendDownlinkPCM(_ pcm: Data) async -> Int {

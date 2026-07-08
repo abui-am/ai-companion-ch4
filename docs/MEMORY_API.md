@@ -99,6 +99,15 @@ curl -s -X DELETE \
 - **Remember:** the model calls `memory.remember` when the user asks it to remember something, or a durable fact clearly comes up. Each distinct fact gets its own row. Only a **rephrase of the same fact** (similar wording + close embedding) updates the existing row instead of inserting a new one.
 - **Forget:** the model calls `memory.forget` with a natural-language `query` (not an ID — users say "forget my dog's name," not `mem_abc`). The closest matching memory above the same similarity threshold is deleted.
 
+### Latency notes
+
+`remember` has no spoken preamble (see `CompanionPrompt`), so every stage between the tool call and the model continuing its reply is silent dead air. To keep that budget tight:
+
+- The privacy gate (`personalizationData`) is cached in-memory per connection for 5s (`PersonalizationCache`) instead of hitting Postgres on every tool call.
+- The OpenAI Embeddings request timeout is 8s, not the 20s used to be — a stuck embeddings call now fails fast instead of stalling the turn.
+- Re-injecting updated facts into the Realtime system prompt after `remember`/`forget` runs detached from the turn's event loop (fire-and-forget), so it never delays that turn's own audio/response streaming.
+- `MemoryAgent` logs a `memory remember latency` line with a `config_check_ms` / `embedding_ms` / `dedup_ms` / `write_ms` / `total_ms` breakdown per call — use it to spot regressions.
+
 ---
 
 ## Frontend examples

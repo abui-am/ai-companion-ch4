@@ -21,13 +21,13 @@ struct MemoryAgent: SubAgent, Sendable {
 
     private let memories: MemoryRepository
     private let embeddings: OpenAIEmbeddingService
-    private let config: ConfigRepository
+    private let personalizationCache: PersonalizationCache
     private let logger: Logger
 
     init(memories: MemoryRepository, embeddings: OpenAIEmbeddingService, config: ConfigRepository, logger: Logger) {
         self.memories = memories
         self.embeddings = embeddings
-        self.config = config
+        self.personalizationCache = PersonalizationCache(config: config, logger: logger)
         self.logger = logger
     }
 
@@ -80,6 +80,7 @@ struct MemoryAgent: SubAgent, Sendable {
     }
 
     func execute(argumentsJSON: String) async -> String {
+        let totalStart = Date()
         guard let args = SubAgentJSON.parseArguments(argumentsJSON) else {
             logger.error("memory invalid arguments", metadata: ["args": .string(argumentsJSON)])
             return SubAgentJSON.encodeError("invalid arguments JSON")
@@ -88,7 +89,10 @@ struct MemoryAgent: SubAgent, Sendable {
             return SubAgentJSON.encodeError("missing action")
         }
 
-        guard await isPersonalizationEnabled() else {
+        let configCheckStart = Date()
+        let personalizationEnabled = await personalizationCache.isEnabled()
+        let configCheckMs = Self.elapsedMs(since: configCheckStart)
+        guard personalizationEnabled else {
             return SubAgentJSON.encodeError(
                 "Memory is off. Enable personalization in Settings to save or recall memories."
             )
@@ -97,7 +101,7 @@ struct MemoryAgent: SubAgent, Sendable {
         do {
             switch action {
             case "remember":
-                return try await remember(args: args)
+                return try await remember(args: args, configCheckMs: configCheckMs, totalStart: totalStart)
             case "search":
                 return try await search(args: args)
             case "forget":
@@ -119,19 +123,9 @@ struct MemoryAgent: SubAgent, Sendable {
         }
     }
 
-    private func isPersonalizationEnabled() async -> Bool {
-        do {
-            return try await config.get().personalizationData
-        } catch {
-            logger.warning(
-                "memory failed to load config — defaulting to disabled",
-                metadata: ["error": "\(error)"]
-            )
-            return false
-        }
-    }
-
-    private func remember(args: [String: Any]) async throws -> String {
+    /// Voice replies have no preamble for `remember` (see `CompanionPrompt`), so every stage
+    /// here is silent dead air to the user — timings are logged to keep that budget honest.
+    private func remember(args: [String: Any], configCheckMs: Int, totalStart: Date) async throws -> String {
         guard let content = (args["content"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !content.isEmpty
         else {
@@ -141,11 +135,25 @@ struct MemoryAgent: SubAgent, Sendable {
             return SubAgentJSON.encodeError("content must be \(Self.maxContentLength) characters or fewer")
         }
 
+        let embeddingStart = Date()
         let embedding = try await embeddings.embed(text: content)
-        if let duplicate = try await memories.findDuplicate(embedding: embedding, maxDistance: Self.duplicateMaxDistance),
-           Self.isNearDuplicateContent(existing: duplicate.content, new: content)
-        {
+        let embeddingMs = Self.elapsedMs(since: embeddingStart)
+
+        let dedupStart = Date()
+        let duplicate = try await memories.findDuplicate(embedding: embedding, maxDistance: Self.duplicateMaxDistance)
+        let dedupMs = Self.elapsedMs(since: dedupStart)
+
+        if let duplicate, Self.isNearDuplicateContent(existing: duplicate.content, new: content) {
+            let writeStart = Date()
             let updated = try await memories.update(id: duplicate.id, content: content, embedding: embedding)
+            logRememberLatency(
+                outcome: "updated",
+                configCheckMs: configCheckMs,
+                embeddingMs: embeddingMs,
+                dedupMs: dedupMs,
+                writeMs: Self.elapsedMs(since: writeStart),
+                totalStart: totalStart
+            )
             return SubAgentJSON.encode([
                 "summary": "Updated existing memory.",
                 "id": updated.id,
@@ -154,7 +162,16 @@ struct MemoryAgent: SubAgent, Sendable {
             ])
         }
 
+        let writeStart = Date()
         let record = try await memories.insert(content: content, embedding: embedding)
+        logRememberLatency(
+            outcome: "inserted",
+            configCheckMs: configCheckMs,
+            embeddingMs: embeddingMs,
+            dedupMs: dedupMs,
+            writeMs: Self.elapsedMs(since: writeStart),
+            totalStart: totalStart
+        )
         logger.info("memory saved", metadata: ["id": .string(record.id), "content": .string(record.content)])
         return SubAgentJSON.encode([
             "summary": "Saved memory.",
@@ -162,6 +179,31 @@ struct MemoryAgent: SubAgent, Sendable {
             "content": record.content,
             "updated": false,
         ])
+    }
+
+    private static func elapsedMs(since start: Date) -> Int {
+        Int(Date().timeIntervalSince(start) * 1000)
+    }
+
+    private func logRememberLatency(
+        outcome: String,
+        configCheckMs: Int,
+        embeddingMs: Int,
+        dedupMs: Int,
+        writeMs: Int,
+        totalStart: Date
+    ) {
+        logger.info(
+            "memory remember latency",
+            metadata: [
+                "outcome": .string(outcome),
+                "config_check_ms": "\(configCheckMs)",
+                "embedding_ms": "\(embeddingMs)",
+                "dedup_ms": "\(dedupMs)",
+                "write_ms": "\(writeMs)",
+                "total_ms": "\(Self.elapsedMs(since: totalStart))",
+            ]
+        )
     }
 
     private func search(args: [String: Any]) async throws -> String {

@@ -25,7 +25,6 @@ enum RealtimeAudioEvent: Sendable {
 ///   5. `close()` — called on session disconnect.
 actor OpenAIRealtimeService {
     private static let sampleRate = 24_000
-    private static let maxToolRoundsPerTurn = 5
 
     private let apiKey: String
     private let model: String
@@ -350,14 +349,6 @@ actor OpenAIRealtimeService {
                         "tools": .string(calls.map(\.name).joined(separator: ",")),
                     ]
                 )
-                if toolCallRoundsThisTurn > Self.maxToolRoundsPerTurn {
-                    logger.warning(
-                        "realtime tool round cap exceeded",
-                        metadata: ["max_rounds": "\(Self.maxToolRoundsPerTurn)"]
-                    )
-                    finishTurn(with: .error("Too many tool calls this turn"))
-                    return
-                }
                 toolCallTask?.cancel()
                 toolCallTask = Task { [weak self] in
                     await self?.handleFunctionCalls(calls)

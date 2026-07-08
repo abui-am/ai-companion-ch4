@@ -26,7 +26,10 @@ struct OpenAIEmbeddingService: Sendable {
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 20
+        // `memory.remember`/`search` block the voice turn with no spoken preamble (unlike
+        // web_search's 45s budget, which has one) — typical embedding calls return in well
+        // under a second, so fail fast rather than leaving the user in silence for up to 20s.
+        request.timeoutInterval = 8
 
         let body: [String: Any] = ["model": model, "input": trimmed]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
