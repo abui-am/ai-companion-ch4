@@ -96,7 +96,7 @@ curl -s -X DELETE \
 
 - **Session start (free):** the 8 most recent memories are listed into the model's system prompt as "Known facts about this user" — no embedding call, so recall works on a brand-new connection without the user having to ask the AI to "check its memory."
 - **On demand:** the model calls `memory.search` with a natural-language query when the user references something older or not in that list. Results below a similarity threshold are dropped, so unrelated memories are never surfaced.
-- **Remember:** the model calls `memory.remember` when the user asks it to remember something, or a durable fact clearly comes up. A near-duplicate check updates the existing row instead of creating a new one.
+- **Remember:** the model calls `memory.remember` when the user asks it to remember something, or a durable fact clearly comes up. Each distinct fact gets its own row. Only a **rephrase of the same fact** (similar wording + close embedding) updates the existing row instead of inserting a new one.
 - **Forget:** the model calls `memory.forget` with a natural-language `query` (not an ID — users say "forget my dog's name," not `mem_abc`). The closest matching memory above the same similarity threshold is deleted.
 
 ---

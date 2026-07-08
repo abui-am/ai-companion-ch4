@@ -110,8 +110,8 @@ actor VoiceSession {
             print("[session] dump-only mode — AI pipeline disabled")
         }
 
+        await realtime.connect()
         await applyUserConfig()
-        await realtime.refreshTimeContext()
         await refreshMemoryContext()
 
         if let language = start.language?.trimmingCharacters(in: .whitespacesAndNewlines), !language.isEmpty {
@@ -123,13 +123,13 @@ actor VoiceSession {
         }
     }
 
-    /// Applies the Settings page's personality and language to the voice pipeline.
-    /// An explicit `session.start.language` (checked by the caller) overrides this.
+    /// Applies personality and language to the Realtime session (requires an active socket).
     private func applyUserConfig() async {
         do {
             let record = try await config.get()
             await realtime.setPersonality(record.personality)
             await realtime.setResponseLanguage(record.language.promptLabel)
+            await realtime.refreshTimeContext()
             saveConversationHistory = record.personalizationData
             logger.info(
                 "session config applied",
@@ -648,6 +648,18 @@ actor VoiceSession {
             metadata: ["session_id": .string(sessionId), "name": .string(name), "status": .string(call.status)]
         )
         try? await send(ToolDone(sessionId: sessionId, turnId: turnId, call: call))
+        await refreshMemoryContextIfMutated(name: name, argumentsJSON: argumentsJSON, status: call.status)
+    }
+
+    /// Re-inject saved facts into the Realtime system prompt after remember/forget so the
+    /// model can recall them in the same session without a reconnect.
+    private func refreshMemoryContextIfMutated(name: String, argumentsJSON: String, status: String) async {
+        guard name == "memory", status == "success", saveConversationHistory else { return }
+        guard let args = SubAgentJSON.parseArguments(argumentsJSON),
+              let action = args["action"] as? String
+        else { return }
+        guard action == "remember" || action == "forget" else { return }
+        await refreshMemoryContext()
     }
 
     private func sendDownlinkPCM(_ pcm: Data) async -> Int {

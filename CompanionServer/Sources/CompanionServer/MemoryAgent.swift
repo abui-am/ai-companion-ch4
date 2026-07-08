@@ -13,7 +13,10 @@ struct MemoryAgent: SubAgent, Sendable {
     private static let defaultSearchLimit = 5
     private static let defaultListLimit = 20
     private static let maxContentLength = 500
-    private static let duplicateMaxDistance = 0.08
+    /// Embedding pre-filter for dedup — final merge also requires similar wording
+    /// (`isNearDuplicateContent`) so unrelated facts (name vs city, coffee vs tea)
+    /// always get their own row.
+    private static let duplicateMaxDistance = 0.05
     private static let searchMaxDistance = 0.35
 
     private let memories: MemoryRepository
@@ -35,10 +38,13 @@ struct MemoryAgent: SubAgent, Sendable {
             "description": """
             Store and recall durable personal facts about the user across conversations — name, \
             preferences, relationships, routines. The most recent facts are already listed in your \
-            instructions; use this tool for anything not already known or from long ago.
+            instructions; use search for anything not listed or from long ago. \
+            When the user explicitly asks you to remember something, call remember immediately — \
+            do not reply that you saved it without calling the tool.
 
             Actions:
-            - remember: content required — save one short fact (one sentence)
+            - remember: content required — save one short fact (one sentence). Each distinct \
+            fact gets its own memory — do not rely on updating a single row for everything.
             - search: query required, optional limit (default 5) — semantic search over saved facts
             - forget: query or id — remove a fact by meaning or by exact ID
             - list: optional limit (default 20) — most recent facts, no search
@@ -136,7 +142,9 @@ struct MemoryAgent: SubAgent, Sendable {
         }
 
         let embedding = try await embeddings.embed(text: content)
-        if let duplicate = try await memories.findDuplicate(embedding: embedding, maxDistance: Self.duplicateMaxDistance) {
+        if let duplicate = try await memories.findDuplicate(embedding: embedding, maxDistance: Self.duplicateMaxDistance),
+           Self.isNearDuplicateContent(existing: duplicate.content, new: content)
+        {
             let updated = try await memories.update(id: duplicate.id, content: content, embedding: embedding)
             return SubAgentJSON.encode([
                 "summary": "Updated existing memory.",
@@ -147,6 +155,7 @@ struct MemoryAgent: SubAgent, Sendable {
         }
 
         let record = try await memories.insert(content: content, embedding: embedding)
+        logger.info("memory saved", metadata: ["id": .string(record.id), "content": .string(record.content)])
         return SubAgentJSON.encode([
             "summary": "Saved memory.",
             "id": record.id,
@@ -197,5 +206,37 @@ struct MemoryAgent: SubAgent, Sendable {
 
     private func memoryJSON(_ record: MemoryRecord) -> [String: Any] {
         ["id": record.id, "content": record.content]
+    }
+
+    /// True only for rephrases of the same fact — not merely related topics in embedding space.
+    static func isNearDuplicateContent(existing: String, new: String) -> Bool {
+        let existingNormalized = Self.normalizedMemoryContent(existing)
+        let newNormalized = Self.normalizedMemoryContent(new)
+        if existingNormalized.isEmpty || newNormalized.isEmpty {
+            return false
+        }
+        if existingNormalized == newNormalized {
+            return true
+        }
+        if existingNormalized.contains(newNormalized) || newNormalized.contains(existingNormalized) {
+            return true
+        }
+
+        let existingWords = Set(existingNormalized.split(separator: " "))
+        let newWords = Set(newNormalized.split(separator: " "))
+        guard !existingWords.isEmpty, !newWords.isEmpty else {
+            return false
+        }
+        let overlap = existingWords.intersection(newWords).count
+        let smaller = min(existingWords.count, newWords.count)
+        return Double(overlap) / Double(smaller) >= 0.75
+    }
+
+    private static func normalizedMemoryContent(_ text: String) -> String {
+        text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
     }
 }

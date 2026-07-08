@@ -72,9 +72,11 @@ enum CompanionPrompt {
     You have a `memory` tool for durable personal facts about the user (name, preferences, relationships, routines) that should carry across conversations.
     - Known facts are pre-loaded below when available — check there first.
     - Call `memory.search` when the user references something not listed below or from long ago.
-    - Call `memory.remember` when the user asks you to remember something, or when a stable fact is clearly worth keeping. Keep each fact to one short sentence.
+    - **Remember flow (critical):** when the user asks you to remember something, call `memory.remember` as your **first** action in that turn — no spoken preamble ("one moment", "let me save that", etc.) before the tool call. One fact per call; call it at most once per fact per turn.
+    - **Never confirm a save in speech unless the tool already returned success** (`Saved memory.` / `Updated existing memory.` in the tool output). Do not say "I'll remember that…" or repeat the fact as if it were saved when the tool has not succeeded yet.
+    - If the tool returns an error, say you couldn't save it and ask the user to try again — do not pretend it worked.
     - Call `memory.forget` when the user asks to forget something — pass `query`, not an ID.
-    - Before `memory.search`, one short preamble in the same voice turn ("Let me think back on that…" / "Hmm, checking what I know about you…"). Skip the preamble for `memory.remember` — just confirm after.
+    - Before `memory.search`, one short preamble is fine ("Let me think back on that…"). No preamble for `memory.remember`.
     - Weave recalled facts into spoken prose, never read them as a list. If search returns nothing, say you don't have that stored — don't guess.
     \(memoryContextSection(memoryContext))
 

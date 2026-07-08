@@ -25,7 +25,7 @@ enum RealtimeAudioEvent: Sendable {
 ///   5. `close()` — called on session disconnect.
 actor OpenAIRealtimeService {
     private static let sampleRate = 24_000
-    private static let maxToolRoundsPerTurn = 2
+    private static let maxToolRoundsPerTurn = 5
 
     private let apiKey: String
     private let model: String
@@ -150,7 +150,13 @@ actor OpenAIRealtimeService {
     /// embedding cost. Tool-driven writes/search are unaffected; see `MemoryAgent`.
     func refreshMemoryContext(memories: [MemoryRecord]) async {
         memoryContext = Self.formatMemoryContext(memories)
-        guard let socket, socket.state == .running else { return }
+        guard let socket, socket.state == .running else {
+            logger.debug(
+                "realtime memory context staged — socket not ready yet",
+                metadata: ["count": "\(memories.count)"]
+            )
+            return
+        }
         do {
             try await sendJSON(sessionUpdatePayload())
             logger.info("realtime memory context refreshed", metadata: ["count": "\(memories.count)"])
@@ -341,6 +347,7 @@ actor OpenAIRealtimeService {
                     metadata: [
                         "round": "\(toolCallRoundsThisTurn)",
                         "calls": "\(calls.count)",
+                        "tools": .string(calls.map(\.name).joined(separator: ",")),
                     ]
                 )
                 if toolCallRoundsThisTurn > Self.maxToolRoundsPerTurn {
@@ -511,14 +518,40 @@ actor OpenAIRealtimeService {
     }
 
     private static func toolCallDedupeKey(name: String, argumentsJSON: String) -> String? {
-        guard name == "web_search",
-              let data = argumentsJSON.data(using: .utf8),
-              let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let query = args["query"] as? String
+        guard let data = argumentsJSON.data(using: .utf8),
+              let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
-        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !normalized.isEmpty else { return nil }
-        return "\(name):\(normalized)"
+
+        if name == "web_search",
+           let query = args["query"] as? String
+        {
+            let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !normalized.isEmpty else { return nil }
+            return "web_search:\(normalized)"
+        }
+
+        if name == "memory",
+           let action = args["action"] as? String
+        {
+            switch action {
+            case "remember":
+                if let content = args["content"] as? String {
+                    let normalized = content.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    guard !normalized.isEmpty else { return nil }
+                    return "memory:remember:\(normalized)"
+                }
+            case "search", "forget":
+                if let query = args["query"] as? String {
+                    let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    guard !normalized.isEmpty else { return nil }
+                    return "memory:\(action):\(normalized)"
+                }
+            default:
+                break
+            }
+        }
+
+        return nil
     }
 
     private static func encodeJSON(_ payload: [String: String]) -> String {

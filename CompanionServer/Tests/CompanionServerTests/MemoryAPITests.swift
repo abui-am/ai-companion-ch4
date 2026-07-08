@@ -314,6 +314,22 @@ final class MemoryAPITests: XCTestCase {
         XCTAssertEqual(all.filter { $0.id == record.id }.count, 1)
     }
 
+    func testInsertAllowsMultipleDistinctFacts() async throws {
+        let name = try await harness.memories.insert(
+            content: "User's name is Ali",
+            embedding: MemoryAPITestHarness.unitVector(at: 0)
+        )
+        harness.trackCreatedMemory(id: name.id)
+        let city = try await harness.memories.insert(
+            content: "User lives in Jakarta",
+            embedding: MemoryAPITestHarness.unitVector(at: 1)
+        )
+        harness.trackCreatedMemory(id: city.id)
+
+        let all = try await harness.memories.list(limit: 100)
+        XCTAssertEqual(all.filter { $0.id == name.id || $0.id == city.id }.count, 2)
+    }
+
     func testDeleteBestMatchRemovesClosestMatchAboveThreshold() async throws {
         let record = try await harness.memories.insert(
             content: "User's dog is named Max",
@@ -516,6 +532,32 @@ final class MemoryAPITests: XCTestCase {
                 XCTAssertEqual(call.summary, "Saved memory.")
             }
         }
+    }
+}
+
+final class MemoryAgentContentDedupTests: XCTestCase {
+    func testNearDuplicateContentDetectsRephrase() {
+        XCTAssertTrue(
+            MemoryAgent.isNearDuplicateContent(
+                existing: "User's dog is named Max",
+                new: "User's dog is named Max the golden retriever"
+            )
+        )
+    }
+
+    func testNearDuplicateContentRejectsDistinctFacts() {
+        XCTAssertFalse(
+            MemoryAgent.isNearDuplicateContent(
+                existing: "User's name is Ali",
+                new: "User lives in Jakarta"
+            )
+        )
+        XCTAssertFalse(
+            MemoryAgent.isNearDuplicateContent(
+                existing: "User likes coffee",
+                new: "User's favorite color is blue"
+            )
+        )
     }
 }
 
