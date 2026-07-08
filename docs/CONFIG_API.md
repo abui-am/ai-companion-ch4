@@ -263,6 +263,7 @@ Tests use `DATABASE_URL` (default `postgres://postgres:postgres@localhost:5432/c
 
 ## Related docs
 
+- [PROFILE_API.md](PROFILE_API.md) — Profile and focus time REST endpoints (same auth, same server)
 - [CALENDAR_API.md](CALENDAR_API.md) — Calendar REST API (same auth, same server)
 - [MEMORY_API.md](MEMORY_API.md) — AI long-term memory, also gated by `privacy.personalizationData`
 - [STABLE_V1.md](STABLE_V1.md) — WebSocket voice protocol; `personality` and `language` from this API are applied to the voice pipeline at the start of each session

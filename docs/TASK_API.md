@@ -288,6 +288,7 @@ Tests use `DATABASE_URL` (default `postgres://postgres:postgres@localhost:5432/c
 
 ## Related docs
 
+- [PROFILE_API.md](PROFILE_API.md) — Profile and focus time REST endpoints
 - [CALENDAR_API.md](CALENDAR_API.md) — Calendar REST endpoints
 - [CONFIG_API.md](CONFIG_API.md) — Settings REST endpoints
 - [STABLE_V1.md](STABLE_V1.md) — WebSocket voice protocol

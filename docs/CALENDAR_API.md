@@ -287,6 +287,7 @@ Tests use `DATABASE_URL` (default `postgres://postgres:postgres@localhost:5432/c
 
 ## Related docs
 
+- [PROFILE_API.md](PROFILE_API.md) — Profile and focus time REST endpoints
 - [TASK_API.md](TASK_API.md) — Task REST endpoints
 - [STABLE_V1.md](STABLE_V1.md) — WebSocket voice protocol (separate from calendar REST)
 - [../CompanionServer/.env.example](../CompanionServer/.env.example) — `DEVICE_TOKEN`, `DATABASE_URL`

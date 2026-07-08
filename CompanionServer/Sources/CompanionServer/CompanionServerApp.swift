@@ -88,6 +88,15 @@ struct CompanionServerApp {
             exit(1)
         }
 
+        let profile = ProfileRepository(database: database, logger: logger)
+        do {
+            try await profile.migrate()
+        } catch {
+            logger.critical("profile migration failed: \(error)")
+            await database.shutdown()
+            exit(1)
+        }
+
         let tasks = TaskRepository(database: database, logger: logger)
         do {
             try await tasks.migrate()
@@ -261,6 +270,12 @@ struct CompanionServerApp {
         ConfigRoutes.register(
             on: router,
             config: userConfig,
+            deviceToken: config.deviceToken,
+            logger: serverLogger
+        )
+        ProfileRoutes.register(
+            on: router,
+            profile: profile,
             deviceToken: config.deviceToken,
             logger: serverLogger
         )

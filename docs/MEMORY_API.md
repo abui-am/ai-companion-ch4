@@ -184,4 +184,5 @@ Repository tests use fixed, orthogonal test vectors rather than calling the live
 
 - [CONFIG_API.md](CONFIG_API.md) — `privacy.personalizationData` toggle that gates this API's data
 - [CONVERSATION_API.md](CONVERSATION_API.md) — `memory` tool calls also appear in persisted conversation history
+- [PROFILE_API.md](PROFILE_API.md) — Profile and focus time REST endpoints (same auth, same server)
 - [TASK_API.md](TASK_API.md) — Task REST endpoints (same auth, same server)
