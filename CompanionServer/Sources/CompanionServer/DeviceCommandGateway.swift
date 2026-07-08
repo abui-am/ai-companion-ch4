@@ -19,10 +19,12 @@ struct DeviceCommandGateway: Sendable {
             let text = String(decoding: data, as: UTF8.self)
             try await outbound.writeText(text)
             logger.info(
-                "device command sent",
+                "move device command sent",
                 metadata: [
                     "action": .string(validated.action),
                     "pattern": .string(validated.params.pattern ?? ""),
+                    "duration_ms": .string(validated.params.durationMs.map { "\($0)" } ?? "default"),
+                    "json": .string(text),
                 ]
             )
             return nil

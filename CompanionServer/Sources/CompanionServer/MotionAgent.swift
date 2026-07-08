@@ -23,21 +23,22 @@ struct MotionAgent: SubAgent, Sendable {
             "type": "function",
             "name": name,
             "description": """
-            Move the companion robot on its desk — slow, gentle wheel motion only.
+            Move this physical desk robot's wheels — slow, gentle motion only. \
+            **Required** whenever the user wants the bot to move; speech alone does not move the hardware.
 
-            Use when the user asks the bot to move, stroll, wander, turn around, come closer, \
-            or explore the desk area. Keep movements small — the robot stays on a desk and must \
-            not drive fast or off the edge.
+            Trigger on: move, stroll, wander, walk/roll/drive/go/throw around (the desk/deck), \
+            turn around, come closer, back up, explore the desk, stop moving.
+
+            Speech-to-text often mishears — "throw around the deck" usually means stroll on the desk.
 
             Actions:
-            - stroll: short wander — forward a bit, turn, repeat (best for "walk around")
+            - stroll: short wander — forward a bit, turn, repeat (default for "walk/throw/stroll around")
             - forward / backward: one short gentle bump
-            - turn_left / turn_right: pivot in place (~quarter turn)
-            - stop: stop wheels immediately
+            - turn_left / turn_right: pivot in place
+            - stop: halt wheels immediately
 
-            Optional duration_ms (50–2000) for single moves — omit for stroll/stop defaults.
-            After the tool returns, give a brief playful spoken reaction; do not describe PWM \
-            or motor details.
+            Call this tool before confirming movement in speech. Optional duration_ms (50–2000) for \
+            single moves; omit for stroll/stop.
             """,
             "parameters": [
                 "type": "object",
@@ -69,6 +70,15 @@ struct MotionAgent: SubAgent, Sendable {
         }
 
         let durationMs = args["duration_ms"] as? Int
+        logger.info(
+            "move tool invoked",
+            metadata: [
+                "action": .string(action),
+                "duration_ms": .string(durationMs.map { "\($0)" } ?? "default"),
+                "arguments": .string(argumentsJSON),
+            ]
+        )
+
         let cmd = DeviceCommand(
             action: "move",
             params: LEDParams(pattern: action, durationMs: durationMs)

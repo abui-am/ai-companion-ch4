@@ -63,11 +63,12 @@
 // Keep duty low and ramp in — avoids brownouts on the shared 5 V supply.
 #define MOTOR_PWM_FREQ 20000
 #define MOTOR_PWM_RES 8
-#define MOTOR_PWM_MAX 70       // ~27% duty — gentle forward/back
-#define MOTOR_PWM_TURN 55      // slower pivot turns
+#define MOTOR_PWM_MIN 100      // floor so wheels actually break static friction
+#define MOTOR_PWM_MAX 150      // ~59% duty — slow but enough to move on 5 V
+#define MOTOR_PWM_TURN 120     // slower pivot turns
 #define MOTOR_RAMP_MS 350
 #define MOTOR_DEFAULT_DURATION_MS 450
-#define MOTOR_STROLL_SEGMENTS 4
-#define MOTOR_STROLL_FORWARD_MS 500
-#define MOTOR_STROLL_TURN_MS 280
-#define MOTOR_STROLL_PAUSE_MS 250
+#define MOTOR_STROLL_SEGMENTS 3
+#define MOTOR_STROLL_FORWARD_MS 400
+#define MOTOR_STROLL_TURN_MS 250
+#define MOTOR_STROLL_PAUSE_MS 200

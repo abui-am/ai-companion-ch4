@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <WebSocketsClient.h>
+#include <WiFi.h>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -93,6 +94,7 @@ static SessionState s_state = SESSION_IDLE;
 static String s_sessionId;
 static volatile bool s_sessionReady = false;
 static volatile bool s_playbackNeedPrefill = true;
+static volatile bool s_pendingListenAfterReconnect = false;
 
 // Trigger label for the active capture turn (tap, auto-relisten, etc.).
 // captureTask runs audio.start + beep on CAPTURING entry once mic I2S is live.
@@ -145,10 +147,16 @@ static void syncFaceDisplay(SessionState s) {
 }
 
 static void setState(SessionState s) {
+  SessionState previous;
   xSemaphoreTake(s_stateMutex, portMAX_DELAY);
+  previous = s_state;
   s_state = s;
   xSemaphoreGive(s_stateMutex);
   syncFaceDisplay(s);
+  if (s == SESSION_CAPTURING && previous != SESSION_CAPTURING) {
+    motorStop();
+    Serial.println("[MOTOR] stopped — mic listening");
+  }
 }
 
 static void drainPlaybackQueue() {
@@ -275,6 +283,8 @@ static void sendText(const String &text) {
   if (s_webSocket.isConnected()) {
     String copy = text;
     s_webSocket.sendTXT(copy);
+  } else {
+    Serial.printf("[WS] send dropped (not connected): %.72s\n", text.c_str());
   }
   xSemaphoreGiveRecursive(s_wsSendMutex);
 }
@@ -286,6 +296,8 @@ static void sendTextAndFlush(const String &text) {
   if (s_webSocket.isConnected()) {
     String copy = text;
     s_webSocket.sendTXT(copy);
+  } else {
+    Serial.printf("[WS] send dropped (not connected): %.72s\n", text.c_str());
   }
   xSemaphoreGiveRecursive(s_wsSendMutex);
   requestWsPump();
@@ -347,6 +359,50 @@ static void pumpWebSocketRepeated(int count, int delayMs) {
     vTaskDelay(pdMS_TO_TICKS(delayMs));
   }
 }
+
+static bool wsCanTalk() {
+  return WiFi.status() == WL_CONNECTED && s_webSocket.isConnected() &&
+         s_sessionReady;
+}
+
+static void wsRequestReconnect(const char *reason) {
+  Serial.printf(
+      "[WS] reconnect requested (%s) wifi=%d ws=%d ready=%d pending_listen=%d\n",
+      reason, static_cast<int>(WiFi.status()),
+      static_cast<int>(s_webSocket.isConnected()),
+      static_cast<int>(s_sessionReady),
+      static_cast<int>(s_pendingListenAfterReconnect));
+
+  s_sessionReady = false;
+  drainPlaybackQueue();
+  drainUplinkQueue();
+  audioIoSpeakerMute();
+  setState(SESSION_IDLE);
+  faceDisplaySetMode(FACE_CONNECTING);
+  faceDisplaySetStatusLine("Reconnecting...");
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WS] WiFi down — reconnecting WiFi");
+    WiFi.reconnect();
+  }
+
+  xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
+  if (s_webSocket.isConnected()) {
+    s_webSocket.disconnect();
+  } else {
+#if COMPANION_USE_TLS
+    s_webSocket.beginSSL(COMPANION_SERVER_HOST, COMPANION_SERVER_PORT,
+                         COMPANION_SERVER_PATH);
+#else
+    s_webSocket.begin(COMPANION_SERVER_HOST, COMPANION_SERVER_PORT,
+                      COMPANION_SERVER_PATH);
+#endif
+  }
+  xSemaphoreGiveRecursive(s_wsSendMutex);
+  requestWsPump();
+}
+
+static void startListening(const char *trigger);
 
 // Service the Links2004 WebSocket client on the WiFi core. The upgrade handshake
 // and session.ready must be read within WEBSOCKETS_TCP_TIMEOUT (5 s default);
@@ -486,6 +542,13 @@ static bool vadUpdate(const AudioFrameVadMetrics &metrics, float &noiseFloor,
 static const char *s_captureTrigger = "capture";
 
 static void beginCapture(const char *trigger) {
+  if (!wsCanTalk()) {
+    Serial.printf("[SESSION] %s but WS not ready — will listen after reconnect\n",
+                  trigger);
+    s_pendingListenAfterReconnect = true;
+    wsRequestReconnect(trigger);
+    return;
+  }
   s_captureTrigger = trigger;
   setState(SESSION_CAPTURING);
 }
@@ -894,11 +957,6 @@ static void onButtonLongPress() {
 
 static void onButtonEvent(ButtonEvent event, void *ctx) {
   (void)ctx;
-  if (!s_sessionReady) {
-    Serial.println("[BUTTON] ignored — session not ready yet");
-    return;
-  }
-
   switch (event) {
   case BUTTON_EVENT_SHORT_TAP:
     onButtonShortTap();
@@ -922,16 +980,24 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
     drainUplinkQueue();
     setState(SESSION_IDLE);
     s_sessionReady = true;
+    faceDisplaySetMode(FACE_IDLE);
     faceDisplaySetStatusLine("Tap to talk");
     Serial.printf("session ready: %s\n", s_sessionId.c_str());
     Serial.println(
         ">>> READY — connecting mic / server OK; wait for LISTENING <<<");
+    if (s_pendingListenAfterReconnect) {
+      s_pendingListenAfterReconnect = false;
+      startListening("[WS] reconnected");
+    }
     break;
   case PROTO_MSG_TRANSCRIPT_FINAL:
     Serial.printf("transcript: %s\n", msg.text.c_str());
     faceDisplayShowTranscript(msg.text.c_str());
     break;
   case PROTO_MSG_DEVICE_COMMAND:
+    Serial.printf("[WS] device_command action=%s pattern=%s duration=%u\n",
+                  msg.action.c_str(), msg.pattern.c_str(),
+                  static_cast<unsigned>(msg.durationMs));
     if (msg.action == "move") {
       if (msg.pattern.length() > 0) {
         motorHandleCommand(msg.pattern.c_str(), msg.durationMs);
@@ -939,7 +1005,7 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
         Serial.println("[MOTOR] move command missing pattern");
       }
     } else {
-      Serial.printf("device_command ignored: action=%s\n", msg.action.c_str());
+      Serial.printf("[WS] device_command ignored: action=%s\n", msg.action.c_str());
     }
     break;
   case PROTO_MSG_TTS_START:
@@ -1029,6 +1095,7 @@ static void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
     s_sessionReady = false;
     drainPlaybackQueue();
     drainUplinkQueue();
+    audioIoSpeakerMute();
     setState(SESSION_IDLE);
     faceDisplaySetMode(FACE_CONNECTING);
     faceDisplaySetStatusLine("Reconnecting...");

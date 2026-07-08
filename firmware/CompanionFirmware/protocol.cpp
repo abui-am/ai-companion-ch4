@@ -8,6 +8,11 @@ void protocolParse(const uint8_t *data, size_t len, ProtoMsg &out) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, data, len);
     if (err) {
+        if (len > 0 && len < 512) {
+            Serial.printf("[PROTO] JSON parse failed (%s): %.*s\n",
+                          err.c_str(), static_cast<int>(len),
+                          reinterpret_cast<const char *>(data));
+        }
         return;
     }
 
@@ -28,6 +33,9 @@ void protocolParse(const uint8_t *data, size_t len, ProtoMsg &out) {
             out.pattern = String((const char *)(params["pattern"] | ""));
             out.durationMs = params["duration_ms"] | 0;
         }
+        Serial.printf("[PROTO] device_command action=%s pattern=%s duration=%u\n",
+                      out.action.c_str(), out.pattern.c_str(),
+                      static_cast<unsigned>(out.durationMs));
     } else if (strcmp(type, "tts.start") == 0) {
         out.type = PROTO_MSG_TTS_START;
         out.sessionId = String((const char *)(doc["session_id"] | ""));
