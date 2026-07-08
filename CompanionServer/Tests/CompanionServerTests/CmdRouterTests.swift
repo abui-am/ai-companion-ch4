@@ -34,6 +34,30 @@ final class CmdRouterTests: XCTestCase {
         }
     }
 
+    func testValidEmotionPasses() throws {
+        let cmd = DeviceCommand(action: "emotion", params: LEDParams(pattern: "angry"))
+        XCTAssertNoThrow(try CmdRouter.validate(cmd))
+    }
+
+    func testValidEmotionWithDurationPasses() throws {
+        let cmd = DeviceCommand(action: "emotion", params: LEDParams(pattern: "excited", durationMs: 8000))
+        XCTAssertNoThrow(try CmdRouter.validate(cmd))
+    }
+
+    func testEmotionUnknownPatternRejected() {
+        let cmd = DeviceCommand(action: "emotion", params: LEDParams(pattern: "grumpy"))
+        XCTAssertThrowsError(try CmdRouter.validate(cmd)) { error in
+            XCTAssertEqual(error as? ValidationError, .outOfRange)
+        }
+    }
+
+    func testEmotionDurationOutOfRangeRejected() {
+        let cmd = DeviceCommand(action: "emotion", params: LEDParams(pattern: "angry", durationMs: 100))
+        XCTAssertThrowsError(try CmdRouter.validate(cmd)) { error in
+            XCTAssertEqual(error as? ValidationError, .outOfRange)
+        }
+    }
+
     func testUnknownActionRejected() {
         let cmd = DeviceCommand(action: "play_sound", params: LEDParams(r: 0, g: 0, b: 0))
         XCTAssertThrowsError(try CmdRouter.validate(cmd)) { error in
@@ -71,6 +95,8 @@ final class CmdRouterTests: XCTestCase {
         XCTAssertTrue(prompt.contains("tasks"))
         XCTAssertTrue(prompt.contains("calendar"))
         XCTAssertTrue(prompt.contains("move"))
+        XCTAssertTrue(prompt.contains("emotion"))
+        XCTAssertTrue(prompt.contains("facial expression"))
         XCTAssertTrue(prompt.contains("physical robot"))
         XCTAssertTrue(prompt.contains("throw around the deck"))
         XCTAssertTrue(prompt.contains("never"))

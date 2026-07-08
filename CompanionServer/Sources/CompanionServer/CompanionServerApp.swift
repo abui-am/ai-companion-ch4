@@ -167,6 +167,7 @@ struct CompanionServerApp {
                 CalendarAgent(calendar: calendar, timeZoneIdentifier: config.companionTimezone, logger: serverLogger),
                 MemoryAgent(memories: memories, embeddings: embeddings, config: userConfig, logger: serverLogger),
                 MotionAgent(gateway: deviceCommands, logger: serverLogger),
+                EmotionAgent(gateway: deviceCommands, logger: serverLogger),
             ]
             if config.webSearchEnabled {
                 subAgentList.append(

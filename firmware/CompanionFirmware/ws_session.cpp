@@ -1004,6 +1004,11 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
       } else {
         Serial.println("[MOTOR] move command missing pattern");
       }
+    } else if (msg.action == "emotion" || msg.action == "set_emotion") {
+      if (!faceDisplaySetEmotion(msg.pattern.c_str(), msg.durationMs)) {
+        Serial.printf("[FACE] emotion command rejected: pattern=%s\n",
+                      msg.pattern.c_str());
+      }
     } else {
       Serial.printf("[WS] device_command ignored: action=%s\n", msg.action.c_str());
     }

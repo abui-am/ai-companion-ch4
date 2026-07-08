@@ -3,6 +3,7 @@ import Foundation
 enum AllowedAction: String {
     case setLed = "set_led"
     case move = "move"
+    case emotion = "emotion"
 }
 
 enum ValidationError: Error, Equatable {
@@ -14,6 +15,12 @@ enum ValidationError: Error, Equatable {
 enum CmdRouter {
     private static let movePatterns: Set<String> = [
         "stroll", "forward", "backward", "turn_left", "turn_right", "stop",
+    ]
+
+    // Mirrors firmware face_display.cpp kEmotions.
+    static let emotionPatterns: Set<String> = [
+        "neutral", "happy", "excited", "angry", "sad",
+        "surprised", "confused", "sleepy", "love",
     ]
 
     static func validate(_ cmd: DeviceCommand) throws -> DeviceCommand {
@@ -37,6 +44,15 @@ enum CmdRouter {
             }
             if let durationMs = cmd.params.durationMs {
                 guard (50 ... 2000).contains(durationMs) else {
+                    throw ValidationError.outOfRange
+                }
+            }
+        case .emotion:
+            guard let pattern = cmd.params.pattern, emotionPatterns.contains(pattern) else {
+                throw ValidationError.outOfRange
+            }
+            if let durationMs = cmd.params.durationMs {
+                guard (1500 ... 60000).contains(durationMs) else {
                     throw ValidationError.outOfRange
                 }
             }
