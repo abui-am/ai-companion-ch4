@@ -22,7 +22,21 @@ static void connectWiFi() {
     Serial.printf(" connected (%s)\n", WiFi.localIP().toString().c_str());
 }
 
+// Force the motor driver inputs to a defined LOW state before anything else
+// runs (Serial/display init take long enough for a floating pin to glitch
+// the DRV8833 and twitch a wheel at boot). motorInit() re-configures these
+// pins for PWM later; this only closes the gap between reset and that call.
+static void motorSafeStateEarly() {
+    const uint8_t pins[] = {PIN_MOTOR_AIN1, PIN_MOTOR_AIN2, PIN_MOTOR_BIN1,
+                             PIN_MOTOR_BIN2};
+    for (uint8_t pin : pins) {
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, LOW);
+    }
+}
+
 void setup() {
+    motorSafeStateEarly();
     Serial.begin(115200);
     delay(800);
     Serial.printf("\n[BOOT] CompanionFirmware heap=%u psram=%u psramFound=%d\n",

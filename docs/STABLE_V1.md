@@ -155,7 +155,7 @@ Implementation: `ws_session.cpp` (session state machine + VAD), `audio_io.cpp` (
 | Speaker BCLK | 6 |
 | Speaker WS | 7 |
 | Speaker DOUT | 5 |
-| Touch button | 11 |
+| Touch button | 3 |
 | OLED SDA | 8 |
 | OLED SCL | 9 |
 

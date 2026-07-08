@@ -22,7 +22,13 @@
 // when noisy-room VAD is stuck. Long press (~800 ms) ends the conversation
 // (including barging in mid AI-reply). Turns in between are automatic — see
 // ws_session.cpp's silence-based VAD turn-taking.
-#define PIN_BUTTON 11
+// GPIO3 on purpose: it's a strapping pin with no internal pull, but that only
+// matters for pins the ESP32 *drives* before firmware configures them (like
+// the motor lines below). Here the ESP32 only reads it, the TTP223 module
+// actively drives the line itself, and buttonInit() doesn't even start
+// polling until wsSessionBegin() runs near the end of setup() — so the
+// boot-time float window never gets sampled.
+#define PIN_BUTTON 3
 #define TOUCH_THRESHOLD 40 // unused for digital touch modules; kept for compat
 
 // Mic (I2S RX) — INMP441. L/R pin tied to GND → left channel.
@@ -55,9 +61,15 @@
 
 // Wheel motors — DRV8833 dual H-bridge (5 V rail shared with speaker amp).
 // Left motor: AIN1/AIN2. Right motor: BIN1/BIN2.
+// BIN1 avoids GPIO3 on purpose: it's a strapping pin with *no* internal pull
+// resistor, so it floats fully undefined from power-on-reset until
+// motorInit() runs — long enough to glitch the DRV8833 input and spin the
+// right wheel on its own at boot (the ESP32 drives this pin, unlike the
+// touch sensor above, so a float here is directly visible as motion).
+// GPIO11 (former button pin) has no such issue.
 #define PIN_MOTOR_AIN1 1
 #define PIN_MOTOR_AIN2 2
-#define PIN_MOTOR_BIN1 3
+#define PIN_MOTOR_BIN1 11
 #define PIN_MOTOR_BIN2 10
 
 // Keep duty low and ramp in — avoids brownouts on the shared 5 V supply.

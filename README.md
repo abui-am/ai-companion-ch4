@@ -114,7 +114,7 @@ If you tap but never speak, a **4 s no-speech timeout** ends the session.
 | Speaker BCLK | 6 | MAX98357A |
 | Speaker WS | 7 | MAX98357A LRC |
 | Speaker DOUT | 5 | MAX98357A DIN |
-| Touch button | 11 | TTP223; other leg to GND |
+| Touch button | 3 | TTP223; other leg to GND |
 
 Mic L/R pin tied to GND → left channel. Sample rate: **16 kHz mono** uplink, **24 kHz** downlink.
 

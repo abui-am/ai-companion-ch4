@@ -125,7 +125,7 @@ The wake-word path was **removed** in favor of tap + VAD turn-taking:
 | PSRAM | QSPI PSRAM (uplink audio queue) |
 | Mic | INMP441 — BCLK 12, WS 4, DIN 13 |
 | Speaker | MAX98357A — BCLK 6, WS 7, DOUT 5 |
-| Touch | GPIO 11 (TTP223 etc.) |
+| Touch | GPIO 3 (TTP223 etc.) |
 | Sample rate | 16 kHz mono |
 
 ---
