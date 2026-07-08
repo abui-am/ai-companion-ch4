@@ -8,6 +8,9 @@
 static void connectWiFi() {
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
+    // Modem sleep drops idle TCP sockets within a few seconds — kills /ws before
+    // session.ready is read unless loop() services the socket continuously.
+    WiFi.setSleep(false);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     Serial.printf("connecting to %s", WIFI_SSID);
@@ -15,7 +18,7 @@ static void connectWiFi() {
         delay(300);
         Serial.print(".");
     }
-    Serial.println(" connected");
+    Serial.printf(" connected (%s)\n", WiFi.localIP().toString().c_str());
 }
 
 void setup() {

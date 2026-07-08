@@ -52,7 +52,41 @@ enum ConversationToolCallBuilder {
             return action
         }
 
+        if name == "memory" {
+            let action = args["action"] as? String ?? name
+            switch action {
+            case "remember":
+                if let content = args["content"] as? String, !content.isEmpty {
+                    return "remember: \(truncate(content))"
+                }
+                return "remember"
+            case "search":
+                if let query = args["query"] as? String, !query.isEmpty {
+                    return "search: \(truncate(query))"
+                }
+                return "search"
+            case "forget":
+                if let query = args["query"] as? String, !query.isEmpty {
+                    return "forget: \(truncate(query))"
+                }
+                if let id = args["id"] as? String, !id.isEmpty {
+                    return "forget: \(id)"
+                }
+                return "forget"
+            default:
+                return action
+            }
+        }
+
         return argumentsJSON
+    }
+
+    /// Shortens a label's free-text portion (fact/query) for compact UI display —
+    /// full text is still available in the tool call's `input`.
+    private static func truncate(_ text: String, maxLength: Int = 60) -> String {
+        guard text.count > maxLength else { return text }
+        let index = text.index(text.startIndex, offsetBy: maxLength)
+        return "\(text[..<index])…"
     }
 
     /// Builds a `StructuredToolCall` from the raw JSON strings captured during a turn —

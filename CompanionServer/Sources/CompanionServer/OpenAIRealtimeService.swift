@@ -34,6 +34,7 @@ actor OpenAIRealtimeService {
     private var responseLanguage: String
     private var personality: ConfigPersonality
     private var timeZone: TimeZone
+    private var memoryContext: String?
     private let subAgents: SubAgentRegistry
     private let logger: Logger
 
@@ -143,6 +144,27 @@ actor OpenAIRealtimeService {
                 metadata: ["timezone": .string(timeZone.identifier), "error": .string("\(error)")]
             )
         }
+    }
+
+    /// Injects recent memories into the system prompt at session start — read-only, no
+    /// embedding cost. Tool-driven writes/search are unaffected; see `MemoryAgent`.
+    func refreshMemoryContext(memories: [MemoryRecord]) async {
+        memoryContext = Self.formatMemoryContext(memories)
+        guard let socket, socket.state == .running else { return }
+        do {
+            try await sendJSON(sessionUpdatePayload())
+            logger.info("realtime memory context refreshed", metadata: ["count": "\(memories.count)"])
+        } catch {
+            logger.error(
+                "realtime memory context refresh failed",
+                metadata: ["error": .string("\(error)")]
+            )
+        }
+    }
+
+    private static func formatMemoryContext(_ memories: [MemoryRecord]) -> String? {
+        guard !memories.isEmpty else { return nil }
+        return memories.map { "- \($0.content)" }.joined(separator: "\n")
     }
 
     func setTimeZone(_ identifier: String) async {
@@ -376,7 +398,8 @@ actor OpenAIRealtimeService {
                 "instructions": CompanionPrompt.system(
                     responseLanguage: responseLanguage,
                     personality: personality,
-                    timeZone: timeZone
+                    timeZone: timeZone,
+                    memoryContext: memoryContext
                 ),
                 "output_modalities": textOnlyOutput ? ["text"] : ["audio"],
                 "audio": audio,

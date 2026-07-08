@@ -38,7 +38,12 @@ actor VoiceSession {
     private let config: ConfigRepository
     private let conversations: ConversationRepository
     private let conversationAudio: ConversationAudioStore
+    private let memories: MemoryRepository
     private let logger: Logger
+
+    /// Cap on facts injected into the system prompt at session start — keeps prompt growth
+    /// bounded regardless of how many memories exist. See `refreshMemoryContext`.
+    private static let sessionMemoryLimit = 8
 
     private var phase: SessionPhase = .connected
     private var pipelineTask: Task<Void, Never>?
@@ -67,6 +72,7 @@ actor VoiceSession {
         config: ConfigRepository,
         conversations: ConversationRepository,
         conversationAudio: ConversationAudioStore,
+        memories: MemoryRepository,
         logger: Logger
     ) {
         self.outbound = outbound
@@ -76,6 +82,7 @@ actor VoiceSession {
         self.config = config
         self.conversations = conversations
         self.conversationAudio = conversationAudio
+        self.memories = memories
         self.downlinkPacer = DownlinkPacer(
             outbound: outbound,
             speakers: speakers,
@@ -105,6 +112,7 @@ actor VoiceSession {
 
         await applyUserConfig()
         await realtime.refreshTimeContext()
+        await refreshMemoryContext()
 
         if let language = start.language?.trimmingCharacters(in: .whitespacesAndNewlines), !language.isEmpty {
             logger.info(
@@ -137,6 +145,27 @@ actor VoiceSession {
                 "failed to load user config — using defaults",
                 metadata: ["session_id": .string(sessionId), "error": "\(error)"]
             )
+        }
+    }
+
+    /// Injects the most recent memories into the system prompt so recall works on a fresh
+    /// connection without the model needing to call `memory.search` first — see
+    /// `OpenAIRealtimeService.refreshMemoryContext`. Skipped when personalization is off;
+    /// never fails the session on a lookup error.
+    private func refreshMemoryContext() async {
+        guard saveConversationHistory else {
+            await realtime.refreshMemoryContext(memories: [])
+            return
+        }
+        do {
+            let recent = try await memories.list(limit: Self.sessionMemoryLimit)
+            await realtime.refreshMemoryContext(memories: recent)
+        } catch {
+            logger.warning(
+                "failed to load memory context — continuing without it",
+                metadata: ["session_id": .string(sessionId), "error": "\(error)"]
+            )
+            await realtime.refreshMemoryContext(memories: [])
         }
     }
 

@@ -112,6 +112,8 @@ static uint8_t *s_uplinkQueueStorage = nullptr;
 static UBaseType_t s_uplinkQueueDepth = 0;
 static int s_turnCaptured = 0;
 static int s_turnDropped = 0;
+static volatile bool s_wsLoopTaskActive = false;
+static TaskHandle_t s_wsLoopHandle = nullptr;
 
 static SessionState getState() {
   xSemaphoreTake(s_stateMutex, portMAX_DELAY);
@@ -276,19 +278,21 @@ static void sendText(const String &text) {
   xSemaphoreGiveRecursive(s_wsSendMutex);
 }
 
+static void requestWsPump();
+
 static void sendTextAndFlush(const String &text) {
   xSemaphoreTakeRecursive(s_wsSendMutex, portMAX_DELAY);
   if (s_webSocket.isConnected()) {
     String copy = text;
     s_webSocket.sendTXT(copy);
-    s_webSocket.loop();
   }
   xSemaphoreGiveRecursive(s_wsSendMutex);
+  requestWsPump();
 }
 
-// Send one uplink PCM frame; loop() after each BIN so the WebSockets library
-// actually pushes the frame (batching multiple sendBIN before one loop() was
-// leaving frames stuck in the client buffer).
+// Send one uplink PCM frame. Do not call loop() here — inbound events (tts.start,
+// downlink PCM) must be handled only on ws_loop or binary frames are dropped
+// while state is still PROCESSING.
 static int sendUplinkFrame(const uint8_t *data, size_t len) {
   if (len == 0) {
     return 0;
@@ -297,10 +301,12 @@ static int sendUplinkFrame(const uint8_t *data, size_t len) {
   int sent = 0;
   if (s_webSocket.isConnected()) {
     s_webSocket.sendBIN(data, len);
-    s_webSocket.loop();
     sent = 1;
   }
   xSemaphoreGiveRecursive(s_wsSendMutex);
+  if (sent) {
+    requestWsPump();
+  }
   return sent;
 }
 
@@ -326,10 +332,31 @@ static void flushWebSocket() {
   xSemaphoreGiveRecursive(s_wsSendMutex);
 }
 
-static void flushWebSocketRepeated(int count, int delayMs) {
+static void requestWsPump() {
+  if (s_wsLoopTaskActive && s_wsLoopHandle != nullptr) {
+    xTaskNotifyGive(s_wsLoopHandle);
+    return;
+  }
+  flushWebSocket();
+}
+
+static void pumpWebSocketRepeated(int count, int delayMs) {
   for (int i = 0; i < count; i++) {
-    flushWebSocket();
+    requestWsPump();
     vTaskDelay(pdMS_TO_TICKS(delayMs));
+  }
+}
+
+// Service the Links2004 WebSocket client on the WiFi core. The upgrade handshake
+// and session.ready must be read within WEBSOCKETS_TCP_TIMEOUT (5 s default);
+// relying on Arduino loop() alone was letting capture/I2C starve loop() long
+// enough that the client disconnected before WStype_CONNECTED fired.
+static void wsMaintenanceTask(void *arg) {
+  (void)arg;
+  while (true) {
+    flushWebSocket();
+    // Wake promptly after uplink/control sends via requestWsPump().
+    (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5));
   }
 }
 
@@ -683,7 +710,7 @@ static void finishUplinkTurn(int sentCount) {
   if (getState() == SESSION_PROCESSING) {
     sendTextAndFlush(protocolBuildAudioStop());
   } else {
-    flushWebSocketRepeated(10, 5);
+    pumpWebSocketRepeated(10, 5);
   }
   const int captured = s_turnCaptured;
   const int dropped = s_turnDropped;
@@ -952,9 +979,12 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
 }
 
 static void handleBinaryFrame(uint8_t *payload, size_t len) {
-  if (getState() != SESSION_SPEAKING) {
-    Serial.printf("[AUDIO] ignored %u bytes — not in SESSION_SPEAKING\n",
-                  static_cast<unsigned>(len));
+  SessionState s = getState();
+  // Accept during PROCESSING too — uplink used to call loop() and drop early
+  // downlink frames before tts.start flipped state to SESSION_SPEAKING.
+  if (s != SESSION_SPEAKING && s != SESSION_PROCESSING) {
+    Serial.printf("[AUDIO] ignored %u bytes — state=%d (need speaking/processing)\n",
+                  static_cast<unsigned>(len), static_cast<int>(s));
     return;
   }
   if (len > COMPANION_DOWNLINK_FRAME_BYTES) {
@@ -983,6 +1013,7 @@ static void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
   case WStype_CONNECTED:
     Serial.println("ws connected");
     sendText(protocolBuildSessionStart());
+    requestWsPump();
     break;
   case WStype_DISCONNECTED:
     Serial.printf("[WS] DISCONNECTED (was in state %d) — resetting\n",
@@ -1047,7 +1078,16 @@ void wsSessionBegin() {
       String("Authorization: Bearer ") + COMPANION_DEVICE_TOKEN;
   s_webSocket.setExtraHeaders(authHeader.c_str());
   s_webSocket.onEvent(webSocketEvent);
-  s_webSocket.setReconnectInterval(0);
+  s_webSocket.setReconnectInterval(2000);
+
+  // 12 KB stack: Links2004 callbacks + binary TTS frames nest several frames deep;
+  // 4 KB overflowed (Guru Meditation) once AI downlink started after capture.
+  BaseType_t wsLoopOk = xTaskCreatePinnedToCore(
+      wsMaintenanceTask, "ws_loop", 12288, NULL, 5, &s_wsLoopHandle, 0);
+  s_wsLoopTaskActive = (wsLoopOk == pdPASS);
+  if (!s_wsLoopTaskActive) {
+    Serial.println("[WS] WARNING: ws_loop task failed — falling back to loop()");
+  }
 
 #if COMPANION_USE_TLS
   s_webSocket.beginSSL(COMPANION_SERVER_HOST, COMPANION_SERVER_PORT,
@@ -1061,4 +1101,10 @@ void wsSessionBegin() {
   Serial.println("connecting to server, please wait...");
 }
 
-void wsSessionLoop() { flushWebSocket(); }
+void wsSessionLoop() {
+  // wsMaintenanceTask owns loop() when running — avoid two tasks calling it
+  // during TTS (corrupts parser state / doubles stack use in the library).
+  if (!s_wsLoopTaskActive) {
+    flushWebSocket();
+  }
+}

@@ -36,6 +36,7 @@ public struct AppConfig: Sendable {
   public let companionHost: String
   public let webSearchEnabled: Bool
   public let openAISearchModel: String
+  public let openAIEmbeddingModel: String
   public let responseLanguage: String
   public let databaseURL: String
   public let companionTimezone: String
@@ -76,6 +77,7 @@ public struct AppConfig: Sendable {
     let cartesiaModelId = reader.string(forKey: "cartesia.model.id", default: "sonic-3.5")
     let webSearchEnabled = reader.bool(forKey: "web.search.enabled", default: true)
     let openAISearchModel = reader.string(forKey: "openai.search.model", default: "gpt-4o-mini")
+    let openAIEmbeddingModel = reader.string(forKey: "openai.embedding.model", default: "text-embedding-3-small")
     let responseLanguage = reader.string(forKey: "companion.response.language", default: "English")
     let databaseURL = reader.string(
       forKey: "database.url",
@@ -100,6 +102,7 @@ public struct AppConfig: Sendable {
       companionHost: companionHost,
       webSearchEnabled: webSearchEnabled,
       openAISearchModel: openAISearchModel,
+      openAIEmbeddingModel: openAIEmbeddingModel,
       responseLanguage: responseLanguage,
       databaseURL: databaseURL,
       companionTimezone: companionTimezone

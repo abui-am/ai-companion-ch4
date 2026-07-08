@@ -63,7 +63,7 @@ Mirrors what the Settings screen renders:
 | `notifications.calendarAlerts` | boolean | |
 | `notifications.remindBeforeMinutes` | number | One of `5`, `10`, `15`, `30` |
 | `privacy.cameraAccess` | boolean | |
-| `privacy.personalizationData` | boolean | |
+| `privacy.personalizationData` | boolean | Also gates the AI's long-term memory (`memory` tool) and conversation history — when off, no memories are saved/recalled and `GET /api/v1/memories` returns an empty list. See [MEMORY_API.md](MEMORY_API.md) and [CONVERSATION_API.md](CONVERSATION_API.md) |
 | `language` | enum | `english` \| `spanish` \| `french` — also changes the voice companion's reply language on its next session |
 
 ### UI label mapping
@@ -264,4 +264,5 @@ Tests use `DATABASE_URL` (default `postgres://postgres:postgres@localhost:5432/c
 ## Related docs
 
 - [CALENDAR_API.md](CALENDAR_API.md) — Calendar REST API (same auth, same server)
+- [MEMORY_API.md](MEMORY_API.md) — AI long-term memory, also gated by `privacy.personalizationData`
 - [STABLE_V1.md](STABLE_V1.md) — WebSocket voice protocol; `personality` and `language` from this API are applied to the voice pipeline at the start of each session

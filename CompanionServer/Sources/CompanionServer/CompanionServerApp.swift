@@ -62,6 +62,14 @@ struct CompanionServerApp {
             ]
         )
 
+        do {
+            try await database.enableVectorExtension()
+        } catch {
+            logger.critical("pgvector extension setup failed: \(error)")
+            await database.shutdown()
+            exit(1)
+        }
+
         let calendar = CalendarRepository(database: database, logger: logger)
         do {
             try await calendar.migrate()
@@ -98,6 +106,20 @@ struct CompanionServerApp {
             exit(1)
         }
 
+        let memories = MemoryRepository(database: database, logger: logger)
+        do {
+            try await memories.migrate()
+        } catch {
+            logger.critical("memory migration failed: \(error)")
+            await database.shutdown()
+            exit(1)
+        }
+        let embeddings = OpenAIEmbeddingService(
+            apiKey: config.openAIAPIKey,
+            model: config.openAIEmbeddingModel,
+            logger: logger
+        )
+
         if let root = PackagePaths.packageRoot() {
             let debugDir = URL(fileURLWithPath: root, isDirectory: true)
                 .appendingPathComponent("debug-audio", isDirectory: true)
@@ -132,6 +154,7 @@ struct CompanionServerApp {
             var subAgentList: [any SubAgent] = [
                 TaskAgent(tasks: tasks, timeZoneIdentifier: config.companionTimezone, logger: serverLogger),
                 CalendarAgent(calendar: calendar, timeZoneIdentifier: config.companionTimezone, logger: serverLogger),
+                MemoryAgent(memories: memories, embeddings: embeddings, config: userConfig, logger: serverLogger),
             ]
             if config.webSearchEnabled {
                 subAgentList.append(
@@ -171,6 +194,7 @@ struct CompanionServerApp {
                 config: userConfig,
                 conversations: conversations,
                 conversationAudio: conversationAudio,
+                memories: memories,
                 logger: serverLogger
             )
             try await session.start()
@@ -250,6 +274,13 @@ struct CompanionServerApp {
             on: router,
             conversations: conversations,
             audioStore: conversationAudio,
+            deviceToken: config.deviceToken,
+            logger: serverLogger
+        )
+        MemoryRoutes.register(
+            on: router,
+            memories: memories,
+            config: userConfig,
             deviceToken: config.deviceToken,
             logger: serverLogger
         )

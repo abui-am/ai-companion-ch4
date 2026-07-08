@@ -6,6 +6,7 @@ enum CompanionPrompt {
         responseLanguage: String,
         personality: ConfigPersonality = .calm,
         timeZone: TimeZone = .current,
+        memoryContext: String? = nil,
         now: Date = Date()
     ) -> String {
         let timeZoneContext = CompanionTimezone.localContext(for: timeZone, now: now)
@@ -67,6 +68,16 @@ enum CompanionPrompt {
     - Prefer the explicit offset form. When speaking times back, always use the user's local timezone.
     - If an action fails, say so plainly and ask for what you need (e.g. which task to delete).
 
+    ## Memory tool
+    You have a `memory` tool for durable personal facts about the user (name, preferences, relationships, routines) that should carry across conversations.
+    - Known facts are pre-loaded below when available — check there first.
+    - Call `memory.search` when the user references something not listed below or from long ago.
+    - Call `memory.remember` when the user asks you to remember something, or when a stable fact is clearly worth keeping. Keep each fact to one short sentence.
+    - Call `memory.forget` when the user asks to forget something — pass `query`, not an ID.
+    - Before `memory.search`, one short preamble in the same voice turn ("Let me think back on that…" / "Hmm, checking what I know about you…"). Skip the preamble for `memory.remember` — just confirm after.
+    - Weave recalled facts into spoken prose, never read them as a list. If search returns nothing, say you don't have that stored — don't guess.
+    \(memoryContextSection(memoryContext))
+
     ## Mode priority
     If modes conflict, prefer: serious (emotional safety) > web_search (factual depth) > casual (default).
     After a serious or web_search answer, you can drop back to casual on the next turn unless the user keeps going deep.
@@ -80,6 +91,15 @@ enum CompanionPrompt {
         default:
             "Always respond in \(language), even if the user's transcript is in another language."
         }
+    }
+
+    private static func memoryContextSection(_ memoryContext: String?) -> String {
+        guard let memoryContext, !memoryContext.isEmpty else { return "" }
+        return """
+        ## Known facts about this user
+        \(memoryContext)
+        (Use memory.search for older or specific details not listed here.)
+        """
     }
 
     private static func personalityInstruction(for personality: ConfigPersonality) -> String {

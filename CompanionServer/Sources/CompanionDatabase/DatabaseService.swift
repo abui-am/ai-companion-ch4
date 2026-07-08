@@ -32,6 +32,15 @@ public actor DatabaseService {
     throw DatabaseError.pingFailed
   }
 
+  /// Enables the pgvector extension once at boot, before any repository migrates a table
+  /// that depends on the `vector` type — see `MemoryRepository`. Kept here rather than in
+  /// one repository since other features may need vector columns later.
+  public func enableVectorExtension() async throws {
+    _ = try await withConnection { connection in
+      try await connection.query("CREATE EXTENSION IF NOT EXISTS vector", logger: logger)
+    }
+  }
+
   public func withConnection<T: Sendable>(
     _ operation: @Sendable (PostgresConnection) async throws -> T
   ) async throws -> T {

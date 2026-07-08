@@ -67,7 +67,7 @@ A **session** covers one WebSocket connection (from `session.start` to disconnec
 | `audioUrl` | string \| null | Present only when audio was captured for this message — see [Audio](#audio) |
 | `createdAt` | string (ISO 8601 UTC) | |
 
-A **tool call** records one sub-agent lookup (`tasks`, `calendar`, `web_search`) the model made while forming its reply to a turn:
+A **tool call** records one sub-agent lookup (`tasks`, `calendar`, `web_search`, `memory`) the model made while forming its reply to a turn:
 
 ```json
 {
@@ -86,9 +86,9 @@ A **tool call** records one sub-agent lookup (`tasks`, `calendar`, `web_search`)
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | string | Stable ID, prefix `ctool_` |
-| `tool` | enum | `tasks` \| `calendar` \| `web_search` |
-| `action` | string \| null | From `input.action` (`tasks`/`calendar`); `null` for `web_search` |
-| `label` | string | Short UI text, e.g. `"list"`, `"create: Buy milk"`, or the search query |
+| `tool` | enum | `tasks` \| `calendar` \| `web_search` \| `memory` |
+| `action` | string \| null | From `input.action` (`tasks`/`calendar`/`memory`); `null` for `web_search` |
+| `label` | string | Short UI text, e.g. `"list"`, `"create: Buy milk"`, `"remember: User's dog is named Max"`, or the search query |
 | `status` | enum | `success` \| `error` \| `duplicate` — see below |
 | `input` | object | Parsed arguments the model sent the tool |
 | `output` | object | Parsed result the tool returned |
@@ -191,6 +191,24 @@ The frontend-first alternative to `/messages`: groups each turn's user message, 
 
 A turn with no tool calls returns `"toolCalls": []`; a turn missing one side (e.g. transcription failed) returns `null` for `user` or `assistant`.
 
+A turn where the model saved a memory looks the same, with `tool: "memory"`:
+
+```json
+{
+  "id": "ctool_g7h8i9j0k1l2",
+  "tool": "memory",
+  "action": "remember",
+  "label": "remember: User's dog is named Max",
+  "status": "success",
+  "input": { "action": "remember", "content": "User's dog is named Max" },
+  "output": { "summary": "Saved memory.", "id": "mem_a1b2c3d4e5f6", "content": "User's dog is named Max", "updated": false },
+  "summary": "Saved memory.",
+  "createdAt": "2026-07-08T09:00:03Z"
+}
+```
+
+Tool call history is a read-only record for UI replay — it is not itself a memory source. Durable facts recalled by the voice companion live only in the `memories` table; see [MEMORY_API.md](MEMORY_API.md).
+
 ### Download message audio
 
 ```
@@ -275,7 +293,7 @@ export type ConversationMessage = {
   createdAt: string;
 };
 
-export type ToolName = "tasks" | "calendar" | "web_search";
+export type ToolName = "tasks" | "calendar" | "web_search" | "memory";
 export type ToolCallStatus = "success" | "error" | "duplicate";
 
 export type ConversationToolCall = {
@@ -400,4 +418,5 @@ Tests use `DATABASE_URL` (default `postgres://postgres:postgres@localhost:5432/c
 
 - [CONFIG_API.md](CONFIG_API.md) — `privacy.personalizationData` toggle that gates this API's data
 - [CALENDAR_API.md](CALENDAR_API.md) — Calendar REST API (same auth, same server)
+- [MEMORY_API.md](MEMORY_API.md) — AI long-term memory; `memory` tool calls shown here are recorded there too
 - [STABLE_V1.md](STABLE_V1.md) — WebSocket voice protocol that produces the transcripts and audio saved here
