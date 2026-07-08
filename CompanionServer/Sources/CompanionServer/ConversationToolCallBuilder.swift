@@ -78,6 +78,10 @@ enum ConversationToolCallBuilder {
             }
         }
 
+        if name == "move", let action = args["action"] as? String {
+            return action
+        }
+
         return argumentsJSON
     }
 

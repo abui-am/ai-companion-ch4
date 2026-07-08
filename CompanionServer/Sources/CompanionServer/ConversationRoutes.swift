@@ -8,11 +8,13 @@ struct ConversationSession: ResponseCodable, Sendable {
   let id: String
   let startedAt: Date
   let endedAt: Date?
+  let voiceCount: Int
 
   init(record: ConversationSessionRecord) {
     id = record.id
     startedAt = record.startedAt
     endedAt = record.endedAt
+    voiceCount = record.voiceCount
   }
 }
 

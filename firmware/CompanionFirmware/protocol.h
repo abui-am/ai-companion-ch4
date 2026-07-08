@@ -33,6 +33,8 @@ struct ProtoMsg {
     String sessionId;
     String text;
     String action;
+    String pattern;
+    uint32_t durationMs = 0;
     String errorCode;
     String errorMessage;
 };

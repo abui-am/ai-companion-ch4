@@ -86,13 +86,21 @@ struct MemoryAgent: SubAgent, Sendable {
             return SubAgentJSON.encodeError("invalid arguments JSON")
         }
         guard let action = args["action"] as? String else {
+            logRememberFailure("missing action", argumentsJSON: argumentsJSON)
             return SubAgentJSON.encodeError("missing action")
         }
+
+        logger.info("memory tool invoked", metadata: ["action": .string(action)])
 
         let configCheckStart = Date()
         let personalizationEnabled = await personalizationCache.isEnabled()
         let configCheckMs = Self.elapsedMs(since: configCheckStart)
         guard personalizationEnabled else {
+            logRememberFailure(
+                "personalization disabled",
+                action: action,
+                argumentsJSON: argumentsJSON
+            )
             return SubAgentJSON.encodeError(
                 "Memory is off. Enable personalization in Settings to save or recall memories."
             )
@@ -109,6 +117,7 @@ struct MemoryAgent: SubAgent, Sendable {
             case "list":
                 return try await list(args: args)
             default:
+                logRememberFailure("unknown action: \(action)", action: action, argumentsJSON: argumentsJSON)
                 return SubAgentJSON.encodeError("unknown action: \(action)")
             }
         } catch let error as MemoryRepositoryError {
@@ -129,11 +138,19 @@ struct MemoryAgent: SubAgent, Sendable {
         guard let content = (args["content"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !content.isEmpty
         else {
+            logRememberFailure("remember requires content", action: "remember", argumentsJSON: Self.encodeArgs(args))
             return SubAgentJSON.encodeError("remember requires content")
         }
         guard content.count <= Self.maxContentLength else {
+            logRememberFailure(
+                "content exceeds \(Self.maxContentLength) characters (\(content.count))",
+                action: "remember",
+                content: content
+            )
             return SubAgentJSON.encodeError("content must be \(Self.maxContentLength) characters or fewer")
         }
+
+        logger.info("memory remember started", metadata: ["content": .string(content)])
 
         let embeddingStart = Date()
         let embedding = try await embeddings.embed(text: content)
@@ -154,12 +171,32 @@ struct MemoryAgent: SubAgent, Sendable {
                 writeMs: Self.elapsedMs(since: writeStart),
                 totalStart: totalStart
             )
+            logger.info(
+                "memory saved",
+                metadata: [
+                    "outcome": .string("updated"),
+                    "id": .string(updated.id),
+                    "content": .string(updated.content),
+                    "replaced_id": .string(duplicate.id),
+                ]
+            )
             return SubAgentJSON.encode([
                 "summary": "Updated existing memory.",
                 "id": updated.id,
                 "content": updated.content,
                 "updated": true,
             ])
+        }
+
+        if let duplicate {
+            logger.info(
+                "memory dedup skipped — similar embedding but different fact",
+                metadata: [
+                    "existing_id": .string(duplicate.id),
+                    "existing_content": .string(duplicate.content),
+                    "new_content": .string(content),
+                ]
+            )
         }
 
         let writeStart = Date()
@@ -172,7 +209,14 @@ struct MemoryAgent: SubAgent, Sendable {
             writeMs: Self.elapsedMs(since: writeStart),
             totalStart: totalStart
         )
-        logger.info("memory saved", metadata: ["id": .string(record.id), "content": .string(record.content)])
+        logger.info(
+            "memory saved",
+            metadata: [
+                "outcome": .string("inserted"),
+                "id": .string(record.id),
+                "content": .string(record.content),
+            ]
+        )
         return SubAgentJSON.encode([
             "summary": "Saved memory.",
             "id": record.id,
@@ -204,6 +248,28 @@ struct MemoryAgent: SubAgent, Sendable {
                 "total_ms": "\(Self.elapsedMs(since: totalStart))",
             ]
         )
+    }
+
+    private func logRememberFailure(
+        _ reason: String,
+        action: String? = nil,
+        content: String? = nil,
+        argumentsJSON: String? = nil
+    ) {
+        var metadata: Logger.Metadata = ["reason": .string(reason)]
+        if let action { metadata["action"] = .string(action) }
+        if let content { metadata["content"] = .string(content) }
+        if let argumentsJSON { metadata["args"] = .string(argumentsJSON) }
+        logger.warning("memory save failed", metadata: metadata)
+    }
+
+    private static func encodeArgs(_ args: [String: Any]) -> String {
+        if let data = try? JSONSerialization.data(withJSONObject: args),
+           let string = String(data: data, encoding: .utf8)
+        {
+            return string
+        }
+        return "{}"
     }
 
     private func search(args: [String: Any]) async throws -> String {

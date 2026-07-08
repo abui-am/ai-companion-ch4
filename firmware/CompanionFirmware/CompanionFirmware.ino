@@ -3,6 +3,7 @@
 #include "audio_io.h"
 #include "config.h"
 #include "face_display.h"
+#include "motor_drive.h"
 #include "ws_session.h"
 
 static void connectWiFi() {
@@ -31,6 +32,7 @@ void setup() {
     faceDisplayInit();
     faceDisplaySetMode(FACE_BOOT);
     faceDisplaySetStatusLine("Booting...");
+    motorInit();
     audioIoInit();
     audioIoSpeakerBeep();
     connectWiFi();

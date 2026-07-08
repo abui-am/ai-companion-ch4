@@ -10,6 +10,30 @@ final class CmdRouterTests: XCTestCase {
         XCTAssertNoThrow(try CmdRouter.validate(cmd))
     }
 
+    func testValidMoveStrollPasses() throws {
+        let cmd = DeviceCommand(action: "move", params: LEDParams(pattern: "stroll"))
+        XCTAssertNoThrow(try CmdRouter.validate(cmd))
+    }
+
+    func testValidMoveWithDurationPasses() throws {
+        let cmd = DeviceCommand(action: "move", params: LEDParams(pattern: "forward", durationMs: 500))
+        XCTAssertNoThrow(try CmdRouter.validate(cmd))
+    }
+
+    func testMoveDurationOutOfRangeRejected() {
+        let cmd = DeviceCommand(action: "move", params: LEDParams(pattern: "forward", durationMs: 5000))
+        XCTAssertThrowsError(try CmdRouter.validate(cmd)) { error in
+            XCTAssertEqual(error as? ValidationError, .outOfRange)
+        }
+    }
+
+    func testMoveUnknownPatternRejected() {
+        let cmd = DeviceCommand(action: "move", params: LEDParams(pattern: "spin"))
+        XCTAssertThrowsError(try CmdRouter.validate(cmd)) { error in
+            XCTAssertEqual(error as? ValidationError, .outOfRange)
+        }
+    }
+
     func testUnknownActionRejected() {
         let cmd = DeviceCommand(action: "play_sound", params: LEDParams(r: 0, g: 0, b: 0))
         XCTAssertThrowsError(try CmdRouter.validate(cmd)) { error in

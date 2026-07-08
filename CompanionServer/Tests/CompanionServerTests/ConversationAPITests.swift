@@ -14,6 +14,7 @@ private struct APIConversationSession: Decodable {
     let id: String
     let startedAt: Date
     let endedAt: Date?
+    let voiceCount: Int
 }
 
 private struct APIConversationSessionsResponse: Decodable {
@@ -502,6 +503,51 @@ final class ConversationAPITests: XCTestCase {
                 )
                 XCTAssertEqual(session.id, sessionId)
                 XCTAssertNil(session.endedAt)
+                XCTAssertEqual(session.voiceCount, 0)
+            }
+        }
+    }
+
+    func testGetSessionVoiceCountReflectsDistinctTurns() async throws {
+        let sessionId = try await harness.createSession()
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-1")
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-2")
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations/\(sessionId)",
+                method: .get,
+                headers: headers
+            ) { response in
+                let session = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationSession.self,
+                    from: response.body
+                )
+                XCTAssertEqual(session.voiceCount, 2)
+            }
+        }
+    }
+
+    func testListConversationsIncludesVoiceCount() async throws {
+        let sessionId = try await harness.createSession()
+        try await harness.seedTurn(sessionId: sessionId, turnId: "turn-1")
+
+        let app = harness.makeApp()
+        let headers = harness.authHeaders()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/conversations",
+                method: .get,
+                headers: headers
+            ) { response in
+                let body = try ConversationAPITestHarness.makeDecoder().decode(
+                    APIConversationSessionsResponse.self,
+                    from: response.body
+                )
+                let session = try XCTUnwrap(body.sessions.first(where: { $0.id == sessionId }))
+                XCTAssertEqual(session.voiceCount, 1)
             }
         }
     }

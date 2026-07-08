@@ -131,10 +131,16 @@ public actor ConversationRepository {
       if let from, let to {
         rows = try await connection.query(
           """
-          SELECT id, started_at, ended_at
-          FROM conversation_sessions
-          WHERE started_at >= \(from) AND started_at <= \(to)
-          ORDER BY started_at DESC
+          SELECT s.id, s.started_at, s.ended_at,
+            COALESCE(
+              (SELECT COUNT(DISTINCT m.turn_id)::INT
+               FROM conversation_messages m
+               WHERE m.session_id = s.id),
+              0
+            ) AS voice_count
+          FROM conversation_sessions s
+          WHERE s.started_at >= \(from) AND s.started_at <= \(to)
+          ORDER BY s.started_at DESC
           LIMIT \(limit)
           """,
           logger: logger
@@ -142,10 +148,16 @@ public actor ConversationRepository {
       } else if let from {
         rows = try await connection.query(
           """
-          SELECT id, started_at, ended_at
-          FROM conversation_sessions
-          WHERE started_at >= \(from)
-          ORDER BY started_at DESC
+          SELECT s.id, s.started_at, s.ended_at,
+            COALESCE(
+              (SELECT COUNT(DISTINCT m.turn_id)::INT
+               FROM conversation_messages m
+               WHERE m.session_id = s.id),
+              0
+            ) AS voice_count
+          FROM conversation_sessions s
+          WHERE s.started_at >= \(from)
+          ORDER BY s.started_at DESC
           LIMIT \(limit)
           """,
           logger: logger
@@ -153,10 +165,16 @@ public actor ConversationRepository {
       } else if let to {
         rows = try await connection.query(
           """
-          SELECT id, started_at, ended_at
-          FROM conversation_sessions
-          WHERE started_at <= \(to)
-          ORDER BY started_at DESC
+          SELECT s.id, s.started_at, s.ended_at,
+            COALESCE(
+              (SELECT COUNT(DISTINCT m.turn_id)::INT
+               FROM conversation_messages m
+               WHERE m.session_id = s.id),
+              0
+            ) AS voice_count
+          FROM conversation_sessions s
+          WHERE s.started_at <= \(to)
+          ORDER BY s.started_at DESC
           LIMIT \(limit)
           """,
           logger: logger
@@ -164,9 +182,15 @@ public actor ConversationRepository {
       } else {
         rows = try await connection.query(
           """
-          SELECT id, started_at, ended_at
-          FROM conversation_sessions
-          ORDER BY started_at DESC
+          SELECT s.id, s.started_at, s.ended_at,
+            COALESCE(
+              (SELECT COUNT(DISTINCT m.turn_id)::INT
+               FROM conversation_messages m
+               WHERE m.session_id = s.id),
+              0
+            ) AS voice_count
+          FROM conversation_sessions s
+          ORDER BY s.started_at DESC
           LIMIT \(limit)
           """,
           logger: logger
@@ -174,8 +198,10 @@ public actor ConversationRepository {
       }
 
       var sessions: [ConversationSessionRecord] = []
-      for try await (id, startedAt, endedAt) in rows.decode((String, Date, Date?).self) {
-        sessions.append(ConversationSessionRecord(id: id, startedAt: startedAt, endedAt: endedAt))
+      for try await (id, startedAt, endedAt, voiceCount) in rows.decode((String, Date, Date?, Int).self) {
+        sessions.append(
+          ConversationSessionRecord(id: id, startedAt: startedAt, endedAt: endedAt, voiceCount: voiceCount)
+        )
       }
       return sessions
     }
@@ -196,15 +222,21 @@ public actor ConversationRepository {
     try await database.withConnection { connection in
       let rows = try await connection.query(
         """
-        SELECT id, started_at, ended_at
-        FROM conversation_sessions
-        WHERE id = \(id)
+        SELECT s.id, s.started_at, s.ended_at,
+          COALESCE(
+            (SELECT COUNT(DISTINCT m.turn_id)::INT
+             FROM conversation_messages m
+             WHERE m.session_id = s.id),
+            0
+          ) AS voice_count
+        FROM conversation_sessions s
+        WHERE s.id = \(id)
         LIMIT 1
         """,
         logger: logger
       )
-      for try await (id, startedAt, endedAt) in rows.decode((String, Date, Date?).self) {
-        return ConversationSessionRecord(id: id, startedAt: startedAt, endedAt: endedAt)
+      for try await (id, startedAt, endedAt, voiceCount) in rows.decode((String, Date, Date?, Int).self) {
+        return ConversationSessionRecord(id: id, startedAt: startedAt, endedAt: endedAt, voiceCount: voiceCount)
       }
       throw ConversationRepositoryError.sessionNotFound(id)
     }

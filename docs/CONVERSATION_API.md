@@ -35,7 +35,8 @@ A **session** covers one WebSocket connection (from `session.start` to disconnec
 {
   "id": "3F2A1B4C-...",
   "startedAt": "2026-07-07T09:00:00Z",
-  "endedAt": "2026-07-07T09:03:12Z"
+  "endedAt": "2026-07-07T09:03:12Z",
+  "voiceCount": 3
 }
 ```
 
@@ -44,6 +45,7 @@ A **session** covers one WebSocket connection (from `session.start` to disconnec
 | `id` | string | The voice session's UUID |
 | `startedAt` | string (ISO 8601 UTC) | Set on first saved turn |
 | `endedAt` | string (ISO 8601 UTC) \| null | Set on disconnect; `null` while the session is still live |
+| `voiceCount` | integer | Number of distinct voice turns in this session (`turn-1`, `turn-2`, …); `0` when no messages have been saved yet |
 
 ```json
 {
@@ -118,8 +120,10 @@ All query parameters are optional. `from`/`to` filter on `startedAt`; `limit` de
 **Response `200`:**
 
 ```json
-{ "sessions": [ { "id": "...", "startedAt": "...", "endedAt": null } ] }
+{ "sessions": [ { "id": "...", "startedAt": "...", "endedAt": null, "voiceCount": 3 } ] }
 ```
+
+Each session object includes `voiceCount` so list UIs can show how many voice turns happened without fetching `/history`.
 
 ### Get one session
 
@@ -127,7 +131,7 @@ All query parameters are optional. `from`/`to` filter on `startedAt`; `limit` de
 GET /api/v1/conversations/{id}
 ```
 
-**Response `200`:** single Session object. **Response `404`:** session not found.
+**Response `200`:** single Session object (includes `voiceCount`). **Response `404`:** session not found.
 
 ### List messages in a session
 
@@ -281,6 +285,7 @@ export type ConversationSession = {
   id: string;
   startedAt: string;
   endedAt: string | null;
+  voiceCount: number;
 };
 
 export type ConversationMessage = {

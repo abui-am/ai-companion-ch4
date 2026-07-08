@@ -160,10 +160,13 @@ struct CompanionServerApp {
             return .dontUpgrade
         } onUpgrade: { inbound, outbound, _ in
             serverLogger.info("ws connection upgraded")
+            let outboundWriter = WebSocketSessionOutboundWriter(base: outbound)
+            let deviceCommands = DeviceCommandGateway(outbound: outboundWriter, logger: serverLogger)
             var subAgentList: [any SubAgent] = [
                 TaskAgent(tasks: tasks, timeZoneIdentifier: config.companionTimezone, logger: serverLogger),
                 CalendarAgent(calendar: calendar, timeZoneIdentifier: config.companionTimezone, logger: serverLogger),
                 MemoryAgent(memories: memories, embeddings: embeddings, config: userConfig, logger: serverLogger),
+                MotionAgent(gateway: deviceCommands, logger: serverLogger),
             ]
             if config.webSearchEnabled {
                 subAgentList.append(
@@ -196,7 +199,7 @@ struct CompanionServerApp {
                 nil
             }
             let session = VoiceSession(
-                outbound: WebSocketSessionOutboundWriter(base: outbound),
+                outbound: outboundWriter,
                 realtime: realtime,
                 tts: cartesiaTTS,
                 speakers: speakers,

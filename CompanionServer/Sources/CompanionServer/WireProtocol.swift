@@ -101,13 +101,31 @@ struct TranscriptFinal: Codable {
     }
 }
 
-struct LEDParams: Codable {
-    let r: Int
-    let g: Int
-    let b: Int
+struct LEDParams: Codable, Sendable {
+    let r: Int?
+    let g: Int?
+    let b: Int?
+    let pattern: String?
+    let durationMs: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case r
+        case g
+        case b
+        case pattern
+        case durationMs = "duration_ms"
+    }
+
+    init(r: Int? = nil, g: Int? = nil, b: Int? = nil, pattern: String? = nil, durationMs: Int? = nil) {
+        self.r = r
+        self.g = g
+        self.b = b
+        self.pattern = pattern
+        self.durationMs = durationMs
+    }
 }
 
-struct DeviceCommand: Codable {
+struct DeviceCommand: Codable, Sendable {
     var type: MessageType = .deviceCommand
     let action: String
     let params: LEDParams

@@ -12,6 +12,7 @@
 #include "button.h"
 #include "config.h"
 #include "face_display.h"
+#include "motor_drive.h"
 #include "pcm_codec.h"
 #include "protocol.h"
 
@@ -931,8 +932,15 @@ static void handleTextFrame(uint8_t *payload, size_t len) {
     faceDisplayShowTranscript(msg.text.c_str());
     break;
   case PROTO_MSG_DEVICE_COMMAND:
-    Serial.printf("device_command ignored (no actuator wired): action=%s\n",
-                  msg.action.c_str());
+    if (msg.action == "move") {
+      if (msg.pattern.length() > 0) {
+        motorHandleCommand(msg.pattern.c_str(), msg.durationMs);
+      } else {
+        Serial.println("[MOTOR] move command missing pattern");
+      }
+    } else {
+      Serial.printf("device_command ignored: action=%s\n", msg.action.c_str());
+    }
     break;
   case PROTO_MSG_TTS_START:
     drainPlaybackQueue();

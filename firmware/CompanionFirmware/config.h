@@ -52,3 +52,22 @@
 #define PIN_OLED_SCL 9
 #define OLED_I2C_ADDRESS 0x3C
 #define OLED_RESET -1
+
+// Wheel motors — DRV8833 dual H-bridge (5 V rail shared with speaker amp).
+// Left motor: AIN1/AIN2. Right motor: BIN1/BIN2.
+#define PIN_MOTOR_AIN1 1
+#define PIN_MOTOR_AIN2 2
+#define PIN_MOTOR_BIN1 3
+#define PIN_MOTOR_BIN2 10
+
+// Keep duty low and ramp in — avoids brownouts on the shared 5 V supply.
+#define MOTOR_PWM_FREQ 20000
+#define MOTOR_PWM_RES 8
+#define MOTOR_PWM_MAX 70       // ~27% duty — gentle forward/back
+#define MOTOR_PWM_TURN 55      // slower pivot turns
+#define MOTOR_RAMP_MS 350
+#define MOTOR_DEFAULT_DURATION_MS 450
+#define MOTOR_STROLL_SEGMENTS 4
+#define MOTOR_STROLL_FORWARD_MS 500
+#define MOTOR_STROLL_TURN_MS 280
+#define MOTOR_STROLL_PAUSE_MS 250

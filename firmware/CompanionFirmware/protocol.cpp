@@ -23,6 +23,11 @@ void protocolParse(const uint8_t *data, size_t len, ProtoMsg &out) {
     } else if (strcmp(type, "device_command") == 0) {
         out.type = PROTO_MSG_DEVICE_COMMAND;
         out.action = String((const char *)(doc["action"] | ""));
+        JsonObject params = doc["params"].as<JsonObject>();
+        if (!params.isNull()) {
+            out.pattern = String((const char *)(params["pattern"] | ""));
+            out.durationMs = params["duration_ms"] | 0;
+        }
     } else if (strcmp(type, "tts.start") == 0) {
         out.type = PROTO_MSG_TTS_START;
         out.sessionId = String((const char *)(doc["session_id"] | ""));

@@ -152,7 +152,7 @@ actor VoiceSession {
     /// connection without the model needing to call `memory.search` first — see
     /// `OpenAIRealtimeService.refreshMemoryContext`. Skipped when personalization is off;
     /// never fails the session on a lookup error.
-    private func refreshMemoryContext() async {
+    private func refreshMemoryContext(trigger: String? = nil) async {
         guard saveConversationHistory else {
             await realtime.refreshMemoryContext(memories: [])
             return
@@ -160,10 +160,24 @@ actor VoiceSession {
         do {
             let recent = try await memories.list(limit: Self.sessionMemoryLimit)
             await realtime.refreshMemoryContext(memories: recent)
+            if let trigger {
+                logger.info(
+                    "memory context refreshed",
+                    metadata: [
+                        "session_id": .string(sessionId),
+                        "trigger": .string(trigger),
+                        "count": "\(recent.count)",
+                    ]
+                )
+            }
         } catch {
             logger.warning(
                 "failed to load memory context — continuing without it",
-                metadata: ["session_id": .string(sessionId), "error": "\(error)"]
+                metadata: [
+                    "session_id": .string(sessionId),
+                    "trigger": .string(trigger ?? "session_start"),
+                    "error": "\(error)",
+                ]
             )
             await realtime.refreshMemoryContext(memories: [])
         }
@@ -672,7 +686,7 @@ actor VoiceSession {
         else { return }
         guard action == "remember" || action == "forget" else { return }
         Task { [weak self] in
-            await self?.refreshMemoryContext()
+            await self?.refreshMemoryContext(trigger: "memory_\(action)")
         }
     }
 
