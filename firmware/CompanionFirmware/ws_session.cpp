@@ -617,6 +617,7 @@ static void captureTask(void *arg) {
   int droppedCount = 0;
   SessionState lastState = SESSION_IDLE;
   bool micActive = false;
+  int emptyReads = 0;
   uint32_t turnStartMs = 0;
   uint32_t lastVoiceMs = 0;
   bool heardVoiceThisTurn = false;
@@ -679,8 +680,19 @@ static void captureTask(void *arg) {
 
     size_t n = audioIoReadUplinkFrame(frame, sizeof(frame));
     if (n == 0) {
+      // Read timed out with the mic supposedly running — the I2S driver has
+      // wedged (the "no beep / hears nothing until reboot" failure). Two
+      // strikes (~2 s) then reinstall the driver in place.
+      if (micActive && ++emptyReads >= 2) {
+        Serial.println("[MIC] mic delivering no data — running recovery");
+        if (audioIoMicRecover()) {
+          audioIoPrimeMicAfterPause();
+        }
+        emptyReads = 0;
+      }
       continue;
     }
+    emptyReads = 0;
 
     switch (s) {
     case SESSION_IDLE: {

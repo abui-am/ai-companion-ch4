@@ -43,6 +43,10 @@ void audioIoSpeakerMute();
 
 void audioIoMicStart();
 void audioIoMicStop();
+
+// Reinstalls the mic I2S driver after it wedges (reads returning no data).
+// Returns true when the driver came back; leaves the mic running.
+bool audioIoMicRecover();
 bool audioIoMicIsRunning();
 void audioIoPrimeMic();
 // Lighter prime after mic was stopped for TTS/PROCESSING — avoids mic-ready

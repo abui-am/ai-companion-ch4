@@ -4,6 +4,8 @@ This document is the canonical reference for **stack v1**: the current working c
 
 **Stable as of 2026-07-06:** tap-to-talk + hands-free adaptive VAD (no on-device wake word). See [§ Client VAD (stable)](#client-vad-stable).
 
+**Updated 2026-07-09:** self-healing for the three long-session failure modes (dead upstream Realtime socket, turns dying before TTS, mic I2S wedge). See [§ Resilience](#resilience-added-2026-07-09) and [MIC_STALL_DEBUG_REPORT.md](MIC_STALL_DEBUG_REPORT.md).
+
 **Code anchors:** `CompanionStack.protocolVersion` / `CompanionStack.pipelineProfile` (Swift), `COMPANION_PROTOCOL_VERSION` (firmware), VAD constants in `ws_session.cpp`.
 
 ---
@@ -98,6 +100,7 @@ Persisted alongside transcripts when `privacy.personalizationData` is on. Implem
 - **Disconnect:** cancel pipeline, close Realtime socket, discard unsent downlink — no resume
 - **Reconnect:** new `session.start` → new `session_id`
 - **Abort:** cancel Realtime response, stop downlink pacer, send `tts.end`
+- **Upstream loss (2026-07-09):** OpenAI reaps idle Realtime sockets; `ensureConnected()` reconnects lazily before the next append/commit. A turn that dies before `tts.start` sends `error code=turn_failed` so the device exits PROCESSING (in-session context is lost on reconnect; MemoryAgent memories survive)
 - **Backpressure:** `DownlinkPacer` leaky-bucket at real-time rate; speaker clients get initial burst of 12 frames
 
 ---
@@ -159,7 +162,7 @@ Implementation: `ws_session.cpp` (session state machine + VAD), `audio_io.cpp` (
 | OLED SDA | 8 |
 | OLED SCL | 9 |
 
-Face display: 1.3" SH1106 @ `0x3C` — `face_display.cpp` (FluxGarage RoboEyes + status bar). Install **Adafruit SH110X** and **FluxGarage RoboEyes** from Arduino Library Manager.
+Face display: 1.3" SH1106 @ `0x3C` — `face_display.cpp` (FluxGarage RoboEyes + status bar). Install **Adafruit SH110X** and **FluxGarage RoboEyes** from Arduino Library Manager. `OLED_USE_SSD1306` in `config.h` switches the driver for 1.3" clones that actually carry an SSD1306 (symptom: init ACKs at 0x3C but the panel stays black; the reverse mismatch shows 2-px-shifted garbage). Boot runs a white-flash panel self-test before WiFi, and the eyes render during WiFi connect — a black screen at boot is now always a real fault.
 
 `MIC_DATA_SHIFT=14`, PSRAM required for uplink queue.
 
@@ -236,6 +239,20 @@ Flash `firmware/CompanionFirmware`, set `config.h` host + token, **tap once** to
 # Terminal 2
 swift run TestClient
 ```
+
+---
+
+## Resilience (added 2026-07-09)
+
+Long sessions surfaced three failure modes that all ended in "robot stuck until reboot/restart." Each now self-heals:
+
+| Failure | Symptom | Recovery | Where |
+|---------|---------|----------|-------|
+| OpenAI reaps the idle Realtime socket | every turn after ~minutes idle hangs at thinking | `ensureConnected()` reconnects before next append/commit; costs one turn at most | `OpenAIRealtimeService.swift` |
+| Turn dies before `tts.start` | device waits in PROCESSING forever | server sends `error code=turn_failed`; device shows error face → idle | `VoiceSession.swift` (both turn paths) |
+| Mic I2S wedge after many stop/start cycles | beep disappears, hears nothing, only reboot helped | read deadline (1 s) detects starvation; 2 strikes → driver reinstall in place (`audioIoMicRecover`) + re-prime | `audio_io.cpp`, `ws_session.cpp` |
+
+Diagnosis narrative: [MIC_STALL_DEBUG_REPORT.md](MIC_STALL_DEBUG_REPORT.md).
 
 ---
 

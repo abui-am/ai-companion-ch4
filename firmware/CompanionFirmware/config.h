@@ -5,10 +5,10 @@
 
 // Fill these in before flashing. Mirrors the showcase-phase auth model in
 // the plan: shared compile-time token, no rotation, LAN-only.
-#define WIFI_SSID "BocilServer"
+#define WIFI_SSID "iphoneGung"
 #define WIFI_PASSWORD "1234567890"
 
-#define COMPANION_SERVER_HOST "10.235.115.130"
+#define COMPANION_SERVER_HOST "172.20.10.3"
 #define COMPANION_SERVER_PORT 8080
 #define COMPANION_SERVER_PATH "/ws"
 #define COMPANION_USE_TLS false // true => wss:// (beginSSL)
@@ -52,8 +52,13 @@
 #define SPEAKER_BEEP_AMPLITUDE 8000
 #define SPEAKER_PLAYBACK_GAIN 1.5
 
-// Face OLED — 1.3" SH1106 (128x64), I2C @ 0x3C. Uses Adafruit SH110X +
-// FluxGarage RoboEyes (install both from Arduino Library Manager).
+// Face OLED — 1.3" 128x64, I2C @ 0x3C. Uses FluxGarage RoboEyes plus either
+// Adafruit SH110X or Adafruit SSD1306 (install from Arduino Library Manager).
+// Many 1.3" modules sold as SH1106 actually carry an SSD1306 — the tell is
+// that init succeeds (chip ACKs at 0x3C) but the panel stays black, because
+// the SH1106 driver never sends the SSD1306 charge-pump-enable command.
+// Set to 1 for SSD1306, 0 for a real SH1106.
+#define OLED_USE_SSD1306 0
 #define PIN_OLED_SDA 8
 #define PIN_OLED_SCL 9
 #define OLED_I2C_ADDRESS 0x3C

@@ -1,7 +1,6 @@
 #include "face_display.h"
 
 #include <Adafruit_GFX.h>
-#include <Adafruit_SH110X.h>
 #include <FluxGarage_RoboEyes.h>
 #include <Wire.h>
 #include <string.h>
@@ -9,6 +8,16 @@
 #include <freertos/semphr.h>
 
 #include "config.h"
+
+#if OLED_USE_SSD1306
+#include <Adafruit_SSD1306.h>
+using OledDriver = Adafruit_SSD1306;
+#define OLED_DRIVER_NAME "SSD1306"
+#else
+#include <Adafruit_SH110X.h>
+using OledDriver = Adafruit_SH1106G;
+#define OLED_DRIVER_NAME "SH1106"
+#endif
 
 static constexpr int kScreenWidth = 128;
 static constexpr int kScreenHeight = 64;
@@ -33,10 +42,10 @@ static void drawFaceOverlays(Adafruit_GFX &gfx);
 // RoboEyes dispatches display() statically on its template parameter, so this
 // subclass injects the marks + status bar into the same buffer right before
 // the single I2C flush of every eye frame.
-class FaceCanvas : public Adafruit_SH1106G {
+class FaceCanvas : public OledDriver {
  public:
   FaceCanvas(uint16_t w, uint16_t h, TwoWire *wire, int8_t rst)
-      : Adafruit_SH1106G(w, h, wire, rst) {}
+      : OledDriver(w, h, wire, rst) {}
 
   bool overlayEnabled = false;
 
@@ -44,7 +53,7 @@ class FaceCanvas : public Adafruit_SH1106G {
     if (overlayEnabled) {
       drawFaceOverlays(*this);
     }
-    Adafruit_SH1106G::display();
+    OledDriver::display();
   }
 };
 
@@ -549,11 +558,23 @@ void faceDisplayInit() {
   Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
   delay(250);
 
-  if (!s_display.begin(OLED_I2C_ADDRESS, true)) {
-    Serial.println("[FACE] SH1106 init failed — check wiring / 0x3C address");
+#if OLED_USE_SSD1306
+  const bool oledOk = s_display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDRESS);
+#else
+  const bool oledOk = s_display.begin(OLED_I2C_ADDRESS, true);
+#endif
+  if (!oledOk) {
+    Serial.println("[FACE] " OLED_DRIVER_NAME
+                   " init failed — check wiring / 0x3C address");
     return;
   }
 
+  // Panel self-test: flash full white, then clear. Proves the panel itself
+  // lights up before WiFi/loop() ever run — the eyes only render from
+  // faceDisplayLoop(), so without this the screen is black all through setup.
+  s_display.fillRect(0, 0, kScreenWidth, kScreenHeight, 1);
+  s_display.display();
+  delay(400);
   s_display.clearDisplay();
   s_display.display();
 
@@ -565,8 +586,8 @@ void faceDisplayInit() {
   s_appliedEmotion = EMOTION_NONE;
   s_faceApplied = true;
 
-  Serial.printf("[FACE] SH1106 128x64 @ 0x%02X SDA=%d SCL=%d\n", OLED_I2C_ADDRESS,
-                PIN_OLED_SDA, PIN_OLED_SCL);
+  Serial.printf("[FACE] " OLED_DRIVER_NAME " 128x64 @ 0x%02X SDA=%d SCL=%d\n",
+                OLED_I2C_ADDRESS, PIN_OLED_SDA, PIN_OLED_SCL);
 }
 
 void faceDisplaySetMode(FaceDisplayMode mode) {

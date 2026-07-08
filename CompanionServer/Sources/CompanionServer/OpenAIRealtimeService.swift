@@ -201,9 +201,20 @@ actor OpenAIRealtimeService {
         await appendAudioFrames([data])
     }
 
+    /// Reconnects if the upstream socket died (OpenAI reaps idle Realtime
+    /// sessions; a long-lived device session outlives them). Without this,
+    /// every turn after the drop fails with "socket not connected" and the
+    /// device is stuck on the thinking face until the server restarts.
+    private func ensureConnected() async {
+        if let socket, socket.state == .running { return }
+        logger.warning("realtime socket down — reconnecting")
+        await connect()
+    }
+
     /// Appends multiple consecutive uplink frames in one Realtime API message.
     func appendAudioFrames(_ frames: [Data]) async {
         guard !frames.isEmpty else { return }
+        await ensureConnected()
         var combined = Data()
         combined.reserveCapacity(frames.count * frames[0].count * 3 / 2)
         for frame in frames {
@@ -219,6 +230,7 @@ actor OpenAIRealtimeService {
     /// Returns a stream that emits audio events and ends with `.done` or `.error`.
     func commitAndCreateResponse() async -> AsyncStream<RealtimeAudioEvent> {
         let (stream, continuation) = AsyncStream<RealtimeAudioEvent>.makeStream()
+        await ensureConnected()
         guard let socket, socket.state == .running else {
             logger.error("commitAndCreateResponse: socket not connected (state=\(String(describing: socket?.state)))")
             continuation.yield(.error("realtime socket not connected"))

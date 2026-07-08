@@ -508,7 +508,20 @@ actor VoiceSession {
 
             await persistConversationTurn(turnId: turnId, inputText: inputText, assistantText: assistantText)
 
-            guard phase == .streamingTTS else { return }
+            guard phase == .streamingTTS else {
+                // Turn ended without TTS ever starting (e.g. the upstream
+                // realtime socket died and the stream errored out) — tell the
+                // device, or it sits on the thinking face until its watchdog.
+                if phase == .processing {
+                    logger.error(
+                        "turn produced no TTS — notifying device",
+                        metadata: ["session_id": .string(sessionId)]
+                    )
+                    try? await send(ErrorMessage(code: "turn_failed", message: "no response from AI"))
+                    phase = .connected
+                }
+                return
+            }
             await downlinkPacer.endTurn()
             dumpDownlinkCaptureIfNeeded()
             try await send(TTSEnd(sessionId: sessionId))
@@ -603,7 +616,20 @@ actor VoiceSession {
 
             await persistConversationTurn(turnId: turnId, inputText: inputText, assistantText: assistantText)
 
-            guard phase == .streamingTTS else { return }
+            guard phase == .streamingTTS else {
+                // Turn ended without TTS ever starting (e.g. the upstream
+                // realtime socket died and the stream errored out) — tell the
+                // device, or it sits on the thinking face until its watchdog.
+                if phase == .processing {
+                    logger.error(
+                        "turn produced no TTS — notifying device",
+                        metadata: ["session_id": .string(sessionId)]
+                    )
+                    try? await send(ErrorMessage(code: "turn_failed", message: "no response from AI"))
+                    phase = .connected
+                }
+                return
+            }
             await downlinkPacer.endTurn()
             dumpDownlinkCaptureIfNeeded()
             try await send(TTSEnd(sessionId: sessionId))

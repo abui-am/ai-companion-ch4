@@ -16,7 +16,12 @@ static void connectWiFi() {
 
     Serial.printf("connecting to %s", WIFI_SSID);
     while (WiFi.status() != WL_CONNECTED) {
-        delay(300);
+        // Keep the face alive while blocked here — loop() (the only other
+        // place eyes render) doesn't run until this returns.
+        for (int i = 0; i < 10; i++) {
+            faceDisplayLoop();
+            delay(30);
+        }
         Serial.print(".");
     }
     Serial.printf(" connected (%s)\n", WiFi.localIP().toString().c_str());
@@ -38,7 +43,13 @@ static void motorSafeStateEarly() {
 void setup() {
     motorSafeStateEarly();
     Serial.begin(115200);
-    delay(800);
+    // Native USB-CDC re-enumerates after reset; wait (up to 4 s) for the
+    // monitor to reattach so early boot lines like [FACE] aren't dropped.
+    const uint32_t serialWaitStart = millis();
+    while (!Serial && millis() - serialWaitStart < 4000) {
+        delay(10);
+    }
+    delay(300);
     Serial.printf("\n[BOOT] CompanionFirmware heap=%u psram=%u psramFound=%d\n",
                   static_cast<unsigned>(ESP.getFreeHeap()),
                   static_cast<unsigned>(ESP.getFreePsram()),

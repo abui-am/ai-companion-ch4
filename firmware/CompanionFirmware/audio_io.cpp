@@ -82,11 +82,7 @@ static void audioIoNormalizeUplinkFrame(int16_t *samples, size_t count) {
   }
 }
 
-void audioIoInit() {
-  if (s_audioInitialized) {
-    return;
-  }
-
+static bool audioIoInstallMicDriver() {
   i2s_config_t micConfig = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
       .sample_rate = COMPANION_UPLINK_SAMPLE_RATE,
@@ -104,23 +100,51 @@ void audioIoInit() {
   esp_err_t micErr = i2s_driver_install(MIC_PORT, &micConfig, 0, NULL);
   if (micErr != ESP_OK) {
     Serial.printf("audio: mic i2s_driver_install failed err=%d\n", micErr);
-  } else {
-    i2s_pin_config_t micPins = {
-        .mck_io_num = I2S_PIN_NO_CHANGE,
-        .bck_io_num = PIN_MIC_BCLK,
-        .ws_io_num = PIN_MIC_WS,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = PIN_MIC_DIN,
-    };
-    micErr = i2s_set_pin(MIC_PORT, &micPins);
-    if (micErr != ESP_OK) {
-      Serial.printf("audio: mic i2s_set_pin failed err=%d\n", micErr);
-    } else {
-      Serial.printf("audio: I2S mic ready (bclk=%d ws=%d din=%d @ %d Hz)\n",
-                    PIN_MIC_BCLK, PIN_MIC_WS, PIN_MIC_DIN,
-                    COMPANION_UPLINK_SAMPLE_RATE);
-      i2s_stop(MIC_PORT);
-    }
+    return false;
+  }
+  i2s_pin_config_t micPins = {
+      .mck_io_num = I2S_PIN_NO_CHANGE,
+      .bck_io_num = PIN_MIC_BCLK,
+      .ws_io_num = PIN_MIC_WS,
+      .data_out_num = I2S_PIN_NO_CHANGE,
+      .data_in_num = PIN_MIC_DIN,
+  };
+  micErr = i2s_set_pin(MIC_PORT, &micPins);
+  if (micErr != ESP_OK) {
+    Serial.printf("audio: mic i2s_set_pin failed err=%d\n", micErr);
+    return false;
+  }
+  return true;
+}
+
+// Tear down and reinstall the mic I2S driver. The legacy driver can wedge
+// after many stop/start cycles (long conversations) — reads then return no
+// data forever and capture starves until reboot. Reinstalling recovers it
+// in place; audioIoReadUplinkFrame's deadline is what detects the condition.
+bool audioIoMicRecover() {
+  Serial.println("audio: mic recovery — reinstalling I2S driver");
+  i2s_driver_uninstall(MIC_PORT);
+  if (!audioIoInstallMicDriver()) {
+    Serial.println("audio: mic recovery FAILED — check wiring/power");
+    s_micRunning = false;
+    return false;
+  }
+  i2s_start(MIC_PORT);
+  s_micRunning = true;
+  Serial.println("audio: mic recovery ok");
+  return true;
+}
+
+void audioIoInit() {
+  if (s_audioInitialized) {
+    return;
+  }
+
+  if (audioIoInstallMicDriver()) {
+    Serial.printf("audio: I2S mic ready (bclk=%d ws=%d din=%d @ %d Hz)\n",
+                  PIN_MIC_BCLK, PIN_MIC_WS, PIN_MIC_DIN,
+                  COMPANION_UPLINK_SAMPLE_RATE);
+    i2s_stop(MIC_PORT);
   }
 
   i2s_config_t spkConfig = {
@@ -296,12 +320,22 @@ size_t audioIoReadUplinkFrame(uint8_t *out, size_t outCapacity) {
   if (outCapacity < COMPANION_UPLINK_FRAME_BYTES) {
     return 0;
   }
-  // Block until one full 60 ms protocol frame is assembled.
+  // Block until one full 60 ms protocol frame is assembled — but never
+  // forever: if the mic I2S wedges and stops delivering (seen after long
+  // sessions), bail out so the caller can run audioIoMicRecover() instead
+  // of starving capture for good (which also kills the turn beep).
   static int32_t rawBuf[COMPANION_UPLINK_FRAME_BYTES / sizeof(int16_t)];
   const size_t targetSamples = COMPANION_UPLINK_FRAME_BYTES / sizeof(int16_t);
   int16_t *dst = reinterpret_cast<int16_t *>(out);
   size_t outSamples = 0;
+  const uint32_t deadlineMs = millis() + 1000;
   while (outSamples < targetSamples) {
+    if (millis() > deadlineMs) {
+      Serial.printf("audio: mic read deadline (%u/%u samples) — mic stalled?\n",
+                    static_cast<unsigned>(outSamples),
+                    static_cast<unsigned>(targetSamples));
+      return 0;
+    }
     size_t bytesRead = 0;
     esp_err_t err = i2s_read(MIC_PORT, rawBuf, sizeof(rawBuf), &bytesRead,
                              pdMS_TO_TICKS(200));
