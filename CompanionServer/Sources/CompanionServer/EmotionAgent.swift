@@ -30,15 +30,19 @@ struct EmotionAgent: SubAgent, Sendable {
             plus a comic-style corner mark (anger vein for angry, "!" for surprised, "?" \
             for confused, hearts for love, Zzz for sleepy, sparkles for excited).
 
-            Call this whenever the emotional tone of the moment shifts, so the face matches \
-            what you're saying: reacting to great news, sharing something sad, being teased, \
-            hearing something shocking, not understanding the user, winding down at night, \
-            receiving a compliment, or getting worked up about something.
+            The face must match the dominant tone of what you are about to SAY. Exactly one \
+            distinct use case each (first match wins): confused = you can't parse the turn; \
+            sad = heavy moment or your reply discusses loss/disappointment; love = affection \
+            aimed at or shared with you; surprised = expectation-breaking reveal of neutral or \
+            unknown valence; excited = big positive (user's win, celebration, or clearly great \
+            news); angry = playful mock outrage at a thing, never truly at the user; sleepy = \
+            bedtime/tiredness context; happy = mild pleasant default; neutral = reset when the \
+            shown expression no longer fits.
 
-            The expression holds for a few seconds and then settles back to the normal face \
-            automatically — pick duration_ms only when you want it longer or shorter. \
-            Use "neutral" to clear an expression early. Fire-and-forget: never announce or \
-            describe calling this tool; just keep talking naturally.
+            Call it at the start of the turn so face and voice land together; at most one call \
+            per turn; skip the call when the face already matches. The expression settles back \
+            automatically — pass duration_ms only for a deliberately long hold. Fire-and-forget: \
+            never announce or describe calling this tool; just keep talking naturally.
             """,
             "parameters": [
                 "type": "object",

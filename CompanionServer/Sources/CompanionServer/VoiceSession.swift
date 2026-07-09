@@ -63,6 +63,9 @@ actor VoiceSession {
     /// turns are persisted via `conversations`/`conversationAudio`.
     private var saveConversationHistory = false
     private var conversationSessionStarted = false
+    /// Registered here so PUT /api/v1/personas can push a persona change into
+    /// this live session (next turn) instead of waiting for a reconnect.
+    private let personas: PersonaStore?
 
     init(
         outbound: SessionOutboundWriter,
@@ -73,6 +76,7 @@ actor VoiceSession {
         conversations: ConversationRepository,
         conversationAudio: ConversationAudioStore,
         memories: MemoryRepository,
+        personas: PersonaStore? = nil,
         logger: Logger
     ) {
         self.outbound = outbound
@@ -83,6 +87,7 @@ actor VoiceSession {
         self.conversations = conversations
         self.conversationAudio = conversationAudio
         self.memories = memories
+        self.personas = personas
         self.downlinkPacer = DownlinkPacer(
             outbound: outbound,
             speakers: speakers,
@@ -95,6 +100,7 @@ actor VoiceSession {
     func start() async throws {
         phase = .connected
         logger.info("session started", metadata: ["session_id": .string(sessionId)])
+        await personas?.attach(sessionId: sessionId, realtime: realtime)
         Task { await realtime.connect() }
         let ready = SessionReady(sessionId: sessionId, audio: .downlink)
         try await send(ready)
@@ -128,6 +134,12 @@ actor VoiceSession {
         do {
             let record = try await config.get()
             await realtime.setPersonality(record.personality)
+            if let personas {
+                await realtime.setPersona(
+                    named: personas.activeName(),
+                    instruction: personas.activeInstruction()
+                )
+            }
             await realtime.setResponseLanguage(record.language.promptLabel)
             await realtime.refreshTimeContext()
             saveConversationHistory = record.personalizationData
@@ -401,6 +413,9 @@ actor VoiceSession {
         pipelineTask?.cancel()
         pipelineTask = nil
         stopUplinkForwarder()
+        if let personas {
+            Task { await personas.detach(sessionId: sessionId) }
+        }
         Task { await realtime.close() }
         Task { await downlinkPacer.cancel() }
         if conversationSessionStarted {

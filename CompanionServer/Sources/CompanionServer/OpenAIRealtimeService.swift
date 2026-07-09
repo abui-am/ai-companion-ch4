@@ -32,6 +32,8 @@ actor OpenAIRealtimeService {
     private let textOnlyOutput: Bool
     private var responseLanguage: String
     private var personality: ConfigPersonality
+    private var personaName: String?
+    private var personaInstruction: String?
     private var timeZone: TimeZone
     private var memoryContext: String?
     private let subAgents: SubAgentRegistry
@@ -111,6 +113,21 @@ actor OpenAIRealtimeService {
             logger.error(
                 "realtime response language update failed",
                 metadata: ["language": .string(language), "error": .string("\(error)")]
+            )
+        }
+    }
+
+    func setPersona(named name: String?, instruction: String?) async {
+        personaName = name
+        personaInstruction = instruction
+        guard let socket, socket.state == .running else { return }
+        do {
+            try await sendJSON(sessionUpdatePayload())
+            logger.info("realtime persona updated", metadata: ["persona": .string(name ?? "none")])
+        } catch {
+            logger.error(
+                "realtime persona update failed",
+                metadata: ["persona": .string(name ?? "none"), "error": .string("\(error)")]
             )
         }
     }
@@ -408,6 +425,7 @@ actor OpenAIRealtimeService {
                 "instructions": CompanionPrompt.system(
                     responseLanguage: responseLanguage,
                     personality: personality,
+                    personaInstruction: personaInstruction,
                     timeZone: timeZone,
                     memoryContext: memoryContext
                 ),

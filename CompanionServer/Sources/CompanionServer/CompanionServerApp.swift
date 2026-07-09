@@ -149,6 +149,7 @@ struct CompanionServerApp {
         }
 
         let speakers = SpeakerRegistry(logger: serverLogger)
+        let personaStore = PersonaStore(logger: serverLogger)
 
         let wsRouter = Router(context: BasicWebSocketRequestContext.self)
         wsRouter.ws("/ws") { request, _ in
@@ -208,6 +209,7 @@ struct CompanionServerApp {
                 conversations: conversations,
                 conversationAudio: conversationAudio,
                 memories: memories,
+                personas: personaStore,
                 logger: serverLogger
             )
             try await session.start()
@@ -274,6 +276,12 @@ struct CompanionServerApp {
         ConfigRoutes.register(
             on: router,
             config: userConfig,
+            deviceToken: config.deviceToken,
+            logger: serverLogger
+        )
+        PersonaRoutes.register(
+            on: router,
+            personas: personaStore,
             deviceToken: config.deviceToken,
             logger: serverLogger
         )
