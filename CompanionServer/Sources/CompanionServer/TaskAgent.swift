@@ -7,11 +7,18 @@ struct TaskAgent: SubAgent, Sendable {
     let name = "tasks"
 
     private let tasks: TaskRepository
+    private let reminderScheduler: ReminderScheduler
     private let timeZone: TimeZone
     private let logger: Logger
 
-    init(tasks: TaskRepository, timeZoneIdentifier: String, logger: Logger) {
+    init(
+        tasks: TaskRepository,
+        reminderScheduler: ReminderScheduler,
+        timeZoneIdentifier: String,
+        logger: Logger
+    ) {
         self.tasks = tasks
+        self.reminderScheduler = reminderScheduler
         self.timeZone = CompanionTimezone.resolve(identifier: timeZoneIdentifier)
         self.logger = logger
     }
@@ -108,6 +115,7 @@ struct TaskAgent: SubAgent, Sendable {
                 }
                 let notes = args["notes"] as? String
                 let record = try await tasks.createTask(title: title, dueAt: dueAt, notes: notes)
+                await reminderScheduler.scheduleTask(record)
                 return SubAgentJSON.encode([
                     "summary": "Created task \"\(record.title)\".",
                     "task": taskJSON(record),
@@ -141,6 +149,7 @@ struct TaskAgent: SubAgent, Sendable {
                     patch.notes = args["notes"] as? String
                 }
                 let record = try await tasks.updateTask(id: id, patch: patch)
+                await reminderScheduler.scheduleTask(record)
                 return SubAgentJSON.encode([
                     "summary": "Updated task \"\(record.title)\".",
                     "task": taskJSON(record),
@@ -150,6 +159,7 @@ struct TaskAgent: SubAgent, Sendable {
                     return SubAgentJSON.encodeError("delete requires id")
                 }
                 try await tasks.deleteTask(id: id)
+                await reminderScheduler.cancelTask(id: id)
                 return SubAgentJSON.encode(["summary": "Deleted task \(id)."])
             default:
                 return SubAgentJSON.encodeError("unknown action: \(action)")

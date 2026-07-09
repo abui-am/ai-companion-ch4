@@ -29,7 +29,7 @@ private struct BufferedToolCall {
 }
 
 actor VoiceSession {
-    private let sessionId = UUID().uuidString
+    let sessionId: String
     private let outbound: SessionOutboundWriter
     private let realtime: OpenAIRealtimeService
     private let tts: (any TTSStreamingService)?
@@ -68,6 +68,7 @@ actor VoiceSession {
     private let personas: PersonaStore?
 
     init(
+        sessionId: String = UUID().uuidString,
         outbound: SessionOutboundWriter,
         realtime: OpenAIRealtimeService,
         tts: (any TTSStreamingService)? = nil,
@@ -79,6 +80,7 @@ actor VoiceSession {
         personas: PersonaStore? = nil,
         logger: Logger
     ) {
+        self.sessionId = sessionId
         self.outbound = outbound
         self.realtime = realtime
         self.tts = tts
@@ -431,6 +433,152 @@ actor VoiceSession {
             }
         }
         logger.info("session disconnected", metadata: ["session_id": .string(sessionId)])
+    }
+
+    /// Proactive reminder delivery — surprised face plus spoken alert. Returns false when skipped.
+    func deliverReminder(
+        job: ReminderJobRecord,
+        gateway: DeviceCommandGateway,
+        remindBeforeMinutes: Int
+    ) async -> Bool {
+        guard phase == .connected else {
+            logger.info(
+                "reminder skipped — session busy",
+                metadata: [
+                    "session_id": .string(sessionId),
+                    "job_id": .string(job.id),
+                    "phase": .string("\(phase)"),
+                ]
+            )
+            return false
+        }
+        phase = .processing
+
+        let kindLabel = job.kind == .task ? "task" : "event"
+        let emotion = DeviceCommand(
+            action: "emotion",
+            params: LEDParams(pattern: "surprised", durationMs: 5000)
+        )
+        _ = await gateway.send(emotion)
+
+        let prompt = """
+        [System reminder — speak aloud in one short friendly sentence. Do NOT call the emotion tool; your face is already surprised.] \
+        Remind the user that their \(kindLabel) "\(job.title)" is due in \(remindBeforeMinutes) minutes.
+        """
+        let turnId = "reminder-\(job.id)"
+        logger.info(
+            "delivering proactive reminder",
+            metadata: ["session_id": .string(sessionId), "job_id": .string(job.id), "turn_id": .string(turnId)]
+        )
+
+        if tts != nil {
+            await runReminderCartesiaTurn(turnId: turnId, prompt: prompt)
+        } else {
+            await runReminderOpenAITurn(turnId: turnId, prompt: prompt)
+        }
+        return phase == .connected
+    }
+
+    private func runReminderOpenAITurn(turnId: String, prompt: String) async {
+        do {
+            phase = .streamingTTS
+            await beginDownlinkCapture(turnId: turnId)
+            try await send(TTSStart(sessionId: sessionId))
+            await mirrorTTSStart()
+
+            let events = await realtime.createResponseFromUserText(prompt)
+            var downlinkFrames = 0
+
+            for await event in events {
+                switch event {
+                case .audio(let pcm):
+                    downlinkFrames += await sendDownlinkPCM(pcm)
+                case .toolCallStarted, .toolCallCompleted:
+                    break
+                case .inputTranscript, .assistantTranscript, .done, .error:
+                    break
+                }
+            }
+
+            guard phase == .streamingTTS else { return }
+            await downlinkPacer.endTurn()
+            dumpDownlinkCaptureIfNeeded()
+            try await send(TTSEnd(sessionId: sessionId))
+            await mirrorTTSEnd()
+            phase = .connected
+            logger.info(
+                "reminder turn complete",
+                metadata: ["session_id": .string(sessionId), "turn_id": .string(turnId), "downlink_frames": "\(downlinkFrames)"]
+            )
+        } catch {
+            await downlinkPacer.cancel()
+            dumpDownlinkCaptureIfNeeded()
+            logger.error(
+                "reminder turn failed",
+                metadata: ["session_id": .string(sessionId), "turn_id": .string(turnId), "error": "\(error)"]
+            )
+            phase = .connected
+        }
+    }
+
+    private func runReminderCartesiaTurn(turnId: String, prompt: String) async {
+        guard let tts else { return }
+        do {
+            phase = .streamingTTS
+            await beginDownlinkCapture(turnId: turnId)
+            try await send(TTSStart(sessionId: sessionId))
+            await mirrorTTSStart()
+
+            let contextId = "\(sessionId)-\(turnId)"
+            activeContextId = contextId
+            let audioEvents = await tts.beginTurn(contextId: contextId)
+
+            let downlinkTask = Task { [weak self] () -> Int in
+                var frameCount = 0
+                for await event in audioEvents {
+                    switch event {
+                    case .audio(let pcm):
+                        frameCount += await self?.sendDownlinkPCM(pcm) ?? 0
+                    case .done, .error:
+                        break
+                    }
+                }
+                return frameCount
+            }
+
+            let events = await realtime.createResponseFromUserText(prompt)
+            for await event in events {
+                if case .assistantTranscript(let delta) = event {
+                    await tts.sendTranscriptChunk(delta, contextId: contextId, isFinal: false)
+                }
+            }
+            await tts.sendTranscriptChunk("", contextId: contextId, isFinal: true)
+            let downlinkFrames = await downlinkTask.value
+            activeContextId = nil
+
+            guard phase == .streamingTTS else { return }
+            await downlinkPacer.endTurn()
+            dumpDownlinkCaptureIfNeeded()
+            try await send(TTSEnd(sessionId: sessionId))
+            await mirrorTTSEnd()
+            phase = .connected
+            logger.info(
+                "reminder+cartesia turn complete",
+                metadata: ["session_id": .string(sessionId), "turn_id": .string(turnId), "downlink_frames": "\(downlinkFrames)"]
+            )
+        } catch {
+            if let contextId = activeContextId {
+                await tts.cancelTurn(contextId: contextId)
+                activeContextId = nil
+            }
+            await downlinkPacer.cancel()
+            dumpDownlinkCaptureIfNeeded()
+            logger.error(
+                "reminder+cartesia turn failed",
+                metadata: ["session_id": .string(sessionId), "turn_id": .string(turnId), "error": "\(error)"]
+            )
+            phase = .connected
+        }
     }
 
     private func runRealtimeTurn(turnId: String) async {

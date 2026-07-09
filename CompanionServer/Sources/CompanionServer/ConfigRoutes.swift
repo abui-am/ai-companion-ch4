@@ -86,6 +86,7 @@ enum ConfigRoutes {
   static func register(
     on router: Router<BasicRequestContext>,
     config: ConfigRepository,
+    reminderScheduler: ReminderScheduler,
     deviceToken: String,
     logger: Logger
   ) {
@@ -107,7 +108,14 @@ enum ConfigRoutes {
         throw HTTPError(.badRequest, message: "Invalid config body: \(error)")
       }
       do {
+        let previous = try await config.get()
         let record = try await config.update(body.patch)
+        if body.patch.remindBeforeMinutes != nil {
+          await reminderScheduler.recomputeAfterConfigChange(
+            previousMinutes: previous.remindBeforeMinutes,
+            newMinutes: record.remindBeforeMinutes
+          )
+        }
         logger.info("PATCH /api/v1/config")
         return ConfigResponse(record: record)
       } catch let error as ConfigRepositoryError {

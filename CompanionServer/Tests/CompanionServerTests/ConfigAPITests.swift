@@ -38,12 +38,22 @@ private struct APIConfig: Decodable {
 private final class ConfigAPITestHarness {
     let database: DatabaseService
     let config: ConfigRepository
+    let reminders: ReminderRepository
+    let reminderScheduler: ReminderScheduler
     let deviceToken = "config-test-token"
     let logger: Logger
 
-    init(database: DatabaseService, config: ConfigRepository, logger: Logger) {
+    init(
+        database: DatabaseService,
+        config: ConfigRepository,
+        reminders: ReminderRepository,
+        reminderScheduler: ReminderScheduler,
+        logger: Logger
+    ) {
         self.database = database
         self.config = config
+        self.reminders = reminders
+        self.reminderScheduler = reminderScheduler
         self.logger = logger
     }
 
@@ -61,8 +71,17 @@ private final class ConfigAPITestHarness {
             return nil
         }
         let config = ConfigRepository(database: database, logger: logger)
+        let reminders = ReminderRepository(database: database, logger: logger)
         try await config.migrate()
-        return ConfigAPITestHarness(database: database, config: config, logger: logger)
+        try await reminders.migrate()
+        let reminderScheduler = ReminderScheduler(reminders: reminders, config: config, logger: logger)
+        return ConfigAPITestHarness(
+            database: database,
+            config: config,
+            reminders: reminders,
+            reminderScheduler: reminderScheduler,
+            logger: logger
+        )
     }
 
     func makeApp() -> Application<RouterResponder<BasicRequestContext>> {
@@ -70,6 +89,7 @@ private final class ConfigAPITestHarness {
         ConfigRoutes.register(
             on: router,
             config: config,
+            reminderScheduler: reminderScheduler,
             deviceToken: deviceToken,
             logger: logger
         )

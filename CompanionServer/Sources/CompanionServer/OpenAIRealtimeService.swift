@@ -246,21 +246,45 @@ actor OpenAIRealtimeService {
     /// Commits buffered audio and creates a response.
     /// Returns a stream that emits audio events and ends with `.done` or `.error`.
     func commitAndCreateResponse() async -> AsyncStream<RealtimeAudioEvent> {
+        let stream = await beginResponseTurn()
+        try? await sendJSON(["type": "input_audio_buffer.commit"])
+        try? await sendJSON(responseCreatePayload())
+        return stream
+    }
+
+    /// Server-initiated turn from injected user text (e.g. proactive reminders).
+    func createResponseFromUserText(_ text: String) async -> AsyncStream<RealtimeAudioEvent> {
+        let stream = await beginResponseTurn()
+        try? await sendJSON([
+            "type": "conversation.item.create",
+            "item": [
+                "type": "message",
+                "role": "user",
+                "content": [
+                    ["type": "input_text", "text": text],
+                ],
+            ],
+        ])
+        try? await sendJSON(responseCreatePayload())
+        return stream
+    }
+
+    private var activeTurnStream: AsyncStream<RealtimeAudioEvent>?
+
+    private func beginResponseTurn() async -> AsyncStream<RealtimeAudioEvent> {
         let (stream, continuation) = AsyncStream<RealtimeAudioEvent>.makeStream()
+        activeTurnStream = stream
         await ensureConnected()
         guard let socket, socket.state == .running else {
-            logger.error("commitAndCreateResponse: socket not connected (state=\(String(describing: socket?.state)))")
+            logger.error("beginResponseTurn: socket not connected (state=\(String(describing: socket?.state)))")
             continuation.yield(.error("realtime socket not connected"))
             continuation.finish()
             return stream
         }
-        logger.info("commitAndCreateResponse: socket ok, sending commit+response.create")
         activeTurnResponseId = nil
         turnContinuation = continuation
         toolCallRoundsThisTurn = 0
         executedToolCallsThisTurn = []
-        try? await sendJSON(["type": "input_audio_buffer.commit"])
-        try? await sendJSON(responseCreatePayload())
         return stream
     }
 

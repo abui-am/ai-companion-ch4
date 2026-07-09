@@ -7,11 +7,18 @@ struct CalendarAgent: SubAgent, Sendable {
     let name = "calendar"
 
     private let calendar: CalendarRepository
+    private let reminderScheduler: ReminderScheduler
     private let timeZone: TimeZone
     private let logger: Logger
 
-    init(calendar: CalendarRepository, timeZoneIdentifier: String, logger: Logger) {
+    init(
+        calendar: CalendarRepository,
+        reminderScheduler: ReminderScheduler,
+        timeZoneIdentifier: String,
+        logger: Logger
+    ) {
         self.calendar = calendar
+        self.reminderScheduler = reminderScheduler
         self.timeZone = CompanionTimezone.resolve(identifier: timeZoneIdentifier)
         self.logger = logger
     }
@@ -163,6 +170,7 @@ struct CalendarAgent: SubAgent, Sendable {
                     isImportant: isImportant,
                     notes: notes
                 )
+                await reminderScheduler.scheduleEvent(record)
                 return SubAgentJSON.encode([
                     "summary": "Created event \"\(record.title)\".",
                     "event": eventJSON(record),
@@ -210,6 +218,7 @@ struct CalendarAgent: SubAgent, Sendable {
                     patch.notes = args["notes"] as? String
                 }
                 let record = try await calendar.updateEvent(id: id, patch: patch)
+                await reminderScheduler.scheduleEvent(record)
                 return SubAgentJSON.encode([
                     "summary": "Updated event \"\(record.title)\".",
                     "event": eventJSON(record),
@@ -219,6 +228,7 @@ struct CalendarAgent: SubAgent, Sendable {
                     return SubAgentJSON.encodeError("delete requires id")
                 }
                 try await calendar.deleteEvent(id: id)
+                await reminderScheduler.cancelEvent(id: id)
                 return SubAgentJSON.encode(["summary": "Deleted event \(id)."])
             default:
                 return SubAgentJSON.encodeError("unknown action: \(action)")

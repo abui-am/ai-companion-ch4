@@ -106,6 +106,7 @@ enum CalendarRoutes {
   static func register(
     on router: Router<BasicRequestContext>,
     calendar: CalendarRepository,
+    reminderScheduler: ReminderScheduler,
     deviceToken: String,
     logger: Logger
   ) {
@@ -154,6 +155,7 @@ enum CalendarRoutes {
           isImportant: body.isImportant,
           notes: body.notes
         )
+        await reminderScheduler.scheduleEvent(record)
         logger.info("POST /api/v1/calendar/events", metadata: ["id": .string(record.id)])
         return CalendarEvent(record: record)
       } catch let error as CalendarRepositoryError {
@@ -174,6 +176,7 @@ enum CalendarRoutes {
       let body = try await request.decode(as: PatchCalendarEventRequest.self, context: context)
       do {
         let record = try await calendar.updateEvent(id: id, patch: body.patch)
+        await reminderScheduler.scheduleEvent(record)
         logger.info("PATCH /api/v1/calendar/events/{id}", metadata: ["id": .string(id)])
         return CalendarEvent(record: record)
       } catch let error as CalendarRepositoryError {
@@ -193,6 +196,7 @@ enum CalendarRoutes {
       let id = try context.parameters.require("id")
       do {
         try await calendar.deleteEvent(id: id)
+        await reminderScheduler.cancelEvent(id: id)
         logger.info("DELETE /api/v1/calendar/events/{id}", metadata: ["id": .string(id)])
         return .noContent
       } catch let error as CalendarRepositoryError {

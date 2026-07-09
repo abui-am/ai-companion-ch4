@@ -34,7 +34,15 @@ final class TaskAgentTests: XCTestCase {
         let logger = Logger(label: "test")
         let settings = try DatabaseSettings(urlString: "postgres://postgres:postgres@127.0.0.1:1/none")
         let database = DatabaseService(settings: settings, logger: logger)
-        return TaskAgent(tasks: TaskRepository(database: database, logger: logger), timeZoneIdentifier: "Asia/Jakarta", logger: logger)
+        let reminders = ReminderRepository(database: database, logger: logger)
+        let config = ConfigRepository(database: database, logger: logger)
+        let scheduler = ReminderScheduler(reminders: reminders, config: config, logger: logger)
+        return TaskAgent(
+            tasks: TaskRepository(database: database, logger: logger),
+            reminderScheduler: scheduler,
+            timeZoneIdentifier: "Asia/Jakarta",
+            logger: logger
+        )
     }
 }
 
@@ -62,6 +70,14 @@ final class CalendarAgentTests: XCTestCase {
         let logger = Logger(label: "test")
         let settings = try DatabaseSettings(urlString: "postgres://postgres:postgres@127.0.0.1:1/none")
         let database = DatabaseService(settings: settings, logger: logger)
-        return CalendarAgent(calendar: CalendarRepository(database: database, logger: logger), timeZoneIdentifier: "Asia/Jakarta", logger: logger)
+        let reminders = ReminderRepository(database: database, logger: logger)
+        let config = ConfigRepository(database: database, logger: logger)
+        let scheduler = ReminderScheduler(reminders: reminders, config: config, logger: logger)
+        return CalendarAgent(
+            calendar: CalendarRepository(database: database, logger: logger),
+            reminderScheduler: scheduler,
+            timeZoneIdentifier: "Asia/Jakarta",
+            logger: logger
+        )
     }
 }
