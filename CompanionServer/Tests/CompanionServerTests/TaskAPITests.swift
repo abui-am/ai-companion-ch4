@@ -25,13 +25,26 @@ private struct APITasksResponse: Decodable {
 private final class TaskAPITestHarness {
   let database: DatabaseService
   let tasks: TaskRepository
+  let reminders: ReminderRepository
+  let config: ConfigRepository
+  let reminderScheduler: ReminderScheduler
   let deviceToken = "task-test-token"
   let logger: Logger
   var createdTaskIDs: [String] = []
 
-  init(database: DatabaseService, tasks: TaskRepository, logger: Logger) {
+  init(
+    database: DatabaseService,
+    tasks: TaskRepository,
+    reminders: ReminderRepository,
+    config: ConfigRepository,
+    reminderScheduler: ReminderScheduler,
+    logger: Logger
+  ) {
     self.database = database
     self.tasks = tasks
+    self.reminders = reminders
+    self.config = config
+    self.reminderScheduler = reminderScheduler
     self.logger = logger
   }
 
@@ -49,8 +62,20 @@ private final class TaskAPITestHarness {
       return nil
     }
     let tasks = TaskRepository(database: database, logger: logger)
+    let reminders = ReminderRepository(database: database, logger: logger)
+    let config = ConfigRepository(database: database, logger: logger)
     try await tasks.migrate()
-    return TaskAPITestHarness(database: database, tasks: tasks, logger: logger)
+    try await reminders.migrate()
+    try await config.migrate()
+    let reminderScheduler = ReminderScheduler(reminders: reminders, config: config, logger: logger)
+    return TaskAPITestHarness(
+      database: database,
+      tasks: tasks,
+      reminders: reminders,
+      config: config,
+      reminderScheduler: reminderScheduler,
+      logger: logger
+    )
   }
 
   func makeApp() -> Application<RouterResponder<BasicRequestContext>> {
@@ -58,6 +83,7 @@ private final class TaskAPITestHarness {
     TaskRoutes.register(
       on: router,
       tasks: tasks,
+      reminderScheduler: reminderScheduler,
       deviceToken: deviceToken,
       logger: logger
     )

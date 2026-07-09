@@ -106,6 +106,55 @@ struct CompanionServerApp {
             exit(1)
         }
 
+        let reminders = ReminderRepository(database: database, logger: logger)
+        do {
+            try await reminders.migrate()
+        } catch {
+            logger.critical("reminder migration failed: \(error)")
+            await database.shutdown()
+            exit(1)
+        }
+
+        let pushDevices = PushDeviceRepository(database: database, logger: logger)
+        do {
+            try await pushDevices.migrate()
+        } catch {
+            logger.critical("push device migration failed: \(error)")
+            await database.shutdown()
+            exit(1)
+        }
+
+        let reminderScheduler = ReminderScheduler(
+            reminders: reminders,
+            config: userConfig,
+            logger: serverLogger
+        )
+        let sessionRegistry = ActiveVoiceSessionRegistry(logger: serverLogger)
+        let apnsService: (any APNsSending)?
+        if let apnsConfig = APNsConfiguration.load(from: config) {
+            apnsService = APNsService(configuration: apnsConfig, logger: serverLogger)
+            serverLogger.info(
+                "apns configured",
+                metadata: [
+                    "key_id": .string(apnsConfig.keyID),
+                    "team_id": .string(apnsConfig.teamID),
+                    "default_bundle_id": .string(apnsConfig.defaultBundleID ?? ""),
+                ]
+            )
+        } else {
+            serverLogger.info("apns not configured — push delivery disabled")
+            apnsService = nil
+        }
+        let reminderWorker = ReminderWorker(
+            reminders: reminders,
+            config: userConfig,
+            pushDevices: pushDevices,
+            sessionRegistry: sessionRegistry,
+            apns: apnsService,
+            logger: serverLogger
+        )
+        await reminderWorker.start()
+
         let conversations = ConversationRepository(database: database, logger: logger)
         do {
             try await conversations.migrate()
@@ -164,8 +213,18 @@ struct CompanionServerApp {
             let outboundWriter = WebSocketSessionOutboundWriter(base: outbound)
             let deviceCommands = DeviceCommandGateway(outbound: outboundWriter, logger: serverLogger)
             var subAgentList: [any SubAgent] = [
-                TaskAgent(tasks: tasks, timeZoneIdentifier: config.companionTimezone, logger: serverLogger),
-                CalendarAgent(calendar: calendar, timeZoneIdentifier: config.companionTimezone, logger: serverLogger),
+                TaskAgent(
+                    tasks: tasks,
+                    reminderScheduler: reminderScheduler,
+                    timeZoneIdentifier: config.companionTimezone,
+                    logger: serverLogger
+                ),
+                CalendarAgent(
+                    calendar: calendar,
+                    reminderScheduler: reminderScheduler,
+                    timeZoneIdentifier: config.companionTimezone,
+                    logger: serverLogger
+                ),
                 MemoryAgent(memories: memories, embeddings: embeddings, config: userConfig, logger: serverLogger),
                 MotionAgent(gateway: deviceCommands, logger: serverLogger),
                 EmotionAgent(gateway: deviceCommands, logger: serverLogger),
@@ -200,7 +259,9 @@ struct CompanionServerApp {
             } else {
                 nil
             }
+            let voiceSessionId = UUID().uuidString
             let session = VoiceSession(
+                sessionId: voiceSessionId,
                 outbound: outboundWriter,
                 realtime: realtime,
                 tts: cartesiaTTS,
@@ -213,6 +274,11 @@ struct CompanionServerApp {
                 logger: serverLogger
             )
             try await session.start()
+            await sessionRegistry.register(
+                sessionId: voiceSessionId,
+                session: session,
+                gateway: deviceCommands
+            )
 
             do {
                 for try await message in inbound.messages(maxSize: 1 << 20) {
@@ -221,6 +287,7 @@ struct CompanionServerApp {
             } catch {
                 serverLogger.info("inbound stream ended", metadata: ["error": "\(error)"])
             }
+            await sessionRegistry.unregister(sessionId: voiceSessionId)
             await session.handleDisconnect()
             serverLogger.info("ws connection closed")
         }
@@ -270,12 +337,16 @@ struct CompanionServerApp {
         CalendarRoutes.register(
             on: router,
             calendar: calendar,
+            reminderScheduler: reminderScheduler,
             deviceToken: config.deviceToken,
             logger: serverLogger
         )
         ConfigRoutes.register(
             on: router,
             config: userConfig,
+            reminderScheduler: reminderScheduler,
+            personas: personaStore,
+            sessionRegistry: sessionRegistry,
             deviceToken: config.deviceToken,
             logger: serverLogger
         )
@@ -294,6 +365,13 @@ struct CompanionServerApp {
         TaskRoutes.register(
             on: router,
             tasks: tasks,
+            reminderScheduler: reminderScheduler,
+            deviceToken: config.deviceToken,
+            logger: serverLogger
+        )
+        PushRoutes.register(
+            on: router,
+            pushDevices: pushDevices,
             deviceToken: config.deviceToken,
             logger: serverLogger
         )
@@ -318,6 +396,7 @@ struct CompanionServerApp {
             configuration: .init(address: .hostname("0.0.0.0", port: 8080))
         )
         try await app.runService()
+        await reminderWorker.stop()
         await database.shutdown()
     }
 

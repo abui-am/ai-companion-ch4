@@ -27,13 +27,26 @@ private struct APICalendarEventsResponse: Decodable {
 private final class CalendarAPITestHarness {
     let database: DatabaseService
     let calendar: CalendarRepository
+    let reminders: ReminderRepository
+    let config: ConfigRepository
+    let reminderScheduler: ReminderScheduler
     let deviceToken = "calendar-test-token"
     let logger: Logger
     var createdEventIDs: [String] = []
 
-    init(database: DatabaseService, calendar: CalendarRepository, logger: Logger) {
+    init(
+        database: DatabaseService,
+        calendar: CalendarRepository,
+        reminders: ReminderRepository,
+        config: ConfigRepository,
+        reminderScheduler: ReminderScheduler,
+        logger: Logger
+    ) {
         self.database = database
         self.calendar = calendar
+        self.reminders = reminders
+        self.config = config
+        self.reminderScheduler = reminderScheduler
         self.logger = logger
     }
 
@@ -51,8 +64,20 @@ private final class CalendarAPITestHarness {
             return nil
         }
         let calendar = CalendarRepository(database: database, logger: logger)
+        let reminders = ReminderRepository(database: database, logger: logger)
+        let config = ConfigRepository(database: database, logger: logger)
         try await calendar.migrate()
-        return CalendarAPITestHarness(database: database, calendar: calendar, logger: logger)
+        try await reminders.migrate()
+        try await config.migrate()
+        let reminderScheduler = ReminderScheduler(reminders: reminders, config: config, logger: logger)
+        return CalendarAPITestHarness(
+            database: database,
+            calendar: calendar,
+            reminders: reminders,
+            config: config,
+            reminderScheduler: reminderScheduler,
+            logger: logger
+        )
     }
 
     func makeApp() -> Application<RouterResponder<BasicRequestContext>> {
@@ -60,6 +85,7 @@ private final class CalendarAPITestHarness {
         CalendarRoutes.register(
             on: router,
             calendar: calendar,
+            reminderScheduler: reminderScheduler,
             deviceToken: deviceToken,
             logger: logger
         )

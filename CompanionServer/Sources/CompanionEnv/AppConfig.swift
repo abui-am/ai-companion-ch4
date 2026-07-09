@@ -40,12 +40,18 @@ public struct AppConfig: Sendable {
   public let responseLanguage: String
   public let databaseURL: String
   public let companionTimezone: String
+  public let apnsKeyID: String?
+  public let apnsTeamID: String?
+  public let apnsPrivateKey: String?
+  public let apnsPrivateKeyPath: String?
+  public let apnsBundleID: String?
 
   public var usesCartesiaTTS: Bool { ttsProvider == .cartesia }
 
   public static func load() async throws -> AppConfig {
     let secrets: SecretsSpecifier<String, String> = .specific([
       "DEVICE_TOKEN", "OPENAI_API_KEY", "CARTESIA_API_KEY", "DATABASE_URL",
+      "APNS_KEY_ID", "APNS_TEAM_ID", "APNS_PRIVATE_KEY", "APNS_PRIVATE_KEY_PATH",
     ])
     var providers: [any ConfigProvider] = [
       EnvironmentVariablesProvider(secretsSpecifier: secrets),
@@ -85,6 +91,11 @@ public struct AppConfig: Sendable {
       default: "postgres://postgres:postgres@localhost:5432/companion"
     )
     let companionTimezone = reader.string(forKey: "companion.timezone", default: TimeZone.current.identifier)
+    let apnsKeyID = reader.string(forKey: "apns.key.id", isSecret: true)
+    let apnsTeamID = reader.string(forKey: "apns.team.id", isSecret: true)
+    let apnsPrivateKey = reader.string(forKey: "apns.private.key", isSecret: true)
+    let apnsPrivateKeyPath = reader.string(forKey: "apns.private.key.path", isSecret: true)
+    let apnsBundleID = reader.string(forKey: "apns.bundle.id")
 
     if ttsProvider == .cartesia, cartesiaAPIKey?.isEmpty != false {
       throw AppConfigError.missingCartesiaAPIKey
@@ -105,7 +116,12 @@ public struct AppConfig: Sendable {
       openAIEmbeddingModel: openAIEmbeddingModel,
       responseLanguage: responseLanguage,
       databaseURL: databaseURL,
-      companionTimezone: companionTimezone
+      companionTimezone: companionTimezone,
+      apnsKeyID: apnsKeyID,
+      apnsTeamID: apnsTeamID,
+      apnsPrivateKey: apnsPrivateKey,
+      apnsPrivateKeyPath: apnsPrivateKeyPath,
+      apnsBundleID: apnsBundleID
     )
   }
 }

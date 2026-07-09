@@ -82,6 +82,8 @@ Constants: `AudioParams` (Swift), `COMPANION_*` in `firmware/*/protocol.h`.
 
 **Outbound:** `session.ready`, `transcript.final`, `device_command`, `tts.start`, `tts.end`, `tool.start`, `tool.done`, `error`, `speaker.ready` (`/speaker` only)
 
+`device_command` with `action: "emotion"` sets the OLED face — see [EMOTION_API.md](EMOTION_API.md).
+
 `transcript.input` is rejected with `error` (`unsupported_event`) — use audio uplink.
 
 Full schemas: `WireProtocol.swift`, `firmware/*/protocol.h`, `.cursor/skills/hummingbird/reference.md`.

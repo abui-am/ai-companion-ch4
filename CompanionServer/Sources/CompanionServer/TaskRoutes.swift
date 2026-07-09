@@ -107,6 +107,7 @@ enum TaskRoutes {
   static func register(
     on router: Router<BasicRequestContext>,
     tasks: TaskRepository,
+    reminderScheduler: ReminderScheduler,
     deviceToken: String,
     logger: Logger
   ) {
@@ -149,6 +150,7 @@ enum TaskRoutes {
           dueAt: body.dueAt,
           notes: body.notes
         )
+        await reminderScheduler.scheduleTask(record)
         logger.info("POST /api/v1/tasks", metadata: ["id": .string(record.id)])
         return TaskItem(record: record)
       } catch let error as TaskRepositoryError {
@@ -167,6 +169,7 @@ enum TaskRoutes {
       let body = try await request.decode(as: PatchTaskRequest.self, context: context)
       do {
         let record = try await tasks.updateTask(id: id, patch: body.patch)
+        await reminderScheduler.scheduleTask(record)
         logger.info("PATCH /api/v1/tasks/{id}", metadata: ["id": .string(id)])
         return TaskItem(record: record)
       } catch let error as TaskRepositoryError {
@@ -184,6 +187,7 @@ enum TaskRoutes {
       let id = try context.parameters.require("id")
       do {
         try await tasks.deleteTask(id: id)
+        await reminderScheduler.cancelTask(id: id)
         logger.info("DELETE /api/v1/tasks/{id}", metadata: ["id": .string(id)])
         return .noContent
       } catch let error as TaskRepositoryError {

@@ -19,6 +19,7 @@ personas/
   grumpy.md    ← comically grumpy robot with a soft heart
   pirate.md    ← swashbuckling captain ("Arrr, matey!")
   wizard.md    ← ancient kindly wizard ("By my beard!")
+  jokowi.md    ← Jokowi-style Indonesian speech patterns
 ```
 
 The filename (without `.md`) is the persona name. **Add a character by adding a
@@ -33,7 +34,7 @@ The active choice persists in `personas/.active` across server restarts.
 ### `GET /api/v1/personas`
 
 ```json
-{ "active": "minion", "available": ["grumpy", "minion", "pirate", "rocky", "wizard"] }
+{ "active": "minion", "available": ["grumpy", "jokowi", "minion", "pirate", "rocky", "wizard"] }
 ```
 
 `active` is `null` when no persona is set.

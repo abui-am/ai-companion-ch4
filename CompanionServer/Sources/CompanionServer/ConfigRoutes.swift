@@ -19,16 +19,23 @@ struct PrivacyResponse: Encodable, Sendable {
   let personalizationData: Bool
 }
 
+struct PersonaStateResponse: ResponseEncodable, Sendable {
+  let active: String?
+  let available: [String]
+}
+
 struct ConfigResponse: ResponseEncodable, Sendable {
   let personality: ConfigPersonality
+  let persona: PersonaStateResponse
   let connection: ConnectionResponse
   let appearance: ConfigAppearance
   let notifications: NotificationsResponse
   let privacy: PrivacyResponse
   let language: ConfigLanguage
 
-  init(record: ConfigRecord) {
+  init(record: ConfigRecord, persona: PersonaStateResponse) {
     personality = record.personality
+    self.persona = persona
     connection = ConfigRoutes.mockConnection
     appearance = record.appearance
     notifications = NotificationsResponse(
@@ -78,6 +85,18 @@ struct PatchConfigRequest: Decodable, Sendable {
   }
 }
 
+struct PersonalityResponse: ResponseEncodable, Sendable {
+  let personality: ConfigPersonality
+}
+
+struct PutPersonalityRequest: Decodable, Sendable {
+  let personality: ConfigPersonality
+}
+
+struct PutConfigPersonaRequest: Decodable, Sendable {
+  let name: String?
+}
+
 enum ConfigRoutes {
   /// Device pairing is not implemented — the Settings page always shows this
   /// hardcoded connection. Never persisted, never mutated by PATCH.
@@ -86,6 +105,9 @@ enum ConfigRoutes {
   static func register(
     on router: Router<BasicRequestContext>,
     config: ConfigRepository,
+    reminderScheduler: ReminderScheduler,
+    personas: PersonaStore? = nil,
+    sessionRegistry: ActiveVoiceSessionRegistry? = nil,
     deviceToken: String,
     logger: Logger
   ) {
@@ -95,7 +117,56 @@ enum ConfigRoutes {
       try requireDeviceToken(from: request, expected: deviceToken)
       let record = try await config.get()
       logger.debug("GET /api/v1/config")
-      return ConfigResponse(record: record)
+      return ConfigResponse(record: record, persona: await personaState(from: personas))
+    }
+
+    configRouter.put("/personality") { request, context in
+      try requireDeviceToken(from: request, expected: deviceToken)
+      let body: PutPersonalityRequest
+      do {
+        body = try await request.decode(as: PutPersonalityRequest.self, context: context)
+      } catch {
+        throw HTTPError(.badRequest, message: "Invalid personality body: \(error)")
+      }
+      do {
+        let record = try await config.update(ConfigPatch(personality: body.personality))
+        await pushPersonalityToActiveSession(body.personality, sessionRegistry: sessionRegistry)
+        logger.info(
+          "PUT /api/v1/config/personality",
+          metadata: ["personality": .string(body.personality.rawValue)]
+        )
+        return PersonalityResponse(personality: record.personality)
+      } catch let error as ConfigRepositoryError {
+        switch error {
+        case .invalidRemindBeforeMinutes:
+          throw HTTPError(.badRequest, message: error.description)
+        case .notFound, .corruptData:
+          throw HTTPError(.internalServerError, message: error.description)
+        }
+      }
+    }
+
+    configRouter.put("/persona") { request, context in
+      try requireDeviceToken(from: request, expected: deviceToken)
+      guard let personas else {
+        throw HTTPError(.serviceUnavailable, message: "Personas are not configured")
+      }
+      let body: PutConfigPersonaRequest
+      do {
+        body = try await request.decode(as: PutConfigPersonaRequest.self, context: context)
+      } catch {
+        throw HTTPError(.badRequest, message: "Invalid persona body: \(error)")
+      }
+      do {
+        try await personas.setActive(body.name)
+        logger.info(
+          "PUT /api/v1/config/persona",
+          metadata: ["persona": .string(body.name ?? "none")]
+        )
+        return await personaState(from: personas)
+      } catch let error as PersonaError {
+        throw HTTPError(.badRequest, message: error.description)
+      }
     }
 
     configRouter.patch { request, context in
@@ -107,9 +178,19 @@ enum ConfigRoutes {
         throw HTTPError(.badRequest, message: "Invalid config body: \(error)")
       }
       do {
+        let previous = try await config.get()
         let record = try await config.update(body.patch)
+        if body.patch.remindBeforeMinutes != nil {
+          await reminderScheduler.recomputeAfterConfigChange(
+            previousMinutes: previous.remindBeforeMinutes,
+            newMinutes: record.remindBeforeMinutes
+          )
+        }
+        if let personality = body.patch.personality {
+          await pushPersonalityToActiveSession(personality, sessionRegistry: sessionRegistry)
+        }
         logger.info("PATCH /api/v1/config")
-        return ConfigResponse(record: record)
+        return ConfigResponse(record: record, persona: await personaState(from: personas))
       } catch let error as ConfigRepositoryError {
         switch error {
         case .invalidRemindBeforeMinutes:
@@ -119,6 +200,24 @@ enum ConfigRoutes {
         }
       }
     }
+  }
+
+  private static func personaState(from personas: PersonaStore?) async -> PersonaStateResponse {
+    guard let personas else {
+      return PersonaStateResponse(active: nil, available: [])
+    }
+    return PersonaStateResponse(
+      active: await personas.activeName(),
+      available: await personas.available()
+    )
+  }
+
+  private static func pushPersonalityToActiveSession(
+    _ personality: ConfigPersonality,
+    sessionRegistry: ActiveVoiceSessionRegistry?
+  ) async {
+    guard let active = await sessionRegistry?.currentSession() else { return }
+    await active.session.applyPersonality(personality)
   }
 
   private static func requireDeviceToken(from request: Request, expected: String) throws {
