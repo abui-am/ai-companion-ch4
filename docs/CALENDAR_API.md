@@ -12,6 +12,17 @@ Authorization: Bearer <DEVICE_TOKEN>
 
 ---
 
+## Reminders
+
+When an event is created or updated, CompanionServer schedules a reminder at `startsAt − notifications.remindBeforeMinutes` (from [CONFIG_API.md](CONFIG_API.md)). At fire time:
+
+- Botchill (ESP32) — if connected and idle: `surprised` face + spoken reminder ([EMOTION_API.md](EMOTION_API.md))
+- **Mac app** — APNs push to registered devices ([PUSH_API.md](PUSH_API.md))
+
+Gated by `notifications.calendarAlerts`. Deleting an event cancels its reminder.
+
+---
+
 ## Event object
 
 Mirrors what `CalendarView` renders:
@@ -289,5 +300,8 @@ Tests use `DATABASE_URL` (default `postgres://postgres:postgres@localhost:5432/c
 
 - [PROFILE_API.md](PROFILE_API.md) — Profile and focus time REST endpoints
 - [TASK_API.md](TASK_API.md) — Task REST endpoints
+- [CONFIG_API.md](CONFIG_API.md) — `remindBeforeMinutes`, `calendarAlerts`
+- [EMOTION_API.md](EMOTION_API.md) — OLED face via `device_command` (reminders use `surprised`)
+- [PUSH_API.md](PUSH_API.md) — Mac app APNs reminder notifications
 - [STABLE_V1.md](STABLE_V1.md) — WebSocket voice protocol (separate from calendar REST)
 - [../CompanionServer/.env.example](../CompanionServer/.env.example) — `DEVICE_TOKEN`, `DATABASE_URL`

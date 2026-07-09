@@ -61,7 +61,7 @@ Mirrors what the Settings screen renders:
 | `appearance` | enum | `system` \| `light` \| `dark` |
 | `notifications.taskReminders` | boolean | |
 | `notifications.calendarAlerts` | boolean | |
-| `notifications.remindBeforeMinutes` | number | One of `5`, `10`, `15`, `30` |
+| `notifications.remindBeforeMinutes` | number | One of `5`, `10`, `15`, `30` — used to schedule reminders at `dueAt`/`startsAt` minus this offset |
 | `privacy.cameraAccess` | boolean | |
 | `privacy.personalizationData` | boolean | Also gates the AI's long-term memory (`memory` tool) and conversation history — when off, no memories are saved/recalled and `GET /api/v1/memories` returns an empty list. See [MEMORY_API.md](MEMORY_API.md) and [CONVERSATION_API.md](CONVERSATION_API.md) |
 | `language` | enum | `english` \| `spanish` \| `french` — also changes the voice companion's reply language on its next session |
@@ -265,5 +265,8 @@ Tests use `DATABASE_URL` (default `postgres://postgres:postgres@localhost:5432/c
 
 - [PROFILE_API.md](PROFILE_API.md) — Profile and focus time REST endpoints (same auth, same server)
 - [CALENDAR_API.md](CALENDAR_API.md) — Calendar REST API (same auth, same server)
+- [TASK_API.md](TASK_API.md) — Task REST API; create/update with `dueAt` schedules reminders
+- [PUSH_API.md](PUSH_API.md) — Mac app APNs device registration for reminder push notifications
 - [MEMORY_API.md](MEMORY_API.md) — AI long-term memory, also gated by `privacy.personalizationData`
-- [STABLE_V1.md](STABLE_V1.md) — WebSocket voice protocol; `personality` and `language` from this API are applied to the voice pipeline at the start of each session
+- [STABLE_V1.md](STABLE_V1.md) — WebSocket voice protocol
+- [EMOTION_API.md](EMOTION_API.md) — OLED face expressions via `device_command`

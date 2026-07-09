@@ -12,7 +12,9 @@
 !.env.example
 *.pem
 *.p12
+*.p8
 *.mobileprovision
+CompanionServer/secrets/
 
 # ── Swift / SPM / Xcode ────────────────────────────────────────────────────────
 .build/

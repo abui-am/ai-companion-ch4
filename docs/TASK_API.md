@@ -12,6 +12,17 @@ Authorization: Bearer <DEVICE_TOKEN>
 
 ---
 
+## Reminders
+
+When a task is created or updated with a `dueAt`, CompanionServer schedules a reminder at `dueAt − notifications.remindBeforeMinutes` (from [CONFIG_API.md](CONFIG_API.md)). At fire time:
+
+- Botchill (ESP32) — if connected and idle: `surprised` face + spoken reminder ([EMOTION_API.md](EMOTION_API.md))
+- **Mac app** — APNs push to registered devices ([PUSH_API.md](PUSH_API.md))
+
+Gated by `notifications.taskReminders`. Completing or deleting a task cancels its reminder.
+
+---
+
 ## Task object
 
 ```json
@@ -291,5 +302,7 @@ Tests use `DATABASE_URL` (default `postgres://postgres:postgres@localhost:5432/c
 - [PROFILE_API.md](PROFILE_API.md) — Profile and focus time REST endpoints
 - [CALENDAR_API.md](CALENDAR_API.md) — Calendar REST endpoints
 - [CONFIG_API.md](CONFIG_API.md) — Settings REST endpoints
+- [EMOTION_API.md](EMOTION_API.md) — OLED face via `device_command` (reminders use `surprised`)
+- [PUSH_API.md](PUSH_API.md) — Mac app APNs reminder notifications
 - [STABLE_V1.md](STABLE_V1.md) — WebSocket voice protocol
 - [../CompanionServer/.env.example](../CompanionServer/.env.example) — `DEVICE_TOKEN`, `DATABASE_URL`
