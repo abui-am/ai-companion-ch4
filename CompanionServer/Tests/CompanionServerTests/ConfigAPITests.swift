@@ -35,6 +35,10 @@ private struct APIConfig: Decodable {
     let language: String
 }
 
+private struct APIPersonality: Decodable {
+    let personality: String
+}
+
 private final class ConfigAPITestHarness {
     let database: DatabaseService
     let config: ConfigRepository
@@ -204,6 +208,63 @@ final class ConfigAPITests: XCTestCase {
                 XCTAssertEqual(config.personality, "energetic")
                 XCTAssertEqual(config.connection.deviceName, "Bocil-Desk-01")
                 XCTAssertEqual(config.connection.status, "paired")
+            }
+        }
+    }
+
+    func testPutPersonalityUpdatesPersonality() async throws {
+        let app = harness.makeApp()
+        let headers = harness.jsonHeaders()
+        let authHeaders = harness.authHeaders()
+        let body = #"{"personality":"professional"}"#
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/config/personality",
+                method: .put,
+                headers: headers,
+                body: ByteBufferAllocator().buffer(string: body)
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                let result = try JSONDecoder().decode(APIPersonality.self, from: response.body)
+                XCTAssertEqual(result.personality, "professional")
+            }
+        }
+
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/api/v1/config", method: .get, headers: authHeaders) { response in
+                let config = try JSONDecoder().decode(APIConfig.self, from: response.body)
+                XCTAssertEqual(config.personality, "professional")
+            }
+        }
+    }
+
+    func testPutPersonalityRejectsInvalidEnum() async throws {
+        let app = harness.makeApp()
+        let headers = harness.jsonHeaders()
+        let body = #"{"personality":"grumpy"}"#
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/config/personality",
+                method: .put,
+                headers: headers,
+                body: ByteBufferAllocator().buffer(string: body)
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+            }
+        }
+    }
+
+    func testPutPersonalityRequiresAuth() async throws {
+        let app = harness.makeApp()
+        let body = #"{"personality":"calm"}"#
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/api/v1/config/personality",
+                method: .put,
+                headers: [.contentType: "application/json"],
+                body: ByteBufferAllocator().buffer(string: body)
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
             }
         }
     }

@@ -42,7 +42,7 @@ Times for tasks and calendar are interpreted in the user's timezone (`COMPANION_
 
 ### Personality and personas
 
-- **Personality** (`calm`, `energetic`, `professional`) — changes tone and how expressive the face is. Set via [Config API](docs/CONFIG_API.md); applies on the next voice session.
+- **Personality** (`calm`, `energetic`, `professional`) — changes tone and how expressive the face is. Set via [Config API](docs/CONFIG_API.md) (`PATCH /api/v1/config` or `PUT /api/v1/config/personality`); applies live on the next turn when a voice session is connected.
 - **Personas** — full character voices (Rocky, Minion, Grumpy, Pirate, Wizard, Jokowi) loaded from `CompanionServer/personas/*.md`. Switch live via [Persona API](docs/PERSONA_API.md); the next reply is in character without reconnecting.
 
 ### Conversation modes

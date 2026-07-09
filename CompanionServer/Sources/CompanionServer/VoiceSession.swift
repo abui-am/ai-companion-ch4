@@ -132,6 +132,17 @@ actor VoiceSession {
     }
 
     /// Applies personality and language to the Realtime session (requires an active socket).
+    func applyPersonality(_ personality: ConfigPersonality) async {
+        await realtime.setPersonality(personality)
+        logger.info(
+            "session personality applied",
+            metadata: [
+                "session_id": .string(sessionId),
+                "personality": .string(personality.rawValue),
+            ]
+        )
+    }
+
     private func applyUserConfig() async {
         do {
             let record = try await config.get()

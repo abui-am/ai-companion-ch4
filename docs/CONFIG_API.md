@@ -109,6 +109,17 @@ Send only the fields you want to change — this is a partial update, not a full
 { "personality": "energetic" }
 ```
 
+Or use the dedicated endpoint:
+
+```
+PUT /api/v1/config/personality
+Content-Type: application/json
+
+{ "personality": "energetic" }
+```
+
+**Response `200`:** `{ "personality": "energetic" }` — persisted and pushed to an active voice session on its next turn.
+
 **Example — change a subset of notification settings:**
 
 ```json
