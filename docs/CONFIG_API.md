@@ -24,7 +24,7 @@ Device pairing is **not implemented**. The `connection` field is always a hardco
 - `PATCH /api/v1/config` **silently ignores** a `connection` key if you send one — it never errors, it just has no effect.
 - There is no endpoint to unpair or rename a device. If your Settings UI has a "Forget this device" button, disable it or show a "Coming soon" state — wiring it up is a separate, not-yet-planned feature.
 
-Everything else in the response (`personality`, `appearance`, `notifications`, `privacy`, `language`) is real, persisted, and editable.
+Everything else in the response (`personality`, `persona`, `appearance`, `notifications`, `privacy`, `language`) is real, persisted, and editable.
 
 ---
 
@@ -35,6 +35,10 @@ Mirrors what the Settings screen renders:
 ```json
 {
   "personality": "calm",
+  "persona": {
+    "active": "jokowi",
+    "available": ["grumpy", "jokowi", "minion", "pirate", "rocky", "wizard"]
+  },
   "connection": {
     "deviceName": "Bocil-Desk-01",
     "status": "paired"
@@ -55,7 +59,9 @@ Mirrors what the Settings screen renders:
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `personality` | enum | `calm` \| `energetic` \| `professional` — also changes the voice companion's tone on its next session |
+| `personality` | enum | `calm` \| `energetic` \| `professional` — base tone only. Overridden while a persona is active. Live via `PUT /api/v1/config/personality` or `PATCH /api/v1/config`. |
+| `persona.active` | string \| null | Active character voice (`jokowi`, `rocky`, `minion`, dll.) or `null` for plain personality tone |
+| `persona.available` | string[] | Persona names from `CompanionServer/personas/*.md` |
 | `connection.deviceName` | string | Mock — see above |
 | `connection.status` | string | Mock — always `paired` |
 | `appearance` | enum | `system` \| `light` \| `dark` |
@@ -102,6 +108,25 @@ Content-Type: application/json
 ```
 
 Send only the fields you want to change — this is a partial update, not a full replace. Omitted fields keep their current value.
+
+> **Personality vs persona:** `personality` is the Settings tone (`calm` / `energetic` / `professional`). **Character voices** — Jokowi, Rocky, Minion, Grumpy, Pirate, Wizard, dll. — use `persona` via `PUT /api/v1/config/persona` (or legacy `PUT /api/v1/personas`). An active persona overrides `personality` until cleared with `{"name":null}`.
+
+**Example — switch to Jokowi:**
+
+```
+PUT /api/v1/config/persona
+Content-Type: application/json
+
+{ "name": "jokowi" }
+```
+
+**Response `200`:** `{ "active": "jokowi", "available": ["grumpy", "jokowi", "minion", "pirate", "rocky", "wizard"] }` — live on the next voice turn.
+
+**Example — clear persona (back to personality tone):**
+
+```json
+{ "name": null }
+```
 
 **Example — change personality only:**
 
@@ -164,13 +189,23 @@ export type Privacy = {
   personalizationData: boolean;
 };
 
+export type PersonaState = {
+  active: string | null;
+  available: string[];
+};
+
 export type Config = {
   personality: Personality;
+  persona: PersonaState;
   connection: Connection;
   appearance: Appearance;
   notifications: Notifications;
   privacy: Privacy;
   language: Language;
+};
+
+export type PersonaPatch = {
+  name: string | null;
 };
 
 /// Partial update body — every field optional, nested objects also partial.
@@ -274,6 +309,7 @@ Tests use `DATABASE_URL` (default `postgres://postgres:postgres@localhost:5432/c
 
 ## Related docs
 
+- [PERSONA_API.md](PERSONA_API.md) — character voices (Jokowi, Rocky, Minion, dll.); overrides `personality` while active
 - [PROFILE_API.md](PROFILE_API.md) — Profile and focus time REST endpoints (same auth, same server)
 - [CALENDAR_API.md](CALENDAR_API.md) — Calendar REST API (same auth, same server)
 - [TASK_API.md](TASK_API.md) — Task REST API; create/update with `dueAt` schedules reminders

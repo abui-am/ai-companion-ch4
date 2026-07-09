@@ -345,6 +345,7 @@ struct CompanionServerApp {
             on: router,
             config: userConfig,
             reminderScheduler: reminderScheduler,
+            personas: personaStore,
             sessionRegistry: sessionRegistry,
             deviceToken: config.deviceToken,
             logger: serverLogger
