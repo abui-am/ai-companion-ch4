@@ -13,8 +13,10 @@ enum ValidationError: Error, Equatable {
 }
 
 enum CmdRouter {
+    // Mirrors firmware motor_drive.cpp runPattern.
     private static let movePatterns: Set<String> = [
         "stroll", "forward", "backward", "turn_left", "turn_right", "stop",
+        "spin_left", "spin_right", "circle", "wiggle", "dance",
     ]
 
     // Mirrors firmware face_display.cpp kEmotions.
@@ -43,7 +45,8 @@ enum CmdRouter {
                 throw ValidationError.outOfRange
             }
             if let durationMs = cmd.params.durationMs {
-                guard (50 ... 2000).contains(durationMs) else {
+                // Spins/circles run longer than single bumps, hence 4000.
+                guard (50 ... 4000).contains(durationMs) else {
                     throw ValidationError.outOfRange
                 }
             }

@@ -169,6 +169,7 @@ struct CompanionServerApp {
                 MemoryAgent(memories: memories, embeddings: embeddings, config: userConfig, logger: serverLogger),
                 MotionAgent(gateway: deviceCommands, logger: serverLogger),
                 EmotionAgent(gateway: deviceCommands, logger: serverLogger),
+                PersonaAgent(personas: personaStore, logger: serverLogger),
             ]
             if config.webSearchEnabled {
                 subAgentList.append(

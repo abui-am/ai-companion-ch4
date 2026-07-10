@@ -27,8 +27,20 @@ final class CmdRouterTests: XCTestCase {
         }
     }
 
+    func testValidTrickPatternsPass() throws {
+        for pattern in ["dance", "spin_left", "spin_right", "circle", "wiggle"] {
+            let cmd = DeviceCommand(action: "move", params: LEDParams(pattern: pattern))
+            XCTAssertNoThrow(try CmdRouter.validate(cmd), "pattern \(pattern) should be valid")
+        }
+    }
+
+    func testValidSpinWithLongDurationPasses() throws {
+        let cmd = DeviceCommand(action: "move", params: LEDParams(pattern: "spin_left", durationMs: 3000))
+        XCTAssertNoThrow(try CmdRouter.validate(cmd))
+    }
+
     func testMoveUnknownPatternRejected() {
-        let cmd = DeviceCommand(action: "move", params: LEDParams(pattern: "spin"))
+        let cmd = DeviceCommand(action: "move", params: LEDParams(pattern: "moonwalk"))
         XCTAssertThrowsError(try CmdRouter.validate(cmd)) { error in
             XCTAssertEqual(error as? ValidationError, .outOfRange)
         }
@@ -102,6 +114,39 @@ final class CmdRouterTests: XCTestCase {
         XCTAssertTrue(prompt.contains("never"))
         XCTAssertTrue(prompt.contains("casual"))
         XCTAssertTrue(prompt.contains("serious"))
+        // Trick moves and voice persona switching must stay wired into the prompt.
+        XCTAssertTrue(prompt.contains("dance"))
+        XCTAssertTrue(prompt.contains("spin_left"))
+        XCTAssertTrue(prompt.contains("circle"))
+        XCTAssertTrue(prompt.contains("wiggle"))
+        XCTAssertTrue(prompt.contains("persona"))
+        XCTAssertTrue(prompt.contains("change persona to grumpy"))
+        // User bombshells must force a face change.
+        XCTAssertTrue(prompt.contains("the user says something shocking"))
+    }
+
+    func testCompanionPromptPersonaBlockLocksCharacter() {
+        let prompt = CompanionPrompt.system(
+            responseLanguage: "English",
+            personaInstruction: "# Pirate\nBe a pirate."
+        )
+        XCTAssertTrue(prompt.contains("NEVER break character"))
+        XCTAssertTrue(prompt.contains("# Pirate"))
+        // The stock personality line is replaced while a persona is active.
+        XCTAssertFalse(prompt.contains("Personality: calm"))
+        // The default identity is OMITTED, not just overridden — nothing of
+        // Botchill or its hidden layer may exist in a persona prompt.
+        XCTAssertFalse(prompt.contains("Botchill"))
+        XCTAssertFalse(prompt.contains("Wowo"))
+        XCTAssertFalse(prompt.contains("Wakanda"))
+        // Tools and modes survive the takeover.
+        XCTAssertTrue(prompt.lowercased().contains("web_search"))
+        XCTAssertTrue(prompt.lowercased().contains("emotion"))
+
+        // Without a persona, the default identity is present.
+        let base = CompanionPrompt.system(responseLanguage: "English")
+        XCTAssertTrue(base.contains("Botchill"))
+        XCTAssertTrue(base.contains("Personality: calm"))
     }
 
     func testCompanionPromptLanguageInstruction() {
