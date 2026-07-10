@@ -1,8 +1,8 @@
 #pragma once
 
 // Copy values from CompanionServer/.env and your LAN before flashing.
-#define WIFI_SSID "Wifi iuran"
-#define WIFI_PASSWORD "sekgangguan"
+#define WIFI_SSID "BocilServer"
+#define WIFI_PASSWORD "1234567890"
 
 #define COMPANION_SERVER_HOST "192.168.1.3"
 #define COMPANION_SERVER_PORT 8080

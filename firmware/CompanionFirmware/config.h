@@ -5,10 +5,10 @@
 
 // Fill these in before flashing. Mirrors the showcase-phase auth model in
 // the plan: shared compile-time token, no rotation, LAN-only.
-#define WIFI_SSID "iphoneGung"
+#define WIFI_SSID "BocilServer"
 #define WIFI_PASSWORD "1234567890"
 
-#define COMPANION_SERVER_HOST "172.20.10.3"
+#define COMPANION_SERVER_HOST "10.27.19.174"
 #define COMPANION_SERVER_PORT 8080
 #define COMPANION_SERVER_PATH "/ws"
 #define COMPANION_USE_TLS false // true => wss:// (beginSSL)
@@ -89,3 +89,19 @@
 #define MOTOR_STROLL_FORWARD_MS 400
 #define MOTOR_STROLL_TURN_MS 250
 #define MOTOR_STROLL_PAUSE_MS 200
+
+// Trick moves. Spin is a long pivot (roughly a full rotation on a smooth
+// desk — tune MOTOR_SPIN_MS per surface). Circle arcs with the inner wheel
+// slowed instead of stopped so the bot sweeps a small loop. Wiggle is a
+// quick left-right shimmy. Dance chains them: spin → forward → backward →
+// wiggle → counter-spin.
+#define MOTOR_SPIN_MS 1400
+#define MOTOR_CIRCLE_MS 2600
+// Inner-wheel duty during the arc. At/below MOTOR_PWM_MIN the inner wheel
+// stalls and the bot pivots tightly around it; raise toward MOTOR_PWM_MAX
+// for a wider, smoother arc. 100 (= the friction floor) keeps the wheel
+// just barely turning and avoids a duty jump after rampTo()'s min-floor.
+#define MOTOR_CIRCLE_INNER_PWM 100
+#define MOTOR_WIGGLE_CYCLES 3
+#define MOTOR_WIGGLE_STEP_MS 180
+#define MOTOR_TRICK_PAUSE_MS 200

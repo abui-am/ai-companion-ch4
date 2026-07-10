@@ -82,6 +82,9 @@ static char s_frameStatus[kMaxLineLen + 1] = "";
 static uint32_t s_nextIdleQuirkMs = 0;
 static uint32_t s_nextGazeShiftMs = 0;
 static uint32_t s_nextRepeatAnimMs = 0;
+// Surprised opens with a short shock tremble; this marks when it ends.
+static uint32_t s_surpriseTrembleUntilMs = 0;
+static bool s_surpriseTrembling = false;
 
 static void copyTruncated(char *dest, size_t destSize, const char *src) {
   if (destSize == 0) {
@@ -329,6 +332,7 @@ static void applyEmotionFace(FaceEmotion emotion) {
     s_roboEyes.setAutoblinker(ON, 2, 2);
     s_roboEyes.setIdleMode(ON, 2, 3);
     s_roboEyes.anim_laugh();
+    s_nextRepeatAnimMs = now + 3000;
     break;
   case EMOTION_EXCITED:
     s_roboEyes.setMood(HAPPY);
@@ -354,7 +358,8 @@ static void applyEmotionFace(FaceEmotion emotion) {
     s_roboEyes.setSweat(ON);
     break;
   case EMOTION_SURPRISED:
-    // Big round eyes + flashing "!" in the corner.
+    // Big round eyes + flashing "!" in the corner, opening with a short
+    // shock tremble (horizontal flicker) that settles into a wide stare.
     s_roboEyes.setMood(DEFAULT);
     s_roboEyes.setWidth(36, 36);
     s_roboEyes.setHeight(36, 36);
@@ -362,6 +367,9 @@ static void applyEmotionFace(FaceEmotion emotion) {
     s_roboEyes.setSpacebetween(8);
     s_roboEyes.setAutoblinker(OFF, 0, 0);
     s_roboEyes.setIdleMode(OFF, 1, 2);
+    s_roboEyes.setHFlicker(ON, 2);
+    s_surpriseTrembleUntilMs = now + 700;
+    s_surpriseTrembling = true;
     s_roboEyes.blink();
     break;
   case EMOTION_CONFUSED:
@@ -382,6 +390,7 @@ static void applyEmotionFace(FaceEmotion emotion) {
     s_roboEyes.setMood(HAPPY);
     s_roboEyes.setAutoblinker(ON, 2, 2);
     s_roboEyes.setIdleMode(ON, 2, 3);
+    s_nextRepeatAnimMs = now + 2000; // periodic winks (tick below)
     break;
   case EMOTION_NONE:
     break;
@@ -403,6 +412,35 @@ static void applyFace(FaceDisplayMode mode, FaceEmotion emotion) {
 
 static void tickFaceBehavior(FaceDisplayMode mode, FaceEmotion emotion) {
   const uint32_t now = millis();
+
+  if (emotion == EMOTION_SURPRISED) {
+    // Let the shock tremble die down into the frozen wide-eyed stare.
+    if (s_surpriseTrembling && now >= s_surpriseTrembleUntilMs) {
+      s_roboEyes.setHFlicker(OFF);
+      s_surpriseTrembling = false;
+    }
+    return;
+  }
+
+  if (emotion == EMOTION_HAPPY) {
+    // Re-laugh now and then so a long happy hold keeps bubbling.
+    if (now >= s_nextRepeatAnimMs) {
+      s_roboEyes.anim_laugh();
+      s_nextRepeatAnimMs = now + random(2800, 4600);
+    }
+    return;
+  }
+
+  if (emotion == EMOTION_LOVE) {
+    // Flirty winks, alternating eyes.
+    if (now >= s_nextRepeatAnimMs) {
+      static bool winkLeft = false;
+      s_roboEyes.blink(winkLeft, !winkLeft);
+      winkLeft = !winkLeft;
+      s_nextRepeatAnimMs = now + random(1800, 3200);
+    }
+    return;
+  }
 
   if (emotion == EMOTION_EXCITED) {
     if (now >= s_nextRepeatAnimMs) {
@@ -666,6 +704,14 @@ bool faceDisplaySetEmotion(const char *name, uint32_t holdMs) {
   xSemaphoreTake(s_mutex, portMAX_DELAY);
   s_emotion = match->emotion;
   s_emotionUntilMs = (match->emotion == EMOTION_NONE) ? 0 : millis() + hold;
+  // An expression is the point of this command — dismiss the transcript text
+  // screen if it's up, or the face change would be invisible behind the text
+  // (emotions usually land at the start of a reply, right when the "You
+  // said:" screen is still holding).
+  if (match->emotion != EMOTION_NONE && s_showTextScreen) {
+    s_showTextScreen = false;
+    s_transcriptUntilMs = 0;
+  }
   xSemaphoreGive(s_mutex);
 
   Serial.printf("[FACE] emotion=%s hold=%ums\n", match->name,

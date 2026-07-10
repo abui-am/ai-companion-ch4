@@ -132,6 +132,84 @@ static void turnRight(uint32_t durationMs) {
   rampStop(MOTOR_RAMP_MS);
 }
 
+static void spinLeft(uint32_t durationMs) {
+  Serial.printf("[MOTOR] spin_left %ums pwm=%u\n",
+                static_cast<unsigned>(durationMs), s_pwmTurn());
+  rampTo(-static_cast<int16_t>(s_pwmTurn()), s_pwmTurn(), MOTOR_RAMP_MS);
+  holdDrive(-static_cast<int16_t>(s_pwmTurn()), s_pwmTurn(), durationMs);
+  rampStop(MOTOR_RAMP_MS);
+}
+
+static void spinRight(uint32_t durationMs) {
+  Serial.printf("[MOTOR] spin_right %ums pwm=%u\n",
+                static_cast<unsigned>(durationMs), s_pwmTurn());
+  rampTo(s_pwmTurn(), -static_cast<int16_t>(s_pwmTurn()), MOTOR_RAMP_MS);
+  holdDrive(s_pwmTurn(), -static_cast<int16_t>(s_pwmTurn()), durationMs);
+  rampStop(MOTOR_RAMP_MS);
+}
+
+// Arc drive: outer wheel at cruise duty, inner wheel slowed (not stopped),
+// so the bot sweeps a smooth loop instead of pivoting.
+static void circleArc(uint32_t durationMs) {
+  const int16_t outer = s_pwmMax();
+  const int16_t inner = MOTOR_CIRCLE_INNER_PWM;
+  Serial.printf("[MOTOR] circle %ums outer=%d inner=%d\n",
+                static_cast<unsigned>(durationMs), outer, inner);
+  rampTo(outer, inner, MOTOR_RAMP_MS);
+  holdDrive(outer, inner, durationMs);
+  rampStop(MOTOR_RAMP_MS);
+}
+
+// Quick left-right shimmy in place — reads as a happy tail-wag. Coasts
+// briefly between direction flips: rampTo() scales toward the new target
+// only, so without the coast each flip would slam the H-bridge straight
+// into reverse and spike the shared 5 V rail.
+static void wiggle() {
+  Serial.println("[MOTOR] wiggle");
+  const int16_t t = s_pwmTurn();
+  for (int i = 0; i < MOTOR_WIGGLE_CYCLES && !s_stopRequested; ++i) {
+    rampTo(t, -t, 100);
+    holdDrive(t, -t, MOTOR_WIGGLE_STEP_MS);
+    if (s_stopRequested) {
+      break;
+    }
+    setDrive(0, 0);
+    vTaskDelay(pdMS_TO_TICKS(40));
+    rampTo(-t, t, 100);
+    holdDrive(-t, t, MOTOR_WIGGLE_STEP_MS);
+    setDrive(0, 0);
+    vTaskDelay(pdMS_TO_TICKS(40));
+  }
+  rampStop(MOTOR_RAMP_MS);
+}
+
+// Showpiece trick: spin, roll forward, roll back, shimmy, counter-spin.
+static void danceTrick() {
+  Serial.println("[MOTOR] dance start");
+  spinRight(MOTOR_SPIN_MS);
+  if (s_stopRequested) {
+    return;
+  }
+  vTaskDelay(pdMS_TO_TICKS(MOTOR_TRICK_PAUSE_MS));
+  moveForward(MOTOR_STROLL_FORWARD_MS);
+  if (s_stopRequested) {
+    return;
+  }
+  vTaskDelay(pdMS_TO_TICKS(MOTOR_TRICK_PAUSE_MS));
+  moveBackward(MOTOR_STROLL_FORWARD_MS);
+  if (s_stopRequested) {
+    return;
+  }
+  vTaskDelay(pdMS_TO_TICKS(MOTOR_TRICK_PAUSE_MS));
+  wiggle();
+  if (s_stopRequested) {
+    return;
+  }
+  vTaskDelay(pdMS_TO_TICKS(MOTOR_TRICK_PAUSE_MS));
+  spinLeft(MOTOR_SPIN_MS);
+  Serial.println("[MOTOR] dance done");
+}
+
 static void strollAround() {
   Serial.println("[MOTOR] stroll start");
   for (int i = 0; i < MOTOR_STROLL_SEGMENTS && !s_stopRequested; ++i) {
@@ -180,6 +258,26 @@ static void runPattern(const char *pattern, uint32_t durationMs) {
   }
   if (strcmp(pattern, "stroll") == 0) {
     strollAround();
+    return;
+  }
+  if (strcmp(pattern, "spin_left") == 0) {
+    spinLeft(durationMs > 0 ? durationMs : MOTOR_SPIN_MS);
+    return;
+  }
+  if (strcmp(pattern, "spin_right") == 0) {
+    spinRight(durationMs > 0 ? durationMs : MOTOR_SPIN_MS);
+    return;
+  }
+  if (strcmp(pattern, "circle") == 0) {
+    circleArc(durationMs > 0 ? durationMs : MOTOR_CIRCLE_MS);
+    return;
+  }
+  if (strcmp(pattern, "wiggle") == 0) {
+    wiggle();
+    return;
+  }
+  if (strcmp(pattern, "dance") == 0) {
+    danceTrick();
     return;
   }
 

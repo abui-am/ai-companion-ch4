@@ -12,6 +12,17 @@ struct PutPersonaRequest: Decodable, Sendable {
     let name: String?
 }
 
+struct PersonaDetailResponse: ResponseEncodable, Sendable {
+    let name: String
+    let content: String
+    let active: Bool
+}
+
+/// Body for creating/updating a persona file: the full markdown instruction.
+struct PutPersonaContentRequest: Decodable, Sendable {
+    let content: String
+}
+
 enum PersonaRoutes {
     static func register(
         on router: Router<BasicRequestContext>,
@@ -48,6 +59,54 @@ enum PersonaRoutes {
                 active: await personas.activeName(),
                 available: await personas.available()
             )
+        }
+
+        group.get("/{name}") { request, context in
+            try requireDeviceToken(from: request, expected: deviceToken)
+            let name = try context.parameters.require("name")
+            guard let content = await personas.instruction(for: name) else {
+                throw HTTPError(.notFound, message: PersonaError.unknownPersona(name).description)
+            }
+            logger.debug("GET /api/v1/personas/{name}", metadata: ["persona": .string(name)])
+            return PersonaDetailResponse(
+                name: name,
+                content: content,
+                active: await personas.activeName() == name
+            )
+        }
+
+        group.put("/{name}") { request, context in
+            try requireDeviceToken(from: request, expected: deviceToken)
+            let name = try context.parameters.require("name")
+            let body: PutPersonaContentRequest
+            do {
+                body = try await request.decode(as: PutPersonaContentRequest.self, context: context)
+            } catch {
+                throw HTTPError(.badRequest, message: "Invalid persona body: \(error)")
+            }
+            do {
+                try await personas.save(name: name, content: body.content)
+            } catch let error as PersonaError {
+                throw HTTPError(.badRequest, message: error.description)
+            }
+            logger.info("PUT /api/v1/personas/{name}", metadata: ["persona": .string(name)])
+            return PersonaDetailResponse(
+                name: name,
+                content: body.content,
+                active: await personas.activeName() == name
+            )
+        }
+
+        group.delete("/{name}") { request, context -> HTTPResponse.Status in
+            try requireDeviceToken(from: request, expected: deviceToken)
+            let name = try context.parameters.require("name")
+            do {
+                try await personas.delete(name: name)
+            } catch let error as PersonaError {
+                throw HTTPError(.notFound, message: error.description)
+            }
+            logger.info("DELETE /api/v1/personas/{name}", metadata: ["persona": .string(name)])
+            return .noContent
         }
     }
 

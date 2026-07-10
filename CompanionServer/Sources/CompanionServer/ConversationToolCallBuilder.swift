@@ -82,6 +82,18 @@ enum ConversationToolCallBuilder {
             return action
         }
 
+        if name == "emotion", let emotion = args["emotion"] as? String {
+            return emotion
+        }
+
+        if name == "persona" {
+            let action = args["action"] as? String ?? name
+            if let personaName = args["name"] as? String, !personaName.isEmpty {
+                return "\(action): \(personaName)"
+            }
+            return action
+        }
+
         return argumentsJSON
     }
 

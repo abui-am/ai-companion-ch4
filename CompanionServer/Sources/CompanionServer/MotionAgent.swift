@@ -8,6 +8,7 @@ struct MotionAgent: SubAgent, Sendable {
 
     private static let allowedActions: Set<String> = [
         "stroll", "forward", "backward", "turn_left", "turn_right", "stop",
+        "spin_left", "spin_right", "circle", "wiggle", "dance",
     ]
 
     private let gateway: DeviceCommandGateway
@@ -27,7 +28,8 @@ struct MotionAgent: SubAgent, Sendable {
             **Required** whenever the user wants the bot to move; speech alone does not move the hardware.
 
             Trigger on: move, stroll, wander, walk/roll/drive/go/throw around (the desk/deck), \
-            turn around, come closer, back up, explore the desk, stop moving.
+            turn around, spin, do a trick, dance, do something cool, come closer, back up, \
+            explore the desk, stop moving.
 
             Speech-to-text often mishears — "throw around the deck" usually means stroll on the desk.
 
@@ -35,10 +37,15 @@ struct MotionAgent: SubAgent, Sendable {
             - stroll: short wander — forward a bit, turn, repeat (default for "walk/throw/stroll around")
             - forward / backward: one short gentle bump
             - turn_left / turn_right: pivot in place
+            - spin_left / spin_right: a full showy spin in place ("spin around", "do a spin")
+            - circle: drive a small circular loop ("go in a circle", "run a lap")
+            - wiggle: quick happy left-right shimmy — great as a joy reaction
+            - dance: the full trick routine — spin, roll forward, roll back, wiggle, counter-spin \
+            ("do a trick", "dance", "show me what you got")
             - stop: halt wheels immediately
 
-            Call this tool before confirming movement in speech. Optional duration_ms (50–2000) for \
-            single moves; omit for stroll/stop.
+            Call this tool before confirming movement in speech. Optional duration_ms (50–4000) for \
+            single moves and spins/circle; omit for stroll/wiggle/dance/stop.
             """,
             "parameters": [
                 "type": "object",
@@ -50,7 +57,7 @@ struct MotionAgent: SubAgent, Sendable {
                     ] as [String: Any],
                     "duration_ms": [
                         "type": "integer",
-                        "description": "Optional duration for forward/back/turn moves (50–2000 ms).",
+                        "description": "Optional duration for forward/back/turn/spin/circle moves (50–4000 ms).",
                     ] as [String: Any],
                 ],
                 "required": ["action"],
@@ -96,6 +103,11 @@ struct MotionAgent: SubAgent, Sendable {
         case "backward": "Moved backward gently."
         case "turn_left": "Turned left."
         case "turn_right": "Turned right."
+        case "spin_left": "Spun around to the left."
+        case "spin_right": "Spun around to the right."
+        case "circle": "Drove a little circle."
+        case "wiggle": "Did a happy wiggle."
+        case "dance": "Performed the full trick routine — spin, forward, back, wiggle, spin!"
         default: "Moving."
         }
         return SubAgentJSON.encode(["summary": summary])
