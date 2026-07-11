@@ -5,6 +5,13 @@ import Hummingbird
 import HummingbirdWebSocket
 import Logging
 
+struct VersionResponse: ResponseEncodable, Sendable {
+    let version: String
+    let protocolVersion: String
+    let pipelineProfile: String
+    let uptimeSeconds: Int
+}
+
 @main
 struct CompanionServerApp {
     static func main() async throws {
@@ -71,58 +78,17 @@ struct CompanionServerApp {
         }
 
         let calendar = CalendarRepository(database: database, logger: logger)
-        do {
-            try await calendar.migrate()
-        } catch {
-            logger.critical("calendar migration failed: \(error)")
-            await database.shutdown()
-            exit(1)
-        }
-
         let userConfig = ConfigRepository(database: database, logger: logger)
-        do {
-            try await userConfig.migrate()
-        } catch {
-            logger.critical("config migration failed: \(error)")
-            await database.shutdown()
-            exit(1)
-        }
-
         let profile = ProfileRepository(database: database, logger: logger)
-        do {
-            try await profile.migrate()
-        } catch {
-            logger.critical("profile migration failed: \(error)")
-            await database.shutdown()
-            exit(1)
-        }
-
         let tasks = TaskRepository(database: database, logger: logger)
-        do {
-            try await tasks.migrate()
-        } catch {
-            logger.critical("task migration failed: \(error)")
-            await database.shutdown()
-            exit(1)
-        }
-
         let reminders = ReminderRepository(database: database, logger: logger)
-        do {
-            try await reminders.migrate()
-        } catch {
-            logger.critical("reminder migration failed: \(error)")
-            await database.shutdown()
-            exit(1)
-        }
-
         let pushDevices = PushDeviceRepository(database: database, logger: logger)
-        do {
-            try await pushDevices.migrate()
-        } catch {
-            logger.critical("push device migration failed: \(error)")
-            await database.shutdown()
-            exit(1)
-        }
+        await migrateOrExit("calendar", calendar.migrate, database: database, logger: logger)
+        await migrateOrExit("config", userConfig.migrate, database: database, logger: logger)
+        await migrateOrExit("profile", profile.migrate, database: database, logger: logger)
+        await migrateOrExit("task", tasks.migrate, database: database, logger: logger)
+        await migrateOrExit("reminder", reminders.migrate, database: database, logger: logger)
+        await migrateOrExit("push device", pushDevices.migrate, database: database, logger: logger)
 
         let reminderScheduler = ReminderScheduler(
             reminders: reminders,
@@ -156,22 +122,9 @@ struct CompanionServerApp {
         await reminderWorker.start()
 
         let conversations = ConversationRepository(database: database, logger: logger)
-        do {
-            try await conversations.migrate()
-        } catch {
-            logger.critical("conversation migration failed: \(error)")
-            await database.shutdown()
-            exit(1)
-        }
-
         let memories = MemoryRepository(database: database, logger: logger)
-        do {
-            try await memories.migrate()
-        } catch {
-            logger.critical("memory migration failed: \(error)")
-            await database.shutdown()
-            exit(1)
-        }
+        await migrateOrExit("conversation", conversations.migrate, database: database, logger: logger)
+        await migrateOrExit("memory", memories.migrate, database: database, logger: logger)
         let embeddings = OpenAIEmbeddingService(
             apiKey: config.openAIAPIKey,
             model: config.openAIEmbeddingModel,
@@ -335,6 +288,16 @@ struct CompanionServerApp {
             serverLogger.debug("GET /ping")
             return "pong"
         }
+        let startedAt = Date()
+        router.get("/version") { _, _ in
+            serverLogger.debug("GET /version")
+            return VersionResponse(
+                version: CompanionStack.serverVersion,
+                protocolVersion: CompanionStack.protocolVersion,
+                pipelineProfile: CompanionStack.pipelineProfile,
+                uptimeSeconds: Int(Date().timeIntervalSince(startedAt))
+            )
+        }
         CalendarRoutes.register(
             on: router,
             calendar: calendar,
@@ -399,6 +362,22 @@ struct CompanionServerApp {
         try await app.runService()
         await reminderWorker.stop()
         await database.shutdown()
+    }
+
+    /// Runs a repository migration; on failure logs, shuts down the database, and exits.
+    static func migrateOrExit(
+        _ name: String,
+        _ migrate: () async throws -> Void,
+        database: DatabaseService,
+        logger: Logger
+    ) async {
+        do {
+            try await migrate()
+        } catch {
+            logger.critical("\(name) migration failed: \(error)")
+            await database.shutdown()
+            exit(1)
+        }
     }
 
     static func bearerToken(from request: Request) -> String? {
