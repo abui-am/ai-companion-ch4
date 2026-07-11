@@ -5,10 +5,10 @@
 
 // Fill these in before flashing. Mirrors the showcase-phase auth model in
 // the plan: shared compile-time token, no rotation, LAN-only.
-#define WIFI_SSID "BocilServer"
+#define WIFI_SSID "IphoneGung"
 #define WIFI_PASSWORD "1234567890"
 
-#define COMPANION_SERVER_HOST "10.27.19.174"
+#define COMPANION_SERVER_HOST "10.27.19.2"
 #define COMPANION_SERVER_PORT 8080
 #define COMPANION_SERVER_PATH "/ws"
 #define COMPANION_USE_TLS false // true => wss:// (beginSSL)
